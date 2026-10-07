@@ -327,11 +327,7 @@ def test_unknown_coin_and_interval_raise():
 # --------------------------------------------------------------------------
 # hgb_loader serve contract
 #
-# The hgb_v1 manifest-shape tests (intervals / feature_columns-vs-groups / the
-# rf_v1 sha drift check) lived here and went with the 2026-07-31 exp044
-# retirement together with ``load_hgb``. checkpoint_loader owns those checks
-# now (see test_checkpoint_parity.py); what survives here is the parity gate
-# between the live feature builder and the served pipeline.
+# Parity between the live feature builder and the served pipeline.
 # --------------------------------------------------------------------------
 
 

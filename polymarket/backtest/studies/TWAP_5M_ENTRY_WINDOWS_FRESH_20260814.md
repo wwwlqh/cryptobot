@@ -85,4 +85,4 @@ requires the same shared horizon and all four coins.
    change. Do not choose again from the next period.
 
 Artifacts: `polymarket/backtest/optimize_runs/twap5m_entry_windows_fresh_20260814/`.
-Runner: `polymarket/backtest/studies/tick_latency/run_twap5m_entry_window_fresh.py`.
+Runner: `run_twap5m_entry_window_fresh.py` (a one-off script, not included in this repository).

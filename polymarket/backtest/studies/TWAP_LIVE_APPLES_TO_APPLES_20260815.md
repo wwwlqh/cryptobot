@@ -87,8 +87,8 @@ $5.57. The correlation is itself part of the risk failure.
 
 ## Artifacts and reproducibility
 
-- Runner:
-  `polymarket/backtest/studies/tick_latency/run_twap_live_apples_20260815.py`
+- Runner: `run_twap_live_apples_20260815.py` (a one-off script, not included
+  in this repository)
 - Report (gitignored research output):
   `polymarket/backtest/optimize_runs/twap_live_apples_20260815/report.json`
 - Per-trade comparison (gitignored research output):

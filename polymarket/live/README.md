@@ -7,8 +7,7 @@ The live strategy config and the systemd units used on the EC2 server.
 | File | Contents |
 |---|---|
 | `twap_symmetric_live.json` | The live strategy (below) |
-| `twap_symmetric_release.json` | Model bundle manifest: model hashes, routing, thresholds, execution settings |
-| `v2_step1last_live.json` | The earlier checkpoint strategy, kept for comparison and tests |
+| `twap_symmetric_release.json` | Release pin: model hash, routing, thresholds and execution settings that `deploy.sh` checks the shipped model against |
 
 The live strategy, as frozen on 2026-08-15:
 

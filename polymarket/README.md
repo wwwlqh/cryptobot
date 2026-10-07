@@ -33,10 +33,10 @@ Everything for the Polymarket venue: the trading engine, the Polymarket adapter,
 | `clob.py`, `ws_mirror.py` | Order books over REST and WebSocket |
 | `twap_mirror.py` | Chainlink 60-second TWAP at each window boundary |
 | `walker.py` | Order placement and fill reconciliation |
-| `fees.py` | Polymarket taker-fee curve |
+| `price_to_beat.py` | Exact window-open price from Polymarket |
 | `balance.py`, `transfer.py`, `relayer.py`, `primitives.py` | Wallet balance, transfers and on-chain helpers |
 
-The engine never imports an adapter directly. It calls `cryptobot.venues.get_adapter("polymarket")`, and `tools/importcheck.py` enforces that boundary.
+The engine reaches the adapter through `cryptobot.venues.get_adapter()`, and the taker-fee curve lives in `cryptobot/venues/fees.py`.
 
 ## Region
 

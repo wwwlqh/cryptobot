@@ -12,7 +12,7 @@ Scripts that deploy the bot to an AWS EC2 server.
 
 ## Server
 
-- Amazon Linux 2023 on a `t3.medium` with a 50 GB gp3 volume.
+- Amazon Linux 2023 on a 2 vCPU / 4 GB instance (`c7i-flex.large`) with a 50 GB gp3 volume.
 - Region `eu-west-1` (Ireland). Polymarket blocks order placement from the UK.
 - The security group allows SSH (port 22) from your own IP only. Don't open port 8800; reach the dashboard through an SSH tunnel.
 

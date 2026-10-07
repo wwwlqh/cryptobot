@@ -261,9 +261,9 @@ def main(argv: list[str] | None = None) -> int:
             "cryptobot live scanner. Reads CRYPTOBOT_DB_PATH "
             "(default data/cryptobot.db), CRYPTOBOT_DASHBOARD_HOST "
             "(default 127.0.0.1), CRYPTOBOT_DASHBOARD_PORT (default 8800), "
-            "CRYPTOBOT_V6_CONFIG (default backtest/optimize_runs/"
-            "v2_step1last_live.json). Set CRYPTOBOT_ALLOW_REMOTE_DASHBOARD=1 "
-            "only if you have authenticated the SSE stream externally."
+            "CRYPTOBOT_V6_CONFIG (default polymarket/live/config/"
+            "twap_symmetric_live.json). See polymarket/infra/"
+            "cryptobot.env.example for every setting."
         )
     )
     parser.add_argument("--tick-seconds", type=int, default=None, help="override TICK_SECONDS")

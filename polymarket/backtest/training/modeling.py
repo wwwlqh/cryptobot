@@ -362,9 +362,9 @@ def _build_hgb_pipe(
 def _fit_pipe(pipe, train: pd.DataFrame, feature_columns: list[str], sample_weight_mode: str):
     """Fit `pipe` on `train[feature_columns]` with the sleeve's sample weighting.
 
-    Shared by `_fit_predict` (backtest) and `export_models` (live) so the
-    fit — including the `recent_chunk_boost` sample weights and the
-    `<final_step>__sample_weight` fit-kwarg wiring — is identical on both paths.
+    Shared by every training path so the fit, including the
+    `recent_chunk_boost` sample weights and the `<final_step>__sample_weight`
+    fit-kwarg wiring, is identical everywhere.
     """
     x_train = train[feature_columns]
     y_train = train["y"].astype(np.int8)

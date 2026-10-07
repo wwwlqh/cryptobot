@@ -823,8 +823,7 @@ def _objective_factory(dd_halt_frac: float, label_col: str, min_bets_per_fold: i
         # performance on the same fixed test windows across all trials (selection-
         # on-test). Compounding amplifies lucky streaks super-linearly. Do NOT
         # treat best_value_pnl_sum as an expected-live-PnL estimate; it is an
-        # upper bound. Forward-OOS (polymarket/backtest/lib/forward_oos_regrade.py) is the
-        # go/no-go arbiter. See MEMORY: project_pmdata_wfo_abcd.md.
+        # upper bound; only a forward out-of-sample test should decide.
         return float(sum(res[k].total_pnl for res in fold_results for k in active_keys))
     return _objective
 

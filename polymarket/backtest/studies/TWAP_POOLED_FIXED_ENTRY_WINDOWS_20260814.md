@@ -76,8 +76,9 @@ as a precisely estimated second.
 
 - `tick_latency/run_twap_pooled_fixed_entry_windows.py` fits the two pooled
   models once and performs the common-cutoff comparison.
-- `tick_latency/run_twap5m_pooled_untouched_validation.py` loads the frozen 5m
-  model and performs the untouched replay without fitting.
+- `run_twap5m_pooled_untouched_validation.py` (a one-off script, not included
+  in this repository) loaded the frozen 5m model and ran the untouched replay
+  without fitting.
 - `training/export_twap_symmetric_60s.py` exports the approved two-model live
   artifact and manifest.
 

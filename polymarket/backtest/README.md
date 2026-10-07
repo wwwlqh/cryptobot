@@ -7,11 +7,10 @@ Offline research: downloading market data, building features and labels, trainin
 | `fetch/` | Data downloaders: pmdata order books, Gamma outcomes, Binance 1-second prices, Chainlink TWAP prices |
 | `training/` | Feature and label building, walk-forward training, model export |
 | `engine/` | Order-book replay with fees and fill simulation (`tick_exit004.py`) |
-| `lib/` | Data cleaning (`pmdata_clean.py`), scoring and grading helpers, forward out-of-sample re-grading |
-| `scripts/` | Command-line tools: tick download, TWAP label building, replay drivers, reports |
-| `audit/` | Checks that live config, models and inputs are consistent |
+| `lib/` | Data cleaning (`pmdata_clean.py`), the research pool loader (`pool_study.py`), the tick-book store (`tick_store.py`) |
+| `scripts/` | Command-line tools: tick download, TWAP label building, exact TWAP price fetch |
 | `studies/` | Dated research reports and the scripts that produced them ([index](studies/README.md)) |
-| `tests/` | Tests for the engine, data cleaning and audits |
+| `tests/` | Tests for the engine, data loading and scripts |
 
 Data sources and where each one is stored: [SOURCES.md](SOURCES.md).
 

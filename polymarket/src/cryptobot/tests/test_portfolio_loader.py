@@ -1,14 +1,13 @@
-"""U5 v6 sleeve loader tests.
+"""Strategy config loader tests.
 
-Reads the real `backtest/optimize_runs/v2_step1last_live.json` (the deployed
-v2 "step1last" checkpoint-only config — the exp044/ORB minute strategy was
-retired 2026-07-09) and verifies the runtime overrides land correctly. Legacy
-lut/rf/blend + pairs + 2-wallet_groups back-compat is exercised against the
-vendored fixture via `cryptobot.tests._legacy_artifact.legacy_portfolio()`.
+Reads the deployed config (``polymarket/live/config/twap_symmetric_live.json``)
+and checks that runtime overrides land correctly. Older config shapes (wallet
+groups, pair lists) are exercised against the vendored fixture in
+``cryptobot.tests._legacy_artifact.legacy_portfolio()``.
 
-The v2 config is checkpoint-only, so `load_sleeves()` requires
-`config.SUBMINUTE_ENABLED` to be True (else it fails closed). The autouse
-`_enable_subminute` fixture pins it on for the whole module.
+The config holds only sub-minute sleeves, so ``load_sleeves()`` needs
+``config.SUBMINUTE_ENABLED``; the autouse ``_enable_subminute`` fixture turns it
+on for the whole module.
 """
 
 from __future__ import annotations

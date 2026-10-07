@@ -104,4 +104,4 @@ $6.53 to $24.67.
    period. Promote T-520 only if its aggregate advantage persists.
 
 Artifacts: `polymarket/backtest/optimize_runs/twap15m_entry_windows_20260814/`.
-Runner: `polymarket/backtest/studies/tick_latency/run_twap15m_entry_window_compare.py`.
+Runner: `run_twap15m_entry_window_compare.py` (a one-off script, not included in this repository).

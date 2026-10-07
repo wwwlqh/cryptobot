@@ -53,21 +53,22 @@ polymarket/
     strategy/        model loading and scoring
     execution/       gates, sizing, order placement, ledger
     reconciliation/  settlement and wallet reconciliation
+  src/cryptobot_polymarket/  Polymarket API client: markets, order books, orders, wallet
+  live/          live strategy config and systemd units
   dashboard/     operator web dashboard
-  infra/         EC2 deploy and systemd setup
+  infra/         EC2 deploy scripts and environment template
 analysis/        trade dataset, charts, Power BI guide and DAX measures
-predictfun/, kalshi/   adapters for other exchanges behind the same venue interface (not used live here)
 ```
 
 ## Running it
 
 ```bash
-pip install -e .
+pip install -e ".[dev]"
 cp .env.example .env    # add your own API keys; DRY_RUN=true by default
-pytest polymarket
+pytest
 ```
 
-About 2,200 tests pass. 8 boot tests need the trained model files, so they fail on a fresh clone.
+About 1,750 tests pass. A few boot tests need the trained model files, so they are skipped on a fresh clone.
 
 Trained model files, raw market data and the live database are not in the repo: they're large and were gitignored. Running the bot live needs your own Polymarket wallet and API keys, plus retrained models made with the scripts in `polymarket/backtest/training/`.
 

@@ -1,12 +1,11 @@
-"""B1-B5 sub-minute checkpoint add-on tests.
+"""Sub-minute entry tests.
 
-Covers the flag-gated pieces the checkpoint-grid combo port added:
+Covers:
 
-  * ``_parse_checkpoint_offsets`` range-spec grammar + fail-closed bounds
-    (portfolio_loader B1/B2);
-  * ``load_sleeves`` flag-gating on the real ``v2_step1last_live.json``
-    artifact — the config is checkpoint-only, so flag off drops every sleeve
-    and the loader fails closed (ORB/exp044 retired 2026-07-09);
+  * ``_parse_checkpoint_offsets`` range grammar and bounds (portfolio_loader);
+  * ``load_sleeves`` with the deployed config: it holds only sub-minute
+    sleeves, so with the flag off every sleeve is dropped and the loader fails
+    closed;
   * ``_qualifying_offset_sec`` / ``_window_start_ts`` tick qualification;
   * per-offset scan latch (``claim_subminute_scan``) + per-offset ledger
     dedup (``subminute_slot_seen``);
