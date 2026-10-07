@@ -1,22 +1,21 @@
-"""Capital + drawdown accounting for the live scanner.
+"""Capital and drawdown accounting for the live scanner.
 
-Mirrors `hightempbot/execution/capital.py` but adapted for cryptobot's
-two-sleeve ledger. The single source of truth for:
-  - realized_capital (= INITIAL_BANKROLL + net capital flows + cumulative net
-    PnL on settled rows)
-  - peak_realized_capital (high-water mark of the FLOW-INCLUSIVE series)
+The single source of truth for:
+
+  - realized_capital (INITIAL_BANKROLL + net capital flows + net PnL on
+    settled rows)
+  - peak_realized_capital (high-water mark of that flow-inclusive series)
   - pending_exposure (USD on PENDING rows)
-  - drawdown_ratio (per D14: denominator MUST be INITIAL_BANKROLL constant,
-    NOT realized_capital — otherwise diverges from backtest's drawdown shape)
-  - per-sleeve pending breakdown for the dashboard's StatStrip
+  - drawdown_ratio (denominator is the constant INITIAL_BANKROLL, not
+    realized_capital, to match the backtest's drawdown shape)
+  - per-sleeve pending breakdown for the dashboard
 
-CAPITAL FLOWS. ``INITIAL_BANKROLL`` is the account balance AT
-``WALLET_START_AT``; every deposit / withdrawal / rebate after it is a
-``capital_flows`` row that moves equity at its OWN timestamp instead of being
-folded into the seed (folding a later deposit into the seed backdates the money
-and overstates the peak, which is what the hard DD halt gates on). Flows are
-account-level — the account is one funded pot and a deposit cannot be
-attributed to a sleeve — so the same series is merged into EVERY wallet's
+Capital flows: ``INITIAL_BANKROLL`` is the account balance at
+``WALLET_START_AT``. Every later deposit, withdrawal or rebate is a
+``capital_flows`` row that moves equity at its own timestamp. Folding a later
+deposit into the seed would backdate the money and overstate the peak that the
+drawdown halt reads. Flows belong to the whole account (a deposit cannot be
+attributed to one sleeve), so the same series is merged into every wallet's
 replay.
 """
 
@@ -34,10 +33,10 @@ from cryptobot.config import INITIAL_BANKROLL
 
 logger = logging.getLogger(__name__)
 
-# The four `capital_flows.kind` values, mirroring the schema CHECK. The sign of
-# `amount_usd` is pinned per kind so the replay can add it blindly: money in is
-# positive, money out is negative, and 'adjustment' is the either-way escape
-# hatch for a manual correction.
+# The four ``capital_flows.kind`` values, matching the schema CHECK. The sign
+# of ``amount_usd`` is fixed per kind so the replay can just add it: money in
+# is positive, money out negative, and 'adjustment' (either sign) is for manual
+# corrections.
 CAPITAL_FLOW_KINDS: tuple[str, ...] = (
     "deposit",
     "withdrawal",
@@ -49,43 +48,38 @@ CAPITAL_FLOW_NEGATIVE_KINDS: tuple[str, ...] = ("withdrawal",)
 
 
 # ---------------------------------------------------------------------------
-# Per-tick ledger-scan cache (hot decision path).
+# Per-connection cache of the ledger scan (hot decision path).
 #
-# ``get_wallet_snapshots`` ran an unbounded ``SELECT ... FROM ledger ORDER BY
-# id`` on EVERY tick (pipeline ~1160), and the scan cost grows with ledger
-# size. The rows are identical between ledger writes, so we cache the fetched
-# rows per connection and reuse them until the ledger changes — the aggregation
-# (which depends on wall-clock for the rolling-24h fields) is recomputed fresh
-# on every call, so the returned snapshots are EXACTLY what a fresh scan would
-# produce.
+# ``get_wallet_snapshots`` reads the whole ledger, and it runs every tick. The
+# rows only change when the ledger does, so they are cached per connection and
+# reused until then. The aggregation (which depends on the clock for the
+# rolling 24h fields) is recomputed on every call, so results are exactly what
+# a fresh scan would return.
 #
-# Invalidation is a LEDGER-CONTENT probe (``ledger_version``), not a
-# connection-level change counter. The previous (data_version, total_changes)
-# signal was safe but useless as a cache key at 1 Hz: the tick's own signals
-# INSERT autocommits bump ``total_changes`` every tick, and worker commits bump
-# ``data_version`` on the scheduler connection — so BOTH per-tick call sites
-# (pipeline pre_score_wallets + snapshot _kpis_block) rescanned the full
-# 12-column ledger every tick (~5-20ms each). The probe instead aggregates the
-# ledger itself in one narrow SQL pass (MAX(id), COUNT(*), settled-row count,
-# Σpnl_net, MAX settle-ts), so unrelated-table writes never invalidate while
-# every ledger mutation that can change the cached rows does:
-#   * INSERT / DELETE            → MAX(id) / COUNT(*) move.
-#   * F3 sweep settlement UPDATE → the settled-row count moves (PENDING →
-#     WIN/LOSS/CANCELLED) plus Σpnl_net / MAX(resolution_ts). This is the case
-#     MAX(id) alone would miss — and the one the LIVE hard-DD-halt
-#     (config.MAX_DRAWDOWN_HALT_FRAC) equity-peak replay depends on catching
-#     (test_capital pins it).
-#   * stop-loss booking          → settled count + Σpnl_net + exit_ts max.
-# Deliberately NOT covered: a bet_ts-only rewrite (no production writer ever
-# mutates bet_ts after insert; tests that rewrite it do so before the first
-# snapshot read). The probe is read BEFORE the scan (see _cached_ledger_rows)
-# so a concurrent write can only force a later rescan, never a stale serve.
+# The cache key is a probe of the ledger's contents (``ledger_version``), not a
+# connection change counter: the tick's own signals inserts and other tables'
+# writes change those counters every second and would invalidate the cache on
+# every tick. The probe aggregates the ledger in one narrow query (MAX(id),
+# COUNT(*), settled-row count, SUM(pnl_net), latest settle time). Writes to
+# other tables never move it, while every ledger change that matters does:
+#
+#  * INSERT / DELETE: MAX(id) or COUNT(*) moves.
+#  * settlement UPDATE: the settled count moves (PENDING -> WIN/LOSS/
+#    CANCELLED), plus SUM(pnl_net) and MAX(resolution_ts). MAX(id) alone would
+#    miss this, and the drawdown halt's peak replay depends on catching it
+#    (test_capital covers it).
+#  * stop-loss booking (historical rows): settled count, SUM(pnl_net) and
+#    exit_ts move.
+#
+# Not covered: rewriting only bet_ts, which no production code does. The probe
+# is read before the scan (see _cached_ledger_rows), so a concurrent write can
+# only cause a later rescan, never a stale result.
 # ---------------------------------------------------------------------------
 
-# Keyed by the connection object itself (sqlite3.Connection is not weak-
-# referenceable) so cached rows can never be served across a different DB with
-# a coincidentally-equal id. Bounded: production uses a handful of long-lived
-# connections; the cap only trips under a test's churn of throwaway connections.
+# Keyed by the connection object itself (sqlite3.Connection cannot be weakly
+# referenced), so rows are never served for a different database. Production
+# uses a few long-lived connections; the cap only matters for tests that create
+# many short-lived ones.
 _SCAN_CACHE_MAX_CONNS = 64
 
 
@@ -101,32 +95,32 @@ _SNAPSHOT_SCAN_LOCK = threading.Lock()
 
 
 def clear_snapshot_scan_cache() -> None:
-    """Drop every cached ledger scan. Test/ops hook — the cache is otherwise
-    self-invalidating via the connection change signal."""
+    """Drop every cached ledger scan. For tests and ops; the cache otherwise
+    invalidates itself.
+    """
     with _SNAPSHOT_SCAN_LOCK:
         _SNAPSHOT_SCAN_CACHE.clear()
 
 
 def ledger_version(conn: sqlite3.Connection) -> tuple[int, int, int, float, str]:
-    """Ledger-content version probe — one narrow aggregate SQL instead of the
-    12-column full fetch it guards. Any mutation that can change the cached
-    wallet-snapshot rows moves at least one component (see the invalidation
-    note above); unrelated-table writes (the tick's per-second signals INSERT,
-    pipeline_health, dashboard state) move NONE, which is the whole point.
+    """Ledger-content version: one narrow aggregate query instead of the full
+    fetch it guards. Any change that can alter the cached rows moves at
+    least one component (see the note above); writes to other tables
+    (signals, pipeline_health, dashboard state) move none.
 
-    Also exported for the snapshot builder's KPI TTL cache so both caches
-    invalidate off one definition of "the ledger changed".
+    The snapshot builder's KPI cache uses it too, so both caches agree on when
+    the ledger changed.
     """
     row = conn.execute(
         "SELECT COALESCE(MAX(id), 0) AS max_id, "
         "       COUNT(*) AS n, "
-        # Settled-row discriminator: the F3 sweep's settlement UPDATE flips
-        # outcome away from PENDING in place (MAX(id)/COUNT(*) both blind).
+        # Settlement flips outcome away from PENDING in place, which MAX(id)
+        # and COUNT(*) cannot see.
         "       COALESCE(SUM(CASE WHEN outcome != 'PENDING' THEN 1 ELSE 0 END), 0) AS settled_n, "
-        # Catches a pnl correction that does not flip outcome.
+        # Catches a pnl correction that does not change the outcome.
         "       COALESCE(SUM(pnl_net), 0.0) AS pnl_sum, "
-        # Catches a settle-time (re)stamp; exit_ts covers booked-once stop rows
-        # whose resolution_ts is NULL at booking.
+        # Catches a new settle time; exit_ts covers stop-loss rows whose
+        # resolution_ts is NULL.
         "       COALESCE(MAX(COALESCE(resolution_ts, exit_ts)), '') AS max_settle_ts "
         "FROM ledger"
     ).fetchone()
@@ -145,12 +139,12 @@ def _cached_ledger_rows(
     *,
     version: Optional[tuple] = None,
 ) -> list[Any]:
-    """Return the wallet-snapshot ledger scan, served from the per-connection
-    cache when the ledger is unchanged. The change signal is read BEFORE the
-    scan so a concurrent write can only cause a later rescan, never a stale
-    serve. ``version`` lets a caller that already read ledger_version() this
-    pass hand it in (skips the re-read); omitted, this reads its own — still
-    before the scan either way."""
+    """Return the ledger rows for wallet snapshots, from the per-connection
+    cache when the ledger is unchanged. The version is read before the scan,
+    so a concurrent write can only cause a later rescan, never a stale
+    result. Pass ``version`` if you already read ledger_version() in this
+    pass.
+    """
     signal = ledger_version(conn) if version is None else version
     with _SNAPSHOT_SCAN_LOCK:
         entry = _SNAPSHOT_SCAN_CACHE.get(conn)
@@ -199,27 +193,26 @@ class WalletSnapshot:
     n_pending: int
     n_settled: int
     n_topups_24h: int
-    # Per-strategy LIVE deploy fields (D-LIVE-1 / D-LIVE-2 / D-LIVE-4).
-    # All default so legacy callers and test fixtures keep working.
+    # Live-trading fields. All have defaults so older callers and test fixtures
+    # still work.
     mode: str = "DRY"
     wallet_group: Optional[str] = None
     group_cap_usd: Optional[float] = None
     group_pending_usd: Optional[float] = None
     live_wallet_balance: Optional[float] = None
-    # Booked stop-loss exits in the last 24h (exit_kind='stop_loss' with a
-    # real pnl_net; voided cancels excluded). Defaulted so legacy fixtures
-    # keep constructing; counted as LOSSES by win_rate_24h per the
-    # 2026-07-21 operator W·L·SL order.
+    # Stop-loss exits booked in the last 24h (exit_kind='stop_loss' with a real
+    # pnl_net; voided cancels excluded). Only historical rows have these;
+    # win_rate_24h counts them as losses.
     stops_24h: int = 0
-    # Net post-cutover capital flows folded into realized_capital + the
-    # halt-facing peak. Account-level, so every wallet reports the same value.
+    # Net capital flows since the cutover, included in realized_capital and the
+    # peak. Account-level, so every wallet reports the same value.
     net_flow_usd: float = 0.0
 
     @property
     def win_rate_24h(self) -> Optional[float]:
-        """W·L·SL win rate (operator order 2026-07-21): stop-loss exits count
-        as losses — ``wins / (settled_24h + stops_24h)`` where ``settled_24h``
-        is the decided (WIN/LOSS) count."""
+        """Win rate counting stop-loss exits as losses: ``wins / (settled_24h +
+        stops_24h)``, where ``settled_24h`` is the WIN/LOSS count.
+        """
         denom = self.settled_24h + self.stops_24h
         if denom <= 0:
             return None
@@ -229,55 +222,39 @@ class WalletSnapshot:
 def _equity_change_sort_key(
     exit_kind: Any, exit_ts: Any, resolution_ts: Any
 ) -> str:
-    """Chronological sort key for the peak/drawdown equity replay.
+    """Sort key for the peak/drawdown equity replay.
 
-    The replay orders settled rows by the moment equity ACTUALLY changed and
-    tracks the running peak — realized capital is order-independent but the
-    peak (which gates the LIVE hard DD halt, config.MAX_DRAWDOWN_HALT_FRAC,
-    plus the DD brake) is NOT. For a normal
-    WIN/LOSS/PUSH row that moment is ``resolution_ts`` (market settlement). For
-    a booked-once PURE_STOP_04 stop-loss row (``exit_kind='stop_loss'``,
-    ``outcome='CANCELLED'``) the pnl is realized at ``exit_ts`` — the stop-sell
-    fill, set ONCE at booking, never NULL, never mutated — while its
-    ``resolution_ts`` is NULL until a *display-only* telemetry backfill may (on
-    older rows) stamp the sweep clock onto it.
+    Realized capital does not depend on order, but the running peak (which the
+    drawdown halt and brake read) does, so rows are ordered by when equity
+    actually changed. For a normal WIN/LOSS/PUSH row that is ``resolution_ts``.
+    For a stop-loss row (``exit_kind='stop_loss'``, ``outcome='CANCELLED'``) it
+    is ``exit_ts``, the sell fill time, which is set once at booking and never
+    changes; its ``resolution_ts`` may be NULL or may have been backfilled
+    later for display. Using ``exit_ts`` gives the true time and keeps the peak
+    the same whether or not the backfill ran.
 
-    Ordering a stop row by ``resolution_ts`` is therefore both (a) the WRONG
-    timestamp (it is not when equity moved) and (b) NON-invariant: a backfill
-    could re-sort the row and silently move the live gate. Keying on
-    ``exit_ts`` fixes both — it is the true equity-change moment and it is
-    immutable, so the peak is identical whether ``resolution_ts`` is NULL or
-    already backfilled (the live box carries a handful of stop rows in each
-    state). Defending the invariant HERE, at the replay, means no future writer
-    of ``resolution_ts`` on a stop row can perturb the gate.
-
-    The two timestamp spellings in the codebase are normalized so they
-    interleave chronologically: some ``exit_ts`` values are ISO
-    (``2026-07-11T00:00:00Z``) while ``resolution_ts`` is the SQL-text form
-    (``2026-07-11 00:00:00``). A raw lexicographic compare would misorder them
-    ('T' sorts after ' '; see fill_rate_breaker._reset_clause for the same
-    hazard), so both are folded to the space form. This is the per-row Python
-    form of the shared SQL fragment ``_equity_change_order_sql``.
+    Timestamps come in two spellings: ISO (``2026-07-11T00:00:00Z``) in some
+    ``exit_ts`` values and SQL text (``2026-07-11 00:00:00``) in
+    ``resolution_ts``. A raw string compare would misorder them ('T' sorts
+    after ' '), so both are normalized to the space form. This is the Python
+    version of ``_equity_change_order_sql``.
     """
     raw = exit_ts if str(exit_kind or "") == "stop_loss" else resolution_ts
     return str(raw or "").replace("T", " ").replace("Z", "")
 
 
 def _equity_change_order_sql(fallback: str) -> str:
-    """SQL expression for the equity-change ordering key — the SINGLE source of
-    truth shared by both SQL replays (``get_capital_snapshot`` here and
-    observability ``_ledger_equity_series``), so a change to the stop-row key
-    can't silently desync the LIVE hard-DD-halt gate
-    (config.MAX_DRAWDOWN_HALT_FRAC) from the equity chart.
+    """SQL expression for the equity-change ordering key, shared by both SQL
+    replays (``get_capital_snapshot`` here and the dashboard's
+    ``_ledger_equity_series``) so the drawdown halt and the equity chart
+    cannot drift apart.
 
-    Orders a settled row by the moment equity ACTUALLY changed: a booked-once
-    PURE_STOP_04 stop-loss row (``exit_kind='stop_loss'``) by its immutable
-    ``exit_ts``, every other row by ``resolution_ts``; the two timestamp
-    spellings are folded to the SQL-space form ('T'→' ', drop 'Z') so ISO and
-    SQL-text values interleave chronologically. ``fallback`` is the COALESCE
-    tail when both are NULL — the ONE intended difference between the two
-    callers: ``''`` for the capital snapshot, ``bet_ts`` for the equity chart.
-    Matches ``_equity_change_sort_key`` (the per-row Python form) apart from it.
+    Orders a stop-loss row (``exit_kind='stop_loss'``) by its ``exit_ts`` and
+    every other row by ``resolution_ts``, with both spellings normalized to the
+    SQL form ('T' -> ' ', drop 'Z'). ``fallback`` is used when both are NULL
+    and is the one intended difference between callers: ``''`` for the capital
+    snapshot, ``bet_ts`` for the equity chart. Otherwise matches
+    ``_equity_change_sort_key``.
     """
     return (
         "replace(replace(COALESCE("
@@ -289,23 +266,18 @@ def _equity_change_order_sql(fallback: str) -> str:
 def load_capital_flows(
     conn: sqlite3.Connection, since_sql: Optional[str]
 ) -> list[tuple[str, int, str, float]]:
-    """Account-level capital-flow events as
-    ``(occurred_at, id, kind, amount_usd)``,
+    """Account-level capital flows as ``(occurred_at, id, kind, amount_usd)``,
     ready to merge into an equity replay.
 
     ``since_sql`` is the cutover (``WALLET_START_AT`` in SQL-text form).
-    ``INITIAL_BANKROLL`` is defined as the balance AT that moment, so a flow
-    dated BEFORE it is ALREADY inside the seed — admitting it would count the
-    same dollars twice. Those rows are dropped here with a debug note rather
-    than rejected at write time, so an operator can record the full funding
-    history without corrupting the era's equity.
+    ``INITIAL_BANKROLL`` is the balance at that moment, so a flow dated before
+    it is already in the seed and would be counted twice. Such rows are dropped
+    here (with a debug log) rather than refused at write time, so the full
+    funding history can be recorded without distorting current equity.
 
-    Returns [] when the table is missing (legacy DB opened by an old-schema
-    reader) so every replay degrades to the pure-P&L behaviour.
-
-    Not cached: the table holds a handful of operator-recorded rows and the
-    read is one covering-index scan, unlike the 12-column ledger fetch that
-    ``_cached_ledger_rows`` exists to eliminate.
+    Returns [] when the table is missing (an old schema), so every replay falls
+    back to PnL only. Not cached: the table holds a handful of rows and the
+    read is one index scan.
     """
     try:
         rows = conn.execute(
@@ -337,9 +309,10 @@ def load_capital_flows(
 
 
 class CapitalFlowError(ValueError):
-    """A `capital_flows` write was refused (bad kind / sign / timestamp, or a
-    duplicate). Carries a machine-readable ``reason`` like the transfer flow's
-    TransferError so callers can branch without string-matching."""
+    """A ``capital_flows`` write was refused (bad kind, sign or timestamp, or a
+    duplicate). ``reason`` is machine-readable, like TransferError, so
+    callers can branch without matching strings.
+    """
 
     def __init__(self, reason: str, message: str) -> None:
         super().__init__(message)
@@ -347,12 +320,12 @@ class CapitalFlowError(ValueError):
 
 
 def normalize_flow_ts(raw: str) -> str:
-    """Validate + normalize a flow timestamp to the ledger's SQL-text UTC form.
+    """Validate a flow timestamp and normalize it to the ledger's SQL-text UTC
+    form.
 
-    Accepts the SQL-text form and the ISO spelling (both appear in this
-    codebase's timestamp columns); anything else — or a moment in the future,
-    which would sit past the equity replay's right edge and silently do nothing
-    until the clock caught up — is refused.
+    Accepts the SQL-text and ISO spellings. Anything else is refused, as is a
+    future time, which would sit past the end of the equity replay and do
+    nothing until the clock caught up.
     """
     text = str(raw or "").strip()
     if text.endswith(" UTC"):
@@ -376,11 +349,11 @@ def normalize_flow_ts(raw: str) -> str:
 
 
 def validate_flow_amount(kind: str, amount_usd: float) -> tuple[str, float]:
-    """Check ``(kind, amount_usd)`` against the schema's sign contract.
+    """Check ``(kind, amount_usd)`` against the schema's sign rules.
 
-    A wrong-signed amount is REFUSED, never silently flipped: "withdrawal 50"
-    is ambiguous between a typo and a misunderstanding, and guessing would move
-    the halt metric the wrong way by twice the amount.
+    A wrong-signed amount is refused, never flipped: "withdrawal 50" could be a
+    typo or a misunderstanding, and guessing wrong would move the halt metric
+    by twice the amount.
     """
     kind_norm = str(kind or "").strip().lower()
     if kind_norm not in CAPITAL_FLOW_KINDS:
@@ -419,12 +392,12 @@ def record_capital_flow(
     source: str = "manual",
     force: bool = False,
 ) -> dict[str, Any]:
-    """Insert one validated `capital_flows` row; return its public dict.
+    """Insert one validated ``capital_flows`` row and return it as a dict.
 
-    Refuses a duplicate (same kind + amount + occurred_at) unless ``force`` —
-    re-running the backfill proposer's emitted commands is the expected way to
-    double-record a deposit, and a doubled deposit silently inflates the peak
-    the DD halt gates on.
+    Refuses a duplicate (same kind, amount and occurred_at) unless ``force``.
+    Re-running the backfill's printed commands is the easy way to record a
+    deposit twice, and a doubled deposit inflates the peak the drawdown halt
+    reads.
     """
     kind_norm, amount = validate_flow_amount(kind, amount_usd)
     ts = normalize_flow_ts(occurred_at)
@@ -459,11 +432,10 @@ def record_capital_flow(
 
 
 def list_capital_flows(conn: sqlite3.Connection) -> list[dict[str, Any]]:
-    """All recorded flows oldest-first.
+    """All recorded flows, oldest first.
 
-    Rows before ``WALLET_START_AT`` remain visible for audit history but are
-    excluded from the current equity replay. This table is a hand-entered
-    record of a few account events, not a stream. Returns [] when missing.
+    Rows before ``WALLET_START_AT`` are listed for history but excluded from
+    the equity replay. Returns [] when the table is missing.
     """
     try:
         rows = conn.execute(
@@ -492,27 +464,25 @@ def _replay_equity(
 ) -> tuple[float, float, float]:
     """Replay the equity series and return ``(peak, pnl_peak, net_flow)``.
 
-    ONE merge, shared by every caller (the per-wallet Python replay, the
-    shared-equity post-pass and the SQL-sourced ``get_capital_snapshot``), so
-    the halt-facing peak can never desync between them.
+    Every caller (the per-wallet replay, the shared-equity pass and
+    ``get_capital_snapshot``) uses this one merge, so they always agree on the
+    peak.
 
-    Two high-water marks come out of the single ordered pass:
-      * ``peak`` — the FLOW-INCLUSIVE series (seed + pnl + flows). This is what
-        ``drawdown_pct_peak_frac`` (the hard DD halt + the DD brake) reads: a
-        deposit raises equity at its timestamp WITHOUT counting as profit, and
-        a withdrawal re-anchors the peak at the post-withdrawal balance so the
-        cash transfer itself cannot trigger a halt. Trading losses after that
-        withdrawal are measured from the new peak.
-      * ``pnl_peak`` — the PURE-P&L series (seed + pnl), untouched by flows,
-        preserving the D14 ``drawdown_ratio`` backtest-parity shape.
+    One ordered pass yields two high-water marks:
 
-    Both are seeded at ``INITIAL_BANKROLL``, so with no flow rows the two are
-    identical and every existing number is byte-for-byte unchanged.
+      * ``peak``: the flow-inclusive series (seed + pnl + flows). This is what
+        ``drawdown_pct_peak_frac`` (the drawdown halt and brake) reads. A deposit
+        raises equity at its timestamp without counting as profit; a withdrawal
+        resets the peak to the remaining balance, so moving cash out cannot
+        trigger a halt. Later trading losses are measured from the new peak.
+      * ``pnl_peak``: the PnL-only series (seed + pnl), ignoring flows, for the
+        backtest-comparable ``drawdown_ratio``.
 
-    Ordering: rows sort by the equity-change timestamp key, and a settlement
-    sorts BEFORE a flow at an identical key (rank 0 vs 1) — flows carry a
-    coarse operator-observed timestamp while a settlement's is exact, so within
-    the same second the market event is the earlier one.
+    Both start at ``INITIAL_BANKROLL``, so with no flows they are identical.
+
+    Ordering: rows sort by the equity-change key, and at an identical key a
+    settlement sorts before a flow (rank 0 vs 1). Flow timestamps are entered
+    by hand and coarse, while settlement times are exact.
     """
     events = [(ts, 0, row_id, pnl, None) for ts, row_id, pnl in settled_rows]
     events.extend(
@@ -547,19 +517,19 @@ def _compute_drawdown_metrics(
     pnl_peak: Optional[float] = None,
     pnl_realized: Optional[float] = None,
 ) -> tuple[float, float]:
-    """Return (drawdown_ratio, drawdown_pct_peak_frac) for a peak/realized pair.
+    """Return (drawdown_ratio, drawdown_pct_peak_frac) for a peak/realized
+    pair.
 
-    D14 pin: drawdown_ratio denominator MUST be INITIAL_BANKROLL (constant),
-    NOT realized_capital, to preserve parity with the backtest drawdown shape.
+    ``drawdown_ratio`` divides by the constant INITIAL_BANKROLL, not
+    realized_capital, to match the backtest's drawdown shape.
 
-    DELIBERATE ASYMMETRY (capital flows): ``drawdown_pct_peak_frac`` — the
-    metric the live hard DD halt and the DD brake gate on — runs on the
-    FLOW-INCLUSIVE ``peak``/``realized`` pair, because risk must be measured
-    against the money actually funding the account. ``drawdown_ratio`` stays
-    PURE P&L: it reads the ``pnl_peak``/``pnl_realized`` pair (flows excluded)
-    over the constant seed, so a deposit can never flatter or worsen the
-    backtest-comparable drawdown shape. Both default to the flow-inclusive pair
-    so callers with no flows are unaffected.
+    The two metrics deliberately differ on capital flows.
+    ``drawdown_pct_peak_frac``, which the drawdown halt and brake read, uses
+    the flow-inclusive ``peak``/``realized`` pair, because risk is measured
+    against the money actually in the account. ``drawdown_ratio`` uses the
+    PnL-only ``pnl_peak``/``pnl_realized`` pair over the constant seed, so
+    deposits never change it. Both default to the flow-inclusive pair, which is
+    the same thing when there are no flows.
     """
     ratio_peak = peak if pnl_peak is None else pnl_peak
     ratio_realized = realized if pnl_realized is None else pnl_realized
@@ -575,12 +545,12 @@ def _compute_drawdown_metrics(
 
 @dataclass(frozen=True)
 class GroupCapState:
-    """Per-group LIVE exposure state for the U6 group_exposure gate.
+    """Per-group live exposure state for the group exposure gate.
 
-    `pending_usd` sums LIVE PENDING ledger rows + unresolved
-    `live_order_attempts` (SUBMITTING/SUBMITTED with `ledger_id IS NULL`)
-    across all member wallets. DRY rows are excluded — the parity shadow
-    cannot block LIVE entries (D-LIVE-14).
+    ``pending_usd`` sums live PENDING ledger rows plus unresolved
+    ``live_order_attempts`` (SUBMITTING/SUBMITTED with ``ledger_id IS NULL``)
+    across all member wallets. DRY rows are excluded so a dry-run shadow can
+    never block live entries.
     """
 
     group_id: str
@@ -590,12 +560,9 @@ class GroupCapState:
 
 
 def wallet_id_for_sleeve(sleeve: str, pair_component: Optional[str] = None) -> str:
-    """Map ledger/signal labels to the dry-run strategy wallet id.
+    """Map a ledger or signal label to its strategy wallet id.
 
-    Pair ledger rows are stored as ``pairs_5m_long``/``pairs_5m_short`` for
-    leg auditability, while the wallet is the component label (``pairs_5m``).
-    Legacy rows may not have ``wallet_id`` populated, so every reader keeps
-    this inference path.
+    Older rows may lack ``wallet_id``, so every reader keeps this fallback.
     """
     if pair_component:
         return str(pair_component)
@@ -620,19 +587,16 @@ def _wallet_start_sql(raw: Optional[str] = None) -> Optional[str]:
             dt = dt.replace(tzinfo=timezone.utc)
         return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     except ValueError:
-        # SQLite datetime comparisons expect this format; trust operator input
-        # when it is already in SQL-text form.
+        # SQLite datetime comparisons expect this form; input already in
+        # SQL-text form is used as is.
         return text.replace("T", " ")[:19]
 
 
 def wallet_specs_for_portfolio(portfolio: Any) -> list[dict[str, Any]]:
     """One wallet spec per market sleeve.
 
-    ``ledger_sleeves`` stays a TUPLE even though it now always holds exactly the
-    wallet's own label: the pair sleeves (retired 2026-07-31) were the only
-    components that fanned one wallet out across two ledger sleeve names
-    (``{label}_long`` / ``{label}_short``), and every consumer already iterates
-    the tuple.
+    ``ledger_sleeves`` is a tuple holding just the wallet's own label; callers
+    iterate it.
     """
     specs: list[dict[str, Any]] = []
     for component in getattr(portfolio, "market_sleeves", ()):
@@ -657,24 +621,20 @@ def get_wallet_snapshots(
     live_wallet_balance: Optional[float] = None,
     version: Optional[tuple] = None,
 ) -> dict[str, WalletSnapshot]:
-    """Compute isolated capital state for each dry-run strategy wallet.
+    """Compute isolated capital state for each strategy wallet.
 
-    Optional U6 keyword args propagate per-wallet LIVE/DRY mode + group
-    exposure context into the returned snapshots so the pipeline can route
-    consistently within a tick:
+    Optional keyword arguments carry per-wallet mode and group exposure into
+    the snapshots so the pipeline routes consistently within a tick:
 
-    - `mode_state`: bulk-loaded `{wallet_id: 'LIVE'|'DRY'}` from
-      `wallet_mode_state` (D-LIVE-20). Wallets missing from the dict default
-      to 'DRY'.
-    - `group_state`: `{group_id: GroupCapState}` computed by
-      `get_group_state` so the snapshot exposes the group cap/pending pair
-      the gate needs.
-    - `live_wallet_balance`: latest CLOB funder balance — drives the
-      D-LIVE-4 effective-cap shrinkage.
-    - `version`: a ledger_version() probe the caller already read this pass
-      (the snapshot builder shares ONE probe across its KPI caches); passed
-      through to the scan cache to skip the re-read. Omitted, the scan reads
-      its own — still before the scan, so the freshness contract holds.
+    - ``mode_state``: ``{wallet_id: 'LIVE'|'DRY'}`` from ``wallet_mode_state``.
+      Missing wallets default to 'DRY'.
+    - ``group_state``: ``{group_id: GroupCapState}`` from ``get_group_state``,
+      so each snapshot carries the group cap and pending amount the gate needs.
+    - ``live_wallet_balance``: latest CLOB funder balance; it shrinks the
+      effective cap.
+    - ``version``: a ledger_version() the caller already read this pass (the
+      snapshot builder shares one across its caches). If omitted, the scan reads
+      its own, still before scanning.
     """
     specs = wallet_specs_for_portfolio(portfolio)
     state: dict[str, dict[str, Any]] = {
@@ -699,10 +659,9 @@ def get_wallet_snapshots(
     )
 
     rows = _cached_ledger_rows(conn, since_sql, version=version)
-    # Account-level cash events, gated on the SAME cutover as the ledger scan
-    # (the seed is the balance at that moment). Loaded once and merged into
-    # every wallet's replay below — a deposit funds the whole account, not a
-    # sleeve.
+    # Account-level cash events, using the same cutover as the ledger scan (the
+    # seed is the balance at that moment). Loaded once and merged into every
+    # wallet's replay: a deposit funds the whole account, not one sleeve.
     flows = load_capital_flows(conn, since_sql)
 
     for row in rows:
@@ -736,10 +695,10 @@ def get_wallet_snapshots(
                     if outcome == "WIN":
                         bucket["wins_24h"] += 1
                 elif str(row["exit_kind"] or "") == "stop_loss":
-                    # Booked stop-loss exit (CANCELLED outcome, real pnl_net —
-                    # this branch already requires pnl_raw IS NOT NULL, so a
-                    # voided cancel never lands here). Counted separately so
-                    # win_rate_24h can count it as a loss (W·L·SL contract).
+                    # Stop-loss exit (CANCELLED with a real pnl_net; this
+                    # branch already requires pnl_raw IS NOT NULL, so voided
+                    # cancels never land here). Counted separately so
+                    # win_rate_24h can count it as a loss.
                     bucket["stops_24h"] += 1
         if int(row["is_topup"] or 0) == 1 and bet_ts >= one_day_ago:
             bucket["n_topups_24h"] += 1
@@ -755,9 +714,8 @@ def get_wallet_snapshots(
         drawdown_ratio, drawdown_pct_peak_frac = _compute_drawdown_metrics(
             peak, realized, pnl_peak=pnl_peak, pnl_realized=pnl_realized
         )
-        # Per-strategy LIVE plumbing: mode + group come from the optional
-        # kwargs so legacy callers (tests, dashboard snapshot builder) keep
-        # working without supplying them.
+        # Mode and group come from optional arguments so callers that do not
+        # supply them (tests, the dashboard snapshot builder) still work.
         mode = "DRY"
         if mode_state is not None:
             mode = str(mode_state.get(wallet_id, "DRY") or "DRY").upper()
@@ -802,13 +760,12 @@ def get_wallet_snapshots(
             live_wallet_balance=live_wallet_balance,
         )
 
-    # ---- Phase 5 shared-equity post-pass (plan 2026-05-29-001 option B1) ----
-    # For each `shared_equity` wallet_group, the member sleeves compound on
-    # ONE shared equity, share ONE peak (drawdown halt), and share ONE
-    # exposure cap — faithful to exp044's single-wallet backtest. We compute
-    # the COMBINED capital across members and OVERRIDE only the shared fields
-    # on each member snapshot. Isolated wallets and non-shared groups are
-    # untouched (the loop body skips groups whose `shared_equity` is False).
+    # ---- Shared-equity pass ---- The sleeves in a ``shared_equity`` wallet
+    # group compound on one equity, share one peak (for the drawdown halt) and
+    # one exposure cap, as in the single-wallet backtest. Compute the combined
+    # capital across members and override only the shared fields on each
+    # member's snapshot. Isolated wallets and groups without ``shared_equity``
+    # are left alone.
     groups = getattr(portfolio, "wallet_groups", ()) or ()
     for group in groups:
         if not getattr(group, "shared_equity", False):
@@ -817,31 +774,29 @@ def get_wallet_snapshots(
         if not member_ids:
             continue
 
-        # combined_pnl_total = SUM of member buckets' pnl_total.
+        # combined_pnl_total = sum of the members' pnl_total.
         combined_pnl_total = sum(
             float(state[m]["pnl_total"]) for m in member_ids
         )
 
-        # combined_peak: MERGE all member buckets' settled_rows into one
-        # list plus the account-level capital flows, replay the running
-        # combined equity in equity-change order, track the max. This is the
-        # peak of the COMBINED equity curve — NOT the sum (or max) of
-        # per-sleeve peaks. This is the peak the LIVE hard DD halt reads: the
-        # deployed sleeves live in a shared_equity group, so the flows have to
-        # land HERE, not only on the per-wallet replay above.
+        # combined_peak: merge every member's settled rows with the account's
+        # capital flows, replay combined equity in equity-change order and take
+        # the maximum. That is the peak of the combined curve, not the sum or
+        # max of per-sleeve peaks. The drawdown halt reads this peak, which is
+        # why the flows must be merged here and not only in the per-wallet
+        # replay.
         merged_rows: list[tuple[str, int, float]] = []
         for m in member_ids:
             merged_rows.extend(state[m]["settled_rows"])
         combined_peak, combined_pnl_peak, combined_net_flow = _replay_equity(
             merged_rows, flows
         )
-        # The shared wallet has ONE bankroll and ONE funding stream — add
-        # INITIAL_BANKROLL (and the flows) ONCE, NOT once per member (summing
-        # per-member realized double-counts both).
+        # The shared wallet has one bankroll and one funding stream: add
+        # INITIAL_BANKROLL and the flows once, not once per member.
         combined_pnl_realized = INITIAL_BANKROLL + combined_pnl_total
         combined_realized = combined_pnl_realized + combined_net_flow
 
-        # combined_pending = SUM of member buckets' pending_exposure.
+        # combined_pending = sum of the members' pending_exposure.
         combined_pending = sum(
             float(state[m]["pending_exposure"]) for m in member_ids
         )
@@ -853,11 +808,11 @@ def get_wallet_snapshots(
             pnl_realized=combined_pnl_realized,
         )
 
-        # Override ONLY the shared capital fields on each member snapshot via
-        # dataclasses.replace. KEEP per-member pnl_total / pnl_24h / wins_24h /
-        # settled_24h / stops_24h / n_pending / n_settled / n_topups_24h /
-        # mode / wallet_group / group_cap_usd / group_pending_usd /
-        # live_wallet_balance for dashboard attribution.
+        # Override only the shared capital fields on each member. Per-member
+        # pnl_total, pnl_24h, wins_24h, settled_24h, stops_24h, n_pending,
+        # n_settled, n_topups_24h, mode, wallet_group, group_cap_usd,
+        # group_pending_usd and live_wallet_balance stay as they are for the
+        # dashboard.
         for m in member_ids:
             snapshots[m] = replace(
                 snapshots[m],
@@ -877,22 +832,23 @@ def get_group_state(
     conn: sqlite3.Connection,
     portfolio: Any,
 ) -> dict[str, "GroupCapState"]:
-    """Compute per-group LIVE pending exposure (D-LIVE-14).
+    """Compute per-group live pending exposure.
 
-    Sources contributing to `pending_usd`:
-      1. LIVE PENDING ledger rows for any wallet in the group.
-      2. `live_order_attempts` in SUBMITTING/SUBMITTED with `ledger_id IS NULL`
-         and `wallet_group` matching the group.
+    ``pending_usd`` adds up:
 
-    DRY rows are excluded — the parity shadow does not consume real-money
-    headroom. Wallets with no group membership get no row.
+      1. live PENDING ledger rows for any wallet in the group;
+      2. ``live_order_attempts`` in SUBMITTING/SUBMITTED with
+         ``ledger_id IS NULL`` whose ``wallet_group`` is this group.
+
+    DRY rows are excluded because a dry run uses no real money. Wallets outside
+    any group get no row.
     """
     groups = getattr(portfolio, "wallet_groups", ()) or ()
     out: dict[str, GroupCapState] = {}
     if not groups:
         return out
 
-    # 1. LIVE PENDING ledger exposure aggregated per wallet_id.
+    # 1. Live PENDING ledger exposure per wallet_id.
     ledger_rows = conn.execute(
         """
         SELECT wallet_id, COALESCE(SUM(bet_size), 0.0) AS pending
@@ -905,10 +861,9 @@ def get_group_state(
         str(r["wallet_id"] or ""): float(r["pending"] or 0.0) for r in ledger_rows
     }
 
-    # 2. Active live_order_attempts that have not yet been linked to a
-    # ledger row contribute their reserved amount toward group pending
-    # exposure. The active-slot partial unique index guarantees one row
-    # per (wallet, coin, sleeve, em, side, window) — no double-counting.
+    # 2. Active live_order_attempts not yet linked to a ledger row count their
+    # reserved amount. The active-slot unique index allows one row per (wallet,
+    # coin, sleeve, em, side, window), so nothing is counted twice.
     try:
         attempt_rows = conn.execute(
             """
@@ -944,37 +899,27 @@ def get_group_state(
 def extractable_pnl_for_wallet(
     conn: sqlite3.Connection, wallet_id: str
 ) -> float:
-    """Per-strategy realized PnL available for transfer (D-LIVE-21).
+    """Realized PnL a strategy wallet can transfer out.
 
-    Formula:
-      extractable = SUM(pnl_net for LIVE settled rows on wallet)
-                  - SUM(amount_usd for in-flight/CONFIRMED transfers from wallet)
+      extractable = SUM(pnl_net for live settled rows on the wallet)
+                  - SUM(amount_usd for in-flight or CONFIRMED transfers out)
 
-    Audit P1 #6: prior transfers in CONFIRMED *and* the in-flight states
-    SUBMITTED/SUBMITTING are subtracted. A SUBMITTED transfer (relayer
-    accepted, awaiting on-chain confirmation) is a real withdrawal in
-    progress; nothing in the repo promotes SUBMITTED->CONFIRMED, so counting
-    only CONFIRMED let an in-flight withdrawal be double-spent. Treating
-    in-flight as committed is conservative and self-corrects: if the transfer
-    later FAILs, the row leaves the subtracted set and extractable rises.
+    In-flight transfers (SUBMITTING, SUBMITTED) are subtracted along with
+    CONFIRMED ones. Nothing promotes SUBMITTED to CONFIRMED, so counting only
+    CONFIRMED would let an in-flight withdrawal be spent twice. If a transfer
+    later FAILs it drops out of the sum and extractable rises again.
 
-    "Settled" is the SAME canonical predicate get_capital_snapshot uses for
-    realized_capital: ``outcome != 'PENDING' AND pnl_net IS NOT NULL``. Audit
-    P1 #5: the prior ``outcome IN ('WIN','LOSS','PUSH')`` filter EXCLUDED
-    CANCELLED rows, but a CANCELLED row can still carry a REAL realized
-    round-trip PnL in ``pnl_net`` (historically the retired pair-orphan close
-    wrote one). realized_capital counted that loss while extractable did not,
-    so extractable overstated withdrawable funds. Using one predicate keeps the
-    two views in lockstep.
+    "Settled" uses the same test as realized_capital in get_capital_snapshot:
+    ``outcome != 'PENDING' AND pnl_net IS NOT NULL``. A CANCELLED row can carry
+    a real pnl_net, so filtering on WIN/LOSS/PUSH would let extractable
+    overstate what can be withdrawn.
 
-    The transfer flow's preview blocks any submission that would push
-    extractable negative. v1 attributes withdrawals to a single source
-    wallet so the operator can extract winners without freezing losers.
+    The transfer preview refuses any transfer that would make extractable
+    negative. Withdrawals come from one source wallet, so winners can be
+    extracted without freezing losers.
 
-    Performance finding #8 (PERF-04): for the per-tick snapshot builder
-    that needs values for every wallet, prefer `extractable_pnl_by_wallet`
-    (one aggregate query covering all wallets) over N invocations of
-    this per-wallet helper (2N queries).
+    For every wallet at once, use ``extractable_pnl_by_wallet`` (two queries in
+    total instead of two per wallet).
     """
     pnl = conn.execute(
         """
@@ -1000,12 +945,12 @@ def extractable_pnl_for_wallet(
 
 
 def extractable_pnl_by_wallet(conn: sqlite3.Connection) -> dict[str, float]:
-    """Bulk variant: 2 queries total instead of 2*N for the snapshot
-    builder. Returns `{wallet_id: extractable}` for every wallet that
-    has at least one LIVE settled row or a CONFIRMED transfer.
+    """Bulk variant: two queries in total instead of two per wallet. Returns
+    ``{wallet_id: extractable}`` for every wallet with at least one live
+    settled row or a CONFIRMED transfer.
 
-    Wallets absent from the map have zero realized PnL and zero prior
-    transfers; callers default missing keys to 0.0.
+    A wallet missing from the map has zero PnL and zero transfers; callers
+    default missing keys to 0.0.
     """
     pnl_rows = conn.execute(
         """
