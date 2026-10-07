@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="dark">
+<meta name="theme-color" content="#0a0c11">
+<title>cryptobot · night desk</title>
+<style>html{background:#0a0c11}</style>
+<link rel="icon" href="assets/glyph.svg">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="styles.css?v=v4-20260729">
+</head>
+<body>
+<div id="root">
+  <div class="boot">
+    <div style="text-align:center">
+      <div class="b-mark">
+        <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M5 16V12M10 16V8M15 16V10M20 16V6"/></svg>
+      </div>
+      <div>loading operator journal…</div>
+    </div>
+  </div>
+</div>
+
+<!-- React + Babel from CDN, pinned with SRI (matches the prior dashboard's
+     supply-chain posture). The JSX modules below are compiled in document
+     order by Babel standalone at DOMContentLoaded and register their
+     components on `window`; load order matters (data → charts → shell →
+     pages → app). -->
+<script src="https://unpkg.com/react@18.3.1/umd/react.production.min.js" integrity="sha384-DGyLxAyjq0f9SPpVevD6IgztCFlnMF6oW/XQGmfe+IsZ8TqEiDrcHkMLKI6fiB/Z" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js" integrity="sha384-gTGxhz21lVGYNMcdJOyq01Edg0jhn/c22nsx0kyqP0TxaV5WVdsSH1fSDUf5YJj1" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" integrity="sha384-m08KidiNqLdpJqLq95G/LEi8Qvjl/xUYll3QILypMoQ65QorJ9Lvtp2RXYGBFj1y" crossorigin="anonymous"></script>
+
+<!-- ?v= cache-bust: deploy.sh AUTO-STAMPS this with a content hash of the
+     dashboard bundle at ship time (so browsers never serve a stale babel-compiled
+     JSX module). The value below is only a dev placeholder for local serving —
+     no need to bump it by hand for a deploy anymore. -->
+<script src="time.js?v=v4-20260729"></script>
+<!-- time.js defines the shared UTC parser used by the bridge and data module. -->
+<script src="live-bridge.js?v=v4-20260729"></script>
+<script src="api.js?v=v4-20260729"></script>
+<script type="text/babel" data-presets="react" src="data.jsx?v=v4-20260729"></script>
+<script type="text/babel" data-presets="react" src="charts.jsx?v=v4-20260729"></script>
+<script type="text/babel" data-presets="react" src="shell.jsx?v=v4-20260729"></script>
+<script type="text/babel" data-presets="react" src="pages-overview.jsx?v=v4-20260729"></script>
+<script type="text/babel" data-presets="react" src="pages-live.jsx?v=v4-20260729"></script>
+<script type="text/babel" data-presets="react" src="pages-analytics.jsx?v=v4-20260729"></script>
+<script type="text/babel" data-presets="react" src="pages-config.jsx?v=v4-20260729"></script>
+<script type="text/babel" data-presets="react" src="pages-latency.jsx?v=v4-20260729"></script>
+<script type="text/babel" data-presets="react" src="pages-subminute.jsx?v=v4-20260729"></script>
+<script type="text/babel" data-presets="react" src="app.jsx?v=v4-20260729"></script>
+</body>
+</html>

@@ -1,0 +1,58 @@
+[Unit]
+Description=cryptobot live scanner (Polymarket *-updown-* + Binance spot)
+Documentation=https://github.com/your-org/cryptobot
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=10
+# Telegram alert when the service lands in failed state (crash loop past the
+# restart burst, or a non-restartable exit). The scanner cannot alert on its
+# own death; this hook is the out-of-process backstop.
+OnFailure=cryptobot-failure-alert.service
+
+[Service]
+Type=simple
+User=ec2-user
+Group=ec2-user
+WorkingDirectory=/home/ec2-user/cryptobot
+EnvironmentFile=/etc/cryptobot.env
+
+# Python venv + project import path
+ExecStart=/home/ec2-user/cryptobot/.venv/bin/python -m cryptobot
+
+# Restart-on-failure with linear backoff (5s, 10s, 20s capped at 60s).
+# Don't restart on clean exit (SIGTERM during shutdown returns 0).
+Restart=on-failure
+RestartSec=5
+
+# Logging — append (not overwrite) so journal + flat file both exist.
+# journald captures stdout+stderr automatically; the flat file is for grep.
+StandardOutput=append:/var/log/cryptobot/scanner.log
+StandardError=append:/var/log/cryptobot/scanner.err
+
+# Graceful shutdown — main.py installs a SIGTERM handler that drains the
+# in-flight tick via scheduler.shutdown(wait=True) before closing the DB.
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+# Resource guard rails for the upsized ~4 GB box (2026-07-05: raised from
+# 1500M/1200M, which was sized for the old t3.small/2 GB and stalled the boot
+# — the 614 MB checkpoint_v1 forest alone exceeds 1.5 GB with the pandas/
+# sklearn import graphs, so the service thrashed at the cgroup ceiling and
+# never reached 'boot OK'. The rf_v1 + hgb_v1 + decision_table load that
+# accompanied it was retired 2026-07-31; the ceiling is left as-is with the
+# headroom it buys).
+# 3300M/2900M leaves ~500 MB for the OS on the 3819 MB box.
+MemoryMax=3300M
+MemoryHigh=2900M
+LimitNOFILE=4096
+
+# Filesystem hardening — bot only writes to data/, runtime/data and logs
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/ec2-user/cryptobot/data /home/ec2-user/cryptobot/runtime/data /var/log/cryptobot
+PrivateTmp=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,135 @@
+[project]
+name = "cryptobot"
+version = "0.1.0"
+description = "Polymarket 15M/5M crypto live real-money trading scanner + dashboard"
+requires-python = ">=3.11"
+dependencies = [
+    # data fetch / live runtime
+    "requests>=2.31",
+    "httpx>=0.27",
+    "apscheduler>=3.10",
+    "pytz>=2024.1",
+    "tzlocal>=5.2",
+    # config (per-strategy LIVE plan §U2: Pydantic singleton for POLY_* creds)
+    "pydantic>=2.0",
+    "pydantic-settings>=2.0",
+    # Polymarket live trading / relayer
+    "py-clob-client-v2>=1.0.1",
+    "py-builder-relayer-client>=0.0.2rc1",
+    "eth-abi>=5.0",
+    "eth-utils>=4.0",
+    # analysis
+    "pandas>=2.2",
+    "numpy>=1.26",
+    "scipy>=1.13",
+    "statsmodels>=0.14",
+    "scikit-learn>=1.4",
+    "xgboost>=2.0",
+    "shap>=0.45",
+    "pyarrow>=15",
+    "joblib>=1.3",
+    # viz
+    "matplotlib>=3.8",
+    "seaborn>=0.13",
+    # notebook authoring + execution
+    "nbformat>=5.10",
+    "nbclient>=0.10",
+    "ipykernel>=6.29",
+    # interactive viewer
+    "jupyterlab>=4.0",
+]
+
+[project.scripts]
+# Names are FROZEN (operator runbooks + the deployed box call these). Phase 2
+# only re-pointed the module paths of the per-venue ones.
+cbot-operator = "cryptobot.cli.operator:main"
+cbot-live-go-no-go = "cryptobot.cli.live_go_no_go:main"
+cbot-poly-wallet-diagnostics = "cryptobot_polymarket.wallet_diagnostics:main"
+cbot-derive-poly-creds = "cryptobot_polymarket.derive_creds:main"
+cbot-predictfun-wallet-diagnostics = "cryptobot_predictfun.wallet_diagnostics:main"
+cbot-derive-predictfun-creds = "cryptobot_predictfun.derive_creds:main"
+cbot-predictfun-live-validation = "cryptobot_predictfun.live_validation:main"
+cbot-env-parity = "cryptobot.cli.env_parity:main"
+cbot-set-wallet-mode = "cryptobot.cli.set_wallet_mode:main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+]
+# predict.fun venue (CRYPTOBOT_VENUE=predictfun). OPTIONAL: the official EIP-712
+# order-signing SDK is only needed to SUBMIT live orders on predict.fun. Market
+# discovery, order-book reads, and the book recorder are first-party httpx (no
+# SDK). DRY mode + the recorder run WITHOUT this installed; cryptobot_predictfun
+# .clob raises a graceful PredictFunClientUnavailable (LIVE cells SKIP) when it
+# is absent.
+predictfun = [
+    # Exact-pinned for go-live: the SDK signs real-money EIP-712 orders and a
+    # silent minor bump at deploy pip-install must never change signing
+    # behavior under us (advisor R7, 2026-07-23). Bump deliberately + re-run
+    # the validation CLI's build stage after any upgrade.
+    "predict_sdk==0.0.20",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+# ONE root project shipping FOUR packages: the shared engine plus the three
+# venue adapters (Phase 2 of the venue-tree restructure). An explicit
+# package-dir map rather than `find`, because the src roots are in
+# different venue trees and autodiscovery cannot span them. (Polymarket
+# collapsed its two src roots into one on 2026-08-04 — single src per venue —
+# so it is now three roots for four packages.)
+#
+# Side effect worth knowing: this map has no "" key, so setuptools has no
+# single root to anchor its egg base to and drops `cryptobot.egg-info/` at
+# the PROJECT ROOT. Before Phase 2 the config was `where = ["core/src"]`
+# (911acc4), whose egg base WAS that src root — so a stale one-package
+# `cryptobot.egg-info/` lingered there until it was deleted
+# 2026-07-29. Both are gitignored build residue that nothing imports (the
+# editable install resolves via the .pth finder + dist-info), and there is
+# no pyproject key to relocate or suppress them. Expect exactly one, at the
+# root; a second one under a src root means someone reintroduced a nested
+# build config.
+[tool.setuptools.package-dir]
+cryptobot = "polymarket/src/cryptobot"
+cryptobot_polymarket = "polymarket/src/cryptobot_polymarket"
+cryptobot_predictfun = "predictfun/live/src/cryptobot_predictfun"
+cryptobot_kalshi = "kalshi/live/src/cryptobot_kalshi"
+
+[tool.setuptools.packages.find]
+where = [
+    # ONE src root for polymarket since 2026-08-04: the engine and the venue
+    # adapter share `polymarket/src/`, so this single entry serves both.
+    "polymarket/src",
+    "predictfun/live/src",
+    "kalshi/live/src",
+]
+include = ["cryptobot*"]
+
+[tool.pytest.ini_options]
+testpaths = [
+    "polymarket/src/cryptobot/tests",
+    "polymarket/src/cryptobot_polymarket/tests",
+    "predictfun/live/src/cryptobot_predictfun/tests",
+    "polymarket/backtest/tests",
+    "polymarket/backtest/training/tests",
+    "polymarket/dashboard/tests",
+    # `platform/tests` sat here until 2026-08-02, when the local mission-control
+    # console (127.0.0.1:8900) was retired — its run archive proved it had never
+    # been opened once (history.db `runs` = 0 rows).
+]
+pythonpath = [
+    "polymarket/src",
+    "predictfun/live/src",
+    "kalshi/live/src",
+    ".",
+]
+markers = [
+    "slow: opt-in via -m slow; e.g. live 60s smoke",
+]
+# tmp_path temp root is moved into the repo by the root conftest.py via
+# PYTEST_DEBUG_TEMPROOT (the default %LOCALAPPDATA% root is ACL-locked on
+# this box). Deliberately NOT --basetemp here: a fixed basetemp is cleared at
+# session start, so two concurrent pytest runs wipe each other mid-flight.

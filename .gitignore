@@ -1,0 +1,99 @@
+# =============================================================================
+# .gitignore — venue-tree layout (2026-07-28 restructure)
+#
+# LEGACY-FIRST, and that is deliberate: the restructure moved tracked CODE and
+# left the ~20 GB gitignored research substrate physically where it already was
+# (`backtest/data`, `backtest/cache`, `backtest/optimize_runs`,
+# `backtest/features/nx_v1`). Both path families are therefore ignored here —
+# the LEGACY block keeps every existing checkout clean, the NEW block keeps a
+# fresh clone clean once writers start landing bytes at the new paths. Deleting
+# the legacy block would expose 290k+ untracked files in any current checkout;
+# deleting the new block would let a fresh clone commit multi-GB parquets.
+# The resolution order itself lives in polymarket/backtest/__init__.py.
+#
+# Rules are directory-level wherever the whole directory is regenerable.
+# =============================================================================
+
+# -- Local dev / runtime state ------------------------------------------------
+results/
+# local dev DBs + models (config.DATA_ROOT default) — no inline comments here:
+# git treats "#" as a comment only at line start, so trailing text breaks the rule
+/data/
+/logs/
+*.log
+polymarket/dashboard/snapshot.json
+polymarket/dashboard/live-fixture.json
+
+# -- Research substrate: LEGACY paths (physically real in every checkout today)
+backtest/data/
+backtest/cache/
+backtest/features/nx_v1/
+backtest/optimize_runs/
+
+# -- Research substrate: NEW paths (what a fresh clone will write) ------------
+polymarket/backtest/data/
+polymarket/backtest/cache/
+polymarket/backtest/features/nx_v1/
+polymarket/backtest/optimize_runs/
+predictfun/backtest/data/
+kalshi/backtest/data/
+
+# The ship-to-live artifact boundary. The heavy binaries are build outputs of
+# polymarket/backtest/{build,training}; the small *_manifest.json / provenance
+# files beside them stay TRACKED so a checkout records what shipped.
+polymarket/backtest/artifacts/*.parquet
+polymarket/backtest/artifacts/*.joblib
+# The retired LUT's sidecar is a SIBLING FILE, not a directory:
+# `<parquet-name>.lutcache.pkl`, so it does not end in .parquet and a
+# `lutcache/` dir rule never matched anything. Kept ignored so a stale sidecar
+# left over from before the 2026-07-31 retirement still can't be committed.
+polymarket/backtest/artifacts/*.lutcache.pkl
+
+# -- Platform console (local mission control) ---------------------------------
+# The run archive: history.db (every button-run, the drift graphs' substrate)
+# plus history/runs/<run_id>/{log.txt,report.*}. Local operator state, never
+# shipped and never committed. config/local.json IS tracked — it is the
+# machine map, and it holds no secrets by contract.
+platform/history.db
+platform/history/
+
+# -- Deploy tarballs (staged bundles; legacy + new infra home) ----------------
+deploy/*.tar.gz
+polymarket/infra/*.tar.gz
+predictfun/infra/*.tar.gz
+kalshi/infra/*.tar.gz
+
+# -- Python -------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+.pytest_cache/
+.pytest-gate-tmp/
+
+# -- Env / IDE ----------------------------------------------------------------
+.venv/
+venv/
+.env
+.vscode/
+.idea/
+
+# -- Local agent workspaces and generated optimization transcripts ------------
+.claude/
+.context/
+
+# -- Secrets: SSH / TLS keys, AWS deploy key — never commit -------------------
+*.pem
+*.pem.pub
+*.key
+
+# -- Retired-venue DB archives pulled from boxes (large binaries, never commit)
+predictfun/archive/
+
+# -- Playwright MCP screenshots + traces (local dev artifacts) ----------------
+.playwright-mcp/
+dashboard-*.png
+tab-*.png
+
+# -- pytest basetemp (see pyproject addopts; default temp root is ACL-locked)
+.pytest_tmp/

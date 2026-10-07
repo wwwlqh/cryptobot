@@ -1,0 +1,50 @@
+// Measures for the trades table (analysis/data/trades.csv).
+// In Power BI Desktop: Modeling > New measure, paste one block at a time.
+
+Trades = COUNTROWS ( trades )
+
+Resolved Trades = CALCULATE ( [Trades], trades[outcome] <> "Pending" )
+
+Net PnL = SUM ( trades[pnl_usd] )
+
+Total Staked = SUM ( trades[stake_usd] )
+
+ROI % = DIVIDE ( [Net PnL], [Total Staked] )
+
+Win Rate % =
+DIVIDE (
+    CALCULATE ( [Trades], trades[pnl_usd] > 0 ),
+    [Resolved Trades]
+)
+
+Avg Win = CALCULATE ( AVERAGE ( trades[pnl_usd] ), trades[pnl_usd] > 0 )
+
+Avg Loss = CALCULATE ( AVERAGE ( trades[pnl_usd] ), trades[pnl_usd] < 0 )
+
+// Share of trades where the model picked the side the window actually settled on.
+// Pre-open trades have no win probability, so they are left out to match Avg Price Paid %.
+Model Accuracy % =
+CALCULATE ( AVERAGE ( trades[model_correct] ), NOT ISBLANK ( trades[model_prob] ) )
+
+// What the model said its chance of winning was.
+Avg Model Prob % = AVERAGE ( trades[model_prob] )
+
+// The price paid is the break-even hit rate before fees.
+Avg Price Paid % =
+CALCULATE ( AVERAGE ( trades[market_price] ), NOT ISBLANK ( trades[model_prob] ) )
+
+// Positive = the model beat the price it paid. Negative = no real edge.
+Accuracy vs Price (pts) = ( [Model Accuracy %] - [Avg Price Paid %] ) * 100
+
+// Use with bet_date on the x-axis. Respects coin / strategy slicers.
+Cumulative PnL =
+VAR LastDate = MAX ( trades[bet_date] )
+RETURN
+    CALCULATE (
+        [Net PnL],
+        trades[bet_date] <= LastDate,
+        REMOVEFILTERS ( trades[bet_date], trades[bet_time_utc], trades[trade_id] )
+    )
+
+// Account-level drawdown is precomputed in the CSV (cum_pnl_usd, drawdown_usd).
+Max Drawdown = MIN ( trades[drawdown_usd] )

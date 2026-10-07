@@ -1,0 +1,193 @@
+{
+  "run_id": "per_strategy_compound_dd35_live",
+  "purpose": "SYNTHETIC multi-wallet topology fixture. Four isolated strategy wallets in two virtual $100 groups, carrying the per-wallet exposure caps / backtest max-DDs / default modes that the capital, group-cap, shared-equity, mode, snapshot and SSE tests all exercise. Rebuilt 2026-07-31: it used to hold two blend/rf sleeves plus two PAIR sleeves, both of which were retired with the lut|rf|blend scorer, so every sleeve is now signal_source='hgb'. Every other number (allocs, capital_fracs, edge bands, fill bands, slippage haircuts, caps, DD fracs) is byte-identical to the artifact it replaced, so the tests calibrated against it keep their values. The hgb-only gates are pinned INERT (threshold -1.0, ask_bucket all:0:1, no book_consumption_max) for the same reason. The wallet ids are historical: `pairs_5m` / `pairs_15m` are plain minute-entry wallets here, NOT pair sleeves. These sleeves carry no checkpoint_offset_set, so they take the tick's MINUTE entry path -- the path these pipeline tests were written against; the sub-minute path is covered by test_subminute / test_hgb_scoring against the real checkpoint bundle.",
+  "bankroll": 100.0,
+  "engine": "synthetic fixture \u2014 never deployed",
+  "concurrent_exposure_cap_fraction": 0.28767857660247903,
+  "wallet_exposure_cap_fracs": {
+    "v6_5m": 0.28767857660247903,
+    "v6_15m": 0.24284688600320803,
+    "pairs_5m": 0.28767857660247903,
+    "pairs_15m": 0.18118910790805948
+  },
+  "backtest_max_drawdown_fracs": {
+    "v6_5m": 0.3365059388149646,
+    "v6_15m": 0.3268267850861646,
+    "pairs_5m": 0.3385043156161856,
+    "pairs_15m": 0.11397851656994877
+  },
+  "max_drawdown_halt_frac": 0.5,
+  "label_source": "polymarket",
+  "label_col": "won_up_polymarket",
+  "sleeves": [
+    {
+      "label": "v6_5m",
+      "source": "synthetic fixture (2026-07-31 rebuild)",
+      "alloc": 0.4,
+      "config": {
+        "interval": "5m",
+        "side": "model_signed",
+        "strategy_archetype": "head",
+        "entry_minute_set": [
+          2
+        ],
+        "entry_strategy": "first_qualifying",
+        "min_edge": 0.24540442977674792,
+        "max_edge": 0.8548793088933712,
+        "min_fill_price": 0.006882609225878796,
+        "max_fill_price": 0.5420925466745662,
+        "hour_bucket_set": "all",
+        "dow_set": "weekday",
+        "min_agreement": 1,
+        "capital_frac": 0.06245401188473625,
+        "max_walk_price": 0.06873402999350457,
+        "dd_halve_at": null,
+        "slippage_haircut": 0.008504259998680616,
+        "min_lut_n": 50,
+        "signal_source": "hgb",
+        "threshold": -1.0,
+        "feature_groups": "rf",
+        "ask_bucket": "all:0:1",
+        "book_consumption_max": null,
+        "side_filter": "both"
+      }
+    },
+    {
+      "label": "v6_15m",
+      "source": "synthetic fixture (2026-07-31 rebuild)",
+      "alloc": 0.6,
+      "config": {
+        "interval": "15m",
+        "side": "model_signed",
+        "strategy_archetype": "head",
+        "entry_minute_set": [
+          2,
+          4,
+          6,
+          7,
+          9
+        ],
+        "entry_strategy": "first_qualifying",
+        "min_edge": 0.16375516808452958,
+        "max_edge": 0.6114854546118584,
+        "min_fill_price": 0.3402006283571956,
+        "max_fill_price": 1.0,
+        "hour_bucket_set": "all",
+        "dow_set": "all",
+        "min_agreement": 1,
+        "capital_frac": 0.03241894240383977,
+        "max_walk_price": null,
+        "dd_halve_at": null,
+        "slippage_haircut": 0.03548665884747798,
+        "min_lut_n": 100,
+        "signal_source": "hgb",
+        "threshold": -1.0,
+        "feature_groups": "rf",
+        "ask_bucket": "all:0:1",
+        "book_consumption_max": null,
+        "side_filter": "both"
+      }
+    },
+    {
+      "label": "pairs_5m",
+      "source": "synthetic fixture (2026-07-31 rebuild)",
+      "alloc": 0.4203479524550844,
+      "config": {
+        "interval": "5m",
+        "side": "model_signed",
+        "strategy_archetype": "head",
+        "entry_minute_set": [
+          1,
+          2,
+          3,
+          4
+        ],
+        "entry_strategy": "first_qualifying",
+        "min_edge": 0.11059103664039638,
+        "max_edge": 0.8548793088933712,
+        "min_fill_price": 0.006882609225878796,
+        "max_fill_price": 0.5420925466745662,
+        "hour_bucket_set": "all",
+        "dow_set": "all",
+        "min_agreement": 1,
+        "capital_frac": 0.13653993910928003,
+        "max_walk_price": null,
+        "dd_halve_at": null,
+        "slippage_haircut": 0.0,
+        "min_lut_n": 90,
+        "signal_source": "hgb",
+        "threshold": -1.0,
+        "feature_groups": "rf",
+        "ask_bucket": "all:0:1",
+        "book_consumption_max": null,
+        "side_filter": "both"
+      }
+    },
+    {
+      "label": "pairs_15m",
+      "source": "synthetic fixture (2026-07-31 rebuild)",
+      "alloc": 0.4045362286599269,
+      "config": {
+        "interval": "15m",
+        "side": "model_signed",
+        "strategy_archetype": "head",
+        "entry_minute_set": [
+          5,
+          8,
+          13
+        ],
+        "entry_strategy": "first_qualifying",
+        "min_edge": 0.12592376961053503,
+        "max_edge": 0.6114854546118584,
+        "min_fill_price": 0.3402006283571956,
+        "max_fill_price": 1.0,
+        "hour_bucket_set": "all",
+        "dow_set": "all",
+        "min_agreement": 1,
+        "capital_frac": 0.06937183243658475,
+        "max_walk_price": null,
+        "dd_halve_at": null,
+        "slippage_haircut": 0.0,
+        "min_lut_n": 80,
+        "signal_source": "hgb",
+        "threshold": -1.0,
+        "feature_groups": "rf",
+        "ask_bucket": "all:0:1",
+        "book_consumption_max": null,
+        "side_filter": "both"
+      }
+    }
+  ],
+  "coin_universe": [
+    "BTC",
+    "ETH",
+    "SOL",
+    "XRP"
+  ],
+  "wallet_groups": {
+    "group_5m": {
+      "members": [
+        "v6_5m",
+        "pairs_5m"
+      ],
+      "cap_usd": 100.0
+    },
+    "group_15m": {
+      "members": [
+        "v6_15m",
+        "pairs_15m"
+      ],
+      "cap_usd": 100.0
+    }
+  },
+  "wallet_default_modes": {
+    "v6_5m": "DRY",
+    "v6_15m": "DRY",
+    "pairs_5m": "DRY",
+    "pairs_15m": "DRY"
+  },
+  "wallet_groups_basis": "Two virtual $100 caps over one funder, so the group-cap gate has >1 group and >1 member per group to exercise. group_5m = v6_5m + pairs_5m; group_15m = v6_15m + pairs_15m.",
+  "updated_at": "2026-07-31T00:00:00+08:00",
+  "bet_size_multiplier_vs_optuna": 1.0,
+  "bet_size_rationale": "Runtime sizing is wallet_realized_capital * alloc * capital_frac * multiplier. Values are inherited from the artifact this fixture replaced so the sizing assertions in test_capital / test_snapshot_builder keep their numbers."
+}

@@ -1,0 +1,115 @@
+{
+  "run_id": "twap_pooled_fixed_all4_t150_live_2026_08_15",
+  "purpose": "Production TWAP-60 BTC+ETH+SOL+XRP contract with exactly two frozen models: one pooled categorical-coin HGB for 5m and one for 15m. All four coins and both intervals use the same T-150 through T-1 entry window. Exact Chainlink 60s boundary TWAP and causal Binance 60s opening TWAP remain fail-closed. Shared contract: 0.55<ask<=0.85, fee-adjusted pred_edge>=0.10, book consumption <=6%, one base fill per market, top-ups and T3 disabled, Tier A disabled, 1% shared-equity base stake.",
+  "bankroll": 100,
+  "engine": "fixed pooled all-four-coin TWAP-60 HGB per interval; timing-only shared-cutoff replay; direct twap_symmetric_v1 scorer",
+  "concurrent_exposure_cap_fraction": 1,
+  "wallet_exposure_cap_fracs": {
+    "subminute_5m": 1,
+    "subminute_15m": 1
+  },
+  "backtest_max_drawdown_fracs": {
+    "subminute_5m": 0.1309,
+    "subminute_15m": 0.0738
+  },
+  "max_drawdown_halt_frac": 0.40,
+  "label_source": "polymarket",
+  "label_col": "won_up_polymarket",
+  "shared_equity": true,
+  "sizing_mode": "compound",
+  "sleeves": [
+    {
+      "label": "subminute_5m",
+      "source": "Frozen pooled BTC+ETH+SOL+XRP 5m HGB, categorical coin_id, fixed shared gate, operator-selected shared T-150 cutoff; direct 11-feature HGB; exact live Chainlink 60s boundary anchor",
+      "alloc": 1,
+      "config": {
+        "interval": "5m",
+        "side": "model_signed",
+        "entry_minute_set": [0, 1, 2, 3, 4],
+        "entry_strategy": "every_qualifying",
+        "min_edge": -1,
+        "max_edge": 1,
+        "min_fill_price": 0.55,
+        "max_fill_price": 0.85,
+        "min_agreement": 0,
+        "capital_frac": 0.010,
+        "dd_halve_at": null,
+        "slippage_haircut": 0,
+        "min_lut_n": 0,
+        "signal_source": "hgb",
+        "hour_bucket_set": "all",
+        "dow_set": "all",
+        "partial_ret_z_floor": null,
+        "partial_ret_z_ceiling": null,
+        "threshold": 0.10,
+        "feature_groups": "price,identity,time,momentum",
+        "ask_bucket": "band:0.55:0.85",
+        "book_consumption_max": 0.06,
+        "side_filter": "both",
+        "sample_weight_mode": "recent_chunk_boost",
+        "stake_frac": 0.010,
+        "hgb_learning_rate": 0.04,
+        "hgb_max_iter": 100,
+        "hgb_max_leaf_nodes": 31,
+        "hgb_l2_regularization": 0.02,
+        "coin_stake_mult": {"BTC": 1, "ETH": 1, "SOL": 1, "XRP": 1},
+        "max_bet_usd_by_coin": {},
+        "checkpoint_offset_set": "150:299:1"
+      }
+    },
+    {
+      "label": "subminute_15m",
+      "source": "Frozen pooled BTC+ETH+SOL+XRP 15m HGB, categorical coin_id, fixed shared gate, operator-selected shared T-150 cutoff; direct 11-feature HGB; exact live Chainlink 60s boundary anchor",
+      "alloc": 1,
+      "config": {
+        "interval": "15m",
+        "side": "model_signed",
+        "entry_minute_set": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14],
+        "entry_strategy": "every_qualifying",
+        "min_edge": -1,
+        "max_edge": 1,
+        "min_fill_price": 0.55,
+        "max_fill_price": 0.85,
+        "min_agreement": 0,
+        "capital_frac": 0.010,
+        "dd_halve_at": null,
+        "slippage_haircut": 0,
+        "min_lut_n": 0,
+        "signal_source": "hgb",
+        "hour_bucket_set": "all",
+        "dow_set": "all",
+        "partial_ret_z_floor": null,
+        "partial_ret_z_ceiling": null,
+        "threshold": 0.10,
+        "feature_groups": "price,identity,time,momentum",
+        "ask_bucket": "band:0.55:0.85",
+        "book_consumption_max": 0.06,
+        "side_filter": "both",
+        "sample_weight_mode": "recent_chunk_boost",
+        "stake_frac": 0.010,
+        "hgb_learning_rate": 0.04,
+        "hgb_max_iter": 100,
+        "hgb_max_leaf_nodes": 31,
+        "hgb_l2_regularization": 0.02,
+        "coin_stake_mult": {"BTC": 1, "ETH": 1, "SOL": 1, "XRP": 1},
+        "max_bet_usd_by_coin": {},
+        "checkpoint_offset_set": "750:899:1"
+      }
+    }
+  ],
+  "pair_sleeves": [],
+  "coin_universe": ["BTC", "ETH", "SOL", "XRP"],
+  "wallet_default_modes": {
+    "subminute_5m": "LIVE",
+    "subminute_15m": "LIVE"
+  },
+  "wallet_groups": {
+    "group_live": {
+      "members": ["subminute_5m", "subminute_15m"],
+      "shared_equity": true,
+      "cap_tracks_equity": true
+    }
+  },
+  "bet_size_rationale": "Run BTC+ETH+SOL+XRP at 1.0% of current available shared cash with one base fill and no top-ups. The two pooled interval HGBs and execution gates remain byte-for-byte frozen; only the shared live timing mask changes. T-150 is common to all four coins and both intervals to reduce timing degrees of freedom. Fixed-model PMData replay through 2026-08-15 UTC produced 443 5m trades at 73.36% WR, +$31.79 PnL, +$0.0718/trade, and $13.09 max DD; 405 15m trades at 73.83% WR, +$40.01 PnL, +$0.0988/trade, and $7.38 max DD. The appended 15m day alone remained slightly negative (-$0.62), so T-150 is an operator-selected shared structure rather than a claim that every recent slice is positive. Both intervals keep the 60s Chainlink/Binance opening contract, 0.10 fee-adjusted edge gate, 6% depth-consumption cap, trend following, no side flip, Tier A off, and the 40% shared-equity drawdown halt.",
+  "updated_at": "2026-08-15T10:22:32+08:00"
+}

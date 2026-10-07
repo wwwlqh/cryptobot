@@ -1,0 +1,53 @@
+[Unit]
+Description=cryptobot WAL checkpoint (TRUNCATE) + disk-free probe
+Documentation=https://github.com/your-org/cryptobot
+After=cryptobot.service
+
+# Order AFTER cryptobot.service (no activation). The LUT load + boot
+# sequence touches the DB, so if the bot IS running we let it settle
+# first; the checkpoint's writer lock would otherwise just queue behind
+# the bot's own init writes.
+#
+# audit #10 (w19oxqf24): do NOT add `Requires=cryptobot.service` here.
+# Requires= is an ACTIVATION dependency, not a "don't run concurrently"
+# guard — when this oneshot fires from the daily timer (04:00 UTC +
+# Persistent=true catch-up), Requires= would silently start cryptobot if
+# it were inactive, restarting a real-money bot the operator had
+# deliberately `systemctl stop`ped to inspect the DB / pause trading
+# (AGENTS.md). After= only ORDERS the checkpoint relative to the bot if
+# it happens to be running; it never starts it. wal_checkpoint(TRUNCATE)
+# is a safe no-op against a stopped DB and deploy/cron.daily.sh already  (legacy-path-ok: remote layout)
+# tolerates (and logs) a locked DB.
+
+[Service]
+Type=oneshot
+User=ec2-user
+Group=ec2-user
+WorkingDirectory=/home/ec2-user/cryptobot
+
+# Run the same script that used to live under /etc/cron.daily/ on
+# hosts with a cron daemon. The script is a no-op on AL2023 cron
+# itself; the timer below is what actually fires it. See
+# `deploy/cron.daily.sh` for the WAL TRUNCATE + disk probe logic.  (legacy-path-ok: remote layout)
+# legacy-path-ok: remote layout is frozen until the Phase 3 cutover
+ExecStart=/home/ec2-user/cryptobot/deploy/cron.daily.sh
+
+# Capture output into journald so operators can audit via
+# `journalctl -u cryptobot-wal-checkpoint`. The script also pipes
+# itself into `logger -t cryptobot-cron`; that is harmless when run
+# under systemd but lets operators on a hypothetical Ubuntu host with
+# a real cron daemon keep the same tag.
+StandardOutput=journal
+StandardError=journal
+
+# Resource ceilings — the checkpoint touches the DB briefly then
+# exits. No need for the same headroom as the scanner.
+MemoryMax=200M
+LimitNOFILE=512
+
+# Filesystem hardening mirrors cryptobot.service.
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/ec2-user/cryptobot/data
+PrivateTmp=true
+NoNewPrivileges=true

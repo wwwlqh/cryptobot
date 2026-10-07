@@ -1,0 +1,200 @@
+{
+  "schema_version": 2,
+  "strategy": "v2 step1last MID+NL union + PURE_STOP_04",
+  "latency_ms": 400,
+  "start_capital_per_fold": 100.0,
+  "scoring": {
+    "features": 11,
+    "method": "expanding-window per-fold WFO with embargo",
+    "dynamic_held_side_rescore": true,
+    "score_path": "C:\\Users\\<user>\\OneDrive\\Desktop\\cryptobot\\backtest\\optimize_runs\\scored_11set_truth.parquet"
+  },
+  "execution": {
+    "decision_anchor_seconds": 1.0,
+    "fak_pad": 0.01,
+    "fak_partial_allowed": true,
+    "stop_band": 0.04,
+    "stop_order": "FOK full size",
+    "stop_max_attempts": 3,
+    "entry_and_exit_latency_ms": 400
+  },
+  "sizing": {
+    "base_frac_5m": 0.0125,
+    "base_frac_15m": 0.025,
+    "brake_scale": 0.5,
+    "brake_floor": 0.5,
+    "concurrency": "raw 1/sqrt(k)",
+    "hard_dd_halt": 0.4,
+    "equity_source": "available cash"
+  },
+  "coverage": {
+    "tick_files": 37222,
+    "scored_rows_with_ticks": 1838446,
+    "candidate_markets": 36210,
+    "qualifying_seconds": 228730,
+    "side_identity": {
+      "source": "option3 ask pair",
+      "max_ask_error": 0.0
+    }
+  },
+  "folds": {
+    "B": {
+      "eligible_markets": 8356,
+      "qualifying_seconds": 62728,
+      "hold": {
+        "n": 7581,
+        "pnl": 696.35,
+        "end": 796.35,
+        "maxdd_pct": 28.77,
+        "wr_pct": 80.5,
+        "orders": 11077,
+        "fak_rejects": 3496,
+        "partial_fills": 212,
+        "stop_triggers": 0,
+        "stop_trigger_pct": 0.0,
+        "stop_fills": 0,
+        "stop_attempts": 0,
+        "stop_rejects": 0,
+        "walker_skips": 151,
+        "dd_halt_skips": 0
+      },
+      "exit004": {
+        "n": 7618,
+        "pnl": 1457.4,
+        "end": 1557.4,
+        "maxdd_pct": 25.36,
+        "wr_pct": 80.52,
+        "orders": 10898,
+        "fak_rejects": 3280,
+        "partial_fills": 338,
+        "stop_triggers": 1346,
+        "stop_trigger_pct": 17.67,
+        "stop_fills": 886,
+        "stop_attempts": 2121,
+        "stop_rejects": 1235,
+        "walker_skips": 152,
+        "dd_halt_skips": 0
+      }
+    },
+    "C": {
+      "eligible_markets": 12378,
+      "qualifying_seconds": 80766,
+      "hold": {
+        "n": 10973,
+        "pnl": 145560.73,
+        "end": 145660.73,
+        "maxdd_pct": 29.68,
+        "wr_pct": 82.01,
+        "orders": 15600,
+        "fak_rejects": 4627,
+        "partial_fills": 693,
+        "stop_triggers": 0,
+        "stop_trigger_pct": 0.0,
+        "stop_fills": 0,
+        "stop_attempts": 0,
+        "stop_rejects": 0,
+        "walker_skips": 271,
+        "dd_halt_skips": 0
+      },
+      "exit004": {
+        "n": 10983,
+        "pnl": 150661.15,
+        "end": 150761.15,
+        "maxdd_pct": 25.11,
+        "wr_pct": 82.02,
+        "orders": 15574,
+        "fak_rejects": 4591,
+        "partial_fills": 719,
+        "stop_triggers": 1420,
+        "stop_trigger_pct": 12.93,
+        "stop_fills": 875,
+        "stop_attempts": 2118,
+        "stop_rejects": 1243,
+        "walker_skips": 276,
+        "dd_halt_skips": 0
+      }
+    },
+    "D": {
+      "eligible_markets": 7929,
+      "qualifying_seconds": 41524,
+      "hold": {
+        "n": 6498,
+        "pnl": 1201.69,
+        "end": 1301.69,
+        "maxdd_pct": 20.21,
+        "wr_pct": 81.78,
+        "orders": 9515,
+        "fak_rejects": 3017,
+        "partial_fills": 279,
+        "stop_triggers": 0,
+        "stop_trigger_pct": 0.0,
+        "stop_fills": 0,
+        "stop_attempts": 0,
+        "stop_rejects": 0,
+        "walker_skips": 732,
+        "dd_halt_skips": 0
+      },
+      "exit004": {
+        "n": 6501,
+        "pnl": 1478.47,
+        "end": 1578.47,
+        "maxdd_pct": 18.84,
+        "wr_pct": 81.79,
+        "orders": 9481,
+        "fak_rejects": 2980,
+        "partial_fills": 324,
+        "stop_triggers": 640,
+        "stop_trigger_pct": 9.84,
+        "stop_fills": 321,
+        "stop_attempts": 970,
+        "stop_rejects": 649,
+        "walker_skips": 742,
+        "dd_halt_skips": 0
+      }
+    },
+    "E": {
+      "eligible_markets": 7547,
+      "qualifying_seconds": 43712,
+      "hold": {
+        "n": 6455,
+        "pnl": 1720.01,
+        "end": 1820.01,
+        "maxdd_pct": 18.99,
+        "wr_pct": 80.99,
+        "orders": 9400,
+        "fak_rejects": 2945,
+        "partial_fills": 293,
+        "stop_triggers": 0,
+        "stop_trigger_pct": 0.0,
+        "stop_fills": 0,
+        "stop_attempts": 0,
+        "stop_rejects": 0,
+        "walker_skips": 282,
+        "dd_halt_skips": 0
+      },
+      "exit004": {
+        "n": 6470,
+        "pnl": 2243.69,
+        "end": 2343.69,
+        "maxdd_pct": 17.68,
+        "wr_pct": 81.04,
+        "orders": 9316,
+        "fak_rejects": 2846,
+        "partial_fills": 351,
+        "stop_triggers": 769,
+        "stop_trigger_pct": 11.89,
+        "stop_fills": 404,
+        "stop_attempts": 1160,
+        "stop_rejects": 756,
+        "walker_skips": 281,
+        "dd_halt_skips": 0
+      }
+    }
+  },
+  "limitations": [
+    "No queue position, network jitter, or competing-taker identity in PMData.",
+    "One entry per resolution; live multifill above $5k synthetic equity is not modeled.",
+    "Fees are explicit per filled notional; raw book prices exclude fees."
+  ],
+  "elapsed_seconds": 801.8
+}

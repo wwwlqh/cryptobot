@@ -1,0 +1,22 @@
+[Unit]
+Description=Daily timer for cryptobot WAL checkpoint
+Documentation=https://github.com/your-org/cryptobot
+
+[Timer]
+# Fire once a day at 04:00 UTC (a quiet hour for the Polymarket
+# /15M crypto markets — the bot is still ticking but volume is low,
+# minimizing the chance the WAL checkpoint contends for the writer
+# lock with an active fill). The 5-minute random delay smooths the
+# load if multiple instances ever share this timer template.
+OnCalendar=*-*-* 04:00:00 UTC
+RandomizedDelaySec=300
+
+# Run a missed firing at boot if the host was off when the previous
+# trigger came around. The WAL TRUNCATE is idempotent.
+Persistent=true
+
+# Each fire produces one ExecStart of the .service unit.
+Unit=cryptobot-wal-checkpoint.service
+
+[Install]
+WantedBy=timers.target

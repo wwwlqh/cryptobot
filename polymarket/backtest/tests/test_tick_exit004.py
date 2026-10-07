@@ -1,0 +1,228 @@
+"""Tests for the canonical subminute + exit004 tick engine."""
+import numpy as np
+import pandas as pd
+import pytest
+
+from polymarket.backtest.engine import tick_exit004 as te
+# The live stop-loss SELL chain was deleted 2026-08-05; its trigger predicate
+# survives verbatim as the T3 deterioration-disarm. The replay's stop logic
+# still needs parity with THAT predicate — it is the same PURE_STOP_04 rule.
+from cryptobot.execution.held_position_pass import (
+    _deterioration_disarm as live_should_stop,
+)
+
+
+def test_fee_and_hold_pnl():
+    assert te.fee(0.75) == pytest.approx(te.fee(0.25))
+    assert te.flat_pnl_net(1, 0.8) == pytest.approx(
+        1.0 / 0.8 - 1.0 - te.fee(0.8)
+    )
+    assert te.flat_pnl_net(0, 0.8) == pytest.approx(-1.0 - te.fee(0.8))
+
+
+# --------------------------------------------------------------------------
+# Settlement-fee parity with LIVE (2026-08-01).
+#
+# The replay's booked friction must equal what execution/grade_fees.py books on
+# the ledger, or BT equity and live equity are not the same quantity. These
+# tests fail loudly if either side moves.
+# --------------------------------------------------------------------------
+
+_FEE_GRID = [
+    (p, s)
+    for p in (0.05, 0.30, 0.50, 0.65, 0.70, 0.75, 0.80, 0.92, 0.99)
+    for s in (0.5, 1.0, 13.7, 142.857, 1_000.0)
+]
+
+
+@pytest.mark.parametrize("price,shares", _FEE_GRID)
+def test_entry_fee_matches_live_grade_fees(price, shares):
+    from cryptobot.execution.grade_fees import entry_fee_usd as live_entry_fee
+
+    assert te.entry_fee_usd(price, shares) == pytest.approx(
+        live_entry_fee(venue="polymarket", entry_price=price, shares=shares),
+        rel=0.0,
+        abs=0.0,
+    )
+
+
+@pytest.mark.parametrize("price,shares", _FEE_GRID)
+def test_entry_fee_is_the_calibrated_per_share_parabola(price, shares):
+    """Pin the SHAPE independently of grade_fees so a same-day edit to both
+    sides cannot silently redefine the fee: k * theta * p * (1-p) * shares."""
+    from cryptobot import config
+
+    expected = (
+        float(config.POLY_FEE_CALIBRATION)
+        * float(config.POLY_FEE_THETA)
+        * price
+        * (1.0 - price)
+        * shares
+    )
+    assert te.entry_fee_usd(price, shares) == pytest.approx(expected, rel=1e-12)
+
+
+@pytest.mark.parametrize("cash_usd", [10.0, 100.0, 2_500.0])
+@pytest.mark.parametrize("price", [0.70, 0.75, 0.80])
+def test_entry_fee_beats_the_retired_per_notional_form(cash_usd, price):
+    """The old replay form charged `cash * theta * p * (1-p)` — per DOLLAR and
+    uncalibrated. It under-charges by exactly p / POLY_FEE_CALIBRATION."""
+    from cryptobot import config
+
+    shares = cash_usd / price
+    old = cash_usd * te.fee(price)
+    new = te.entry_fee_usd(price, shares)
+    assert old < new
+    assert old / new == pytest.approx(price / float(config.POLY_FEE_CALIBRATION), rel=1e-12)
+
+
+def test_stop_exit_leg_is_fee_free_like_live():
+    """Historical stop bookings on the ledger were `proceeds - cost - entry_fee`
+    — the SELL leg carried no fee — so the replay of that era must not charge
+    one. The live stop-loss chain was DELETED 2026-08-05 (nothing can book a
+    stop exit any more), which freezes that contract: the engine must never
+    grow an exit-fee helper, and the live module must stay gone."""
+    assert not hasattr(te, "exit_fee_usd")
+
+    import importlib.util
+
+    assert importlib.util.find_spec("cryptobot.execution.stop_loss") is None, (
+        "cryptobot.execution.stop_loss came back — if a live exit path exists "
+        "again, re-check whether the replay must charge an exit-leg fee"
+    )
+
+
+def test_side_level_conversion_uses_complementary_up_book():
+    tick = _tick(
+        [1.0],
+        asks=[[0.82, 0.80]],
+        ask_sizes=[[3.0, 2.0]],
+        bids=[[0.18, 0.20]],
+        bid_sizes=[[5.0, 4.0]],
+    )
+    assert np.allclose(tick.ask_levels(0, "UP"), ((0.80, 2.0), (0.82, 3.0)))
+    assert np.allclose(tick.ask_levels(0, "DOWN"), ((0.80, 4.0), (0.82, 5.0)))
+    assert np.allclose(tick.bid_levels(0, "UP"), ((0.20, 4.0), (0.18, 5.0)))
+    assert np.allclose(tick.bid_levels(0, "DOWN"), ((0.20, 2.0), (0.18, 3.0)))
+
+
+def test_edge_quote_stops_before_bad_level():
+    levels = ((0.80, 1.0), (0.90, 10.0))
+    quote = te.quote_edge_preserving(
+        levels,
+        5.0,
+        model_p=0.86,
+        min_edge=0.03,
+    )
+    assert quote is None  # first level is only $0.80, below the $1 venue floor
+
+    quote = te.quote_edge_preserving(
+        ((0.80, 2.0), (0.90, 10.0)),
+        5.0,
+        model_p=0.86,
+        min_edge=0.03,
+    )
+    assert quote is not None
+    assert quote.amount_usd == pytest.approx(1.6)
+    assert quote.limit_price == pytest.approx(0.80)
+
+
+def test_fak_allows_partial_fill_under_padded_limit():
+    fill = te.fak_buy(((0.80, 1.0), (0.81, 0.5), (0.82, 10.0)), 2.0, 0.81)
+    assert fill is not None
+    assert fill.cash_usd == pytest.approx(1.205)
+    assert fill.shares == pytest.approx(1.5)
+    assert fill.vwap == pytest.approx(1.205 / 1.5)
+
+
+def test_fok_requires_full_size_and_respects_trigger_bid():
+    levels = ((0.72, 1.0), (0.70, 1.0), (0.69, 10.0))
+    assert te.fok_sell(levels, 2.5, 0.70) is None
+    fill = te.fok_sell(levels, 2.0, 0.70)
+    assert fill is not None
+    assert fill.cash_usd == pytest.approx(1.42)
+    assert fill.vwap == pytest.approx(0.71)
+
+
+def test_selects_higher_edge_side_before_band_gate():
+    scored = pd.DataFrame(
+        {
+            "fold": ["B"] * 4,
+            "market_slug": ["m1"] * 4,
+            "entry_ts": [100, 100, 101, 101],
+            "interval": ["5m"] * 4,
+            "coin": ["btc"] * 4,
+            "ask": [0.80, 0.70, 0.90, 0.72],
+            "offset_sec": [270, 270, 271, 271],
+            "pred_edge": [0.04, 0.05, 0.02, 0.01],
+            "win_true": [1, 0, 1, 0],
+            "side_up": [True, False, True, False],
+        }
+    )
+    attempts = te.build_union_attempts(scored)
+    assert attempts["side"].tolist() == ["DOWN", "UP"]
+    assert attempts["band"].tolist() == ["MID", "NL"]
+    assert attempts["concurrency_k"].tolist() == [1, 1]
+
+
+def test_dynamic_held_side_score_triggers_delayed_full_fok():
+    tick = _tick(
+        [101.4, 102.0, 102.4],
+        asks=[[0.80], [0.80], [0.80]],
+        ask_sizes=[[10.0], [10.0], [10.0]],
+        bids=[[0.75], [0.70], [0.71]],
+        bid_sizes=[[10.0], [10.0], [10.0]],
+    )
+    ask = 0.60
+    model_p = 0.65
+    scores = pd.DataFrame(
+        {
+            "entry_ts": [101],
+            "ask": [ask],
+            "pred_edge": [model_p - ask - te.fee(ask)],
+        }
+    )
+    result = te.simulate_exit004(
+        tick,
+        scores,
+        side="UP",
+        entry_score_ts=100,
+        entry_fill_ts=101.4,
+        entry_fill_price=0.80,
+        shares=1.25,
+        settlement_ts=105,
+        win=0,
+        latency_seconds=0.4,
+    )
+    assert result.stop_triggered
+    assert result.stopped
+    assert result.attempts == 1
+    assert result.close_ts == pytest.approx(102.4)
+    assert result.exit_fill is not None
+    assert result.exit_fill.vwap == pytest.approx(0.71)
+
+
+@pytest.mark.parametrize(
+    ("bid", "model_p", "entry_fill", "band"),
+    [
+        (0.70, 0.65, 0.80, 0.04),
+        (0.80, 0.65, 0.80, 0.04),
+        (0.68, 0.65, 0.80, 0.04),
+    ],
+)
+def test_stop_predicate_matches_live(bid, model_p, entry_fill, band):
+    assert te.should_stop(
+        bid=bid, model_p=model_p, entry_fill=entry_fill, band=band
+    ) == live_should_stop(
+        bid=bid, model_p=model_p, entry_fill=entry_fill, band=band
+    )
+
+
+def _tick(seconds, *, asks, ask_sizes, bids, bid_sizes):
+    return te.TickBook(
+        seconds=np.asarray(seconds, dtype=float),
+        ask_prices=np.asarray([np.asarray(x) for x in asks], dtype=object),
+        ask_sizes=np.asarray([np.asarray(x) for x in ask_sizes], dtype=object),
+        bid_prices=np.asarray([np.asarray(x) for x in bids], dtype=object),
+        bid_sizes=np.asarray([np.asarray(x) for x in bid_sizes], dtype=object),
+    )

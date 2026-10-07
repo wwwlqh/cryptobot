@@ -1,0 +1,292 @@
+{
+  "artifact": "twap_symmetric_v1",
+  "contract_version": 3,
+  "model_sha256": "64cc2148ce3c14faec5ff1de9c752f5bad2b2bcbda8cb31702e5962f341f7248",
+  "model_count": 2,
+  "model_routing": {
+    "15m": "pooled_all4",
+    "5m": "pooled_all4"
+  },
+  "categorical_features": {
+    "15m": [
+      "coin_id"
+    ],
+    "5m": [
+      "coin_id"
+    ]
+  },
+  "live_coins": [
+    "BTC",
+    "ETH",
+    "SOL",
+    "XRP"
+  ],
+  "live_intervals": [
+    "5m",
+    "15m"
+  ],
+  "chainlink_window_seconds": {
+    "15m": 60,
+    "5m": 60
+  },
+  "decision_window_seconds": {
+    "15m": 150,
+    "5m": 150
+  },
+  "checkpoint_offset_sets": {
+    "15m": "750:899:1",
+    "5m": "150:299:1"
+  },
+  "thresholds": {
+    "15m": 0.1,
+    "5m": 0.1
+  },
+  "book_consumption_max": {
+    "15m": 0.06,
+    "5m": 0.06
+  },
+  "execution_by_interval": {
+    "15m": {
+      "ask_hi": 0.85,
+      "ask_lo": 0.55,
+      "book_consumption_max": 0.06,
+      "gate": 0.1
+    },
+    "5m": {
+      "ask_hi": 0.85,
+      "ask_lo": 0.55,
+      "book_consumption_max": 0.06,
+      "gate": 0.1
+    }
+  },
+  "execution": {
+    "trend_following": true,
+    "side_flip": false,
+    "t3_enabled": false,
+    "max_drawdown_halt_frac": 0.4,
+    "tier_a_multiplier": 1,
+    "base_equity_fraction": 0.01,
+    "fak_pad": 0.01,
+    "retry_until_first_fill": true
+  },
+  "live_feature_contract": {
+    "basis_center_fit_period": {
+      "btc": {
+        "15m": "2026-06-07T00:00:00+00:00/2026-07-21T07:00:00+00:00",
+        "5m": "2026-06-07T00:00:00+00:00/2026-07-21T07:00:00+00:00"
+      },
+      "eth": {
+        "15m": "2026-06-07T00:00:00+00:00/2026-07-21T07:00:00+00:00",
+        "5m": "2026-06-07T00:00:00+00:00/2026-07-21T07:00:00+00:00"
+      },
+      "sol": {
+        "15m": "2026-06-07T00:00:00+00:00/2026-07-21T07:00:00+00:00",
+        "5m": "2026-06-07T00:00:00+00:00/2026-07-21T07:00:00+00:00"
+      },
+      "xrp": {
+        "15m": "2026-06-07T00:00:00+00:00/2026-07-21T07:00:00+00:00",
+        "5m": "2026-06-07T00:00:00+00:00/2026-07-21T07:00:00+00:00"
+      }
+    },
+    "basis_center_log": {
+      "btc": {
+        "15m": 0.0009091297260918564,
+        "5m": 0.0009063582040549266
+      },
+      "eth": {
+        "15m": 0.0008992723905509858,
+        "5m": 0.0008990453081216887
+      },
+      "sol": {
+        "15m": 0.0008806270571675657,
+        "5m": 0.000882088776570237
+      },
+      "xrp": {
+        "15m": 0.0008694272406827841,
+        "5m": 0.0008694945607043649
+      }
+    },
+    "basis_residual_clip_log": 0.0001,
+    "binance_window_seconds": {
+      "15m": 60,
+      "5m": 60
+    },
+    "causal_window": "[boundary-60,boundary)",
+    "name": "binance_trailing_twap_centered_chainlink_basis_v2"
+  },
+  "entry_window_validation": {
+    "artifact": "twap_entry_windows_append_20260815",
+    "model_refits": 0,
+    "model_sha256": "64cc2148ce3c14faec5ff1de9c752f5bad2b2bcbda8cb31702e5962f341f7248",
+    "pooled_across_all_four_coins": true,
+    "shared_window_across_all_four_coins": true,
+    "selected_window_seconds": {
+      "15m": 150,
+      "5m": 150
+    },
+    "topups_enabled": false,
+    "results": {
+      "15m": {
+        "period": "2026-08-07T00:00:00+00:00/2026-08-15T00:00:00+00:00",
+        "trades": 405,
+        "wins": 299,
+        "win_rate": 0.7382716049382716,
+        "pnl_usd": 40.00645706853167,
+        "ev_per_trade_usd": 0.09878137547785597,
+        "max_drawdown_usd": 7.380389784214273,
+        "appended_period_pnl_usd": -0.6239851404685179
+      },
+      "5m": {
+        "period": "2026-08-14T00:00:00+00:00/2026-08-15T00:00:00+00:00",
+        "trades": 443,
+        "wins": 325,
+        "win_rate": 0.7336343115124153,
+        "pnl_usd": 31.79099322142377,
+        "ev_per_trade_usd": 0.07176296438244643,
+        "max_drawdown_usd": 13.092107246665297,
+        "appended_period_pnl_usd": 10.951285083876957
+      }
+    }
+  },
+  "validation": {
+    "15m": {
+      "base": {
+        "deployed_usd": 429.4482,
+        "ev_per_dollar": 0.11924809958506678,
+        "ev_per_filled_trade_usd": 0.11881875109101549,
+        "fill_rate": 0.16557817902420285,
+        "fills": 431,
+        "markets": 2603,
+        "max_drawdown_usd": 7.44009105752277,
+        "orders_including_topups": 431,
+        "pnl_usd": 51.210881720227675,
+        "tier_a_n": 427,
+        "topup_legs": 0,
+        "topup_markets": 0,
+        "win_rate": 0.7331786542923434,
+        "wins": 316
+      },
+      "caveat": "Historical model/gate packaging check at T-300. The current T-150 timing evidence is pinned in entry_window_validation. Ask-hi 0.95 added zero fills and zero PnL versus 0.85.",
+      "markets": 2603,
+      "period": "2026-08-07T00:00:00+00:00/2026-08-14T00:00:00+00:00",
+      "reference_2pct_base": {
+        "deployed_usd": 691.1382,
+        "ev_per_dollar": 0.1187298792243128,
+        "ev_per_filled_trade_usd": 0.1903915429543131,
+        "fill_rate": 0.16557817902420285,
+        "fills": 431,
+        "markets": 2603,
+        "max_drawdown_usd": 11.974204372267288,
+        "orders_including_topups": 431,
+        "pnl_usd": 82.05875501330894,
+        "tier_a_n": 427,
+        "topup_legs": 0,
+        "topup_markets": 0,
+        "win_rate": 0.7331786542923434,
+        "wins": 316
+      },
+      "reference_2pct_t3": {
+        "deployed_usd": 1114.8102000000001,
+        "ev_per_dollar": 0.14268233013820963,
+        "ev_per_filled_trade_usd": 0.3690573480228388,
+        "fill_rate": 0.16557817902420285,
+        "fills": 431,
+        "markets": 2603,
+        "max_drawdown_usd": 17.677561773888776,
+        "orders_including_topups": 855,
+        "pnl_usd": 159.06371699784353,
+        "tier_a_n": 427,
+        "topup_legs": 424,
+        "topup_markets": 222,
+        "win_rate": 0.7331786542923434,
+        "wins": 316
+      },
+      "t3": {
+        "deployed_usd": 651.1202,
+        "ev_per_dollar": 0.13905517898004083,
+        "ev_per_filled_trade_usd": 0.21007340127266816,
+        "fill_rate": 0.16557817902420285,
+        "fills": 431,
+        "markets": 2603,
+        "max_drawdown_usd": 10.064179759461958,
+        "orders_including_topups": 653,
+        "pnl_usd": 90.54163594851998,
+        "tier_a_n": 427,
+        "topup_legs": 222,
+        "topup_markets": 222,
+        "win_rate": 0.7331786542923434,
+        "wins": 316
+      }
+    },
+    "5m": {
+      "base": {
+        "deployed_usd": 365,
+        "ev_per_dollar": 0.08193568397969148,
+        "ev_per_filled_trade_usd": 0.08193568397969148,
+        "fill_rate": 0.5464071856287425,
+        "fills": 365,
+        "markets": 668,
+        "max_drawdown_usd": 10.199470672678618,
+        "orders_including_topups": 365,
+        "pnl_usd": 29.90652465258739,
+        "tier_a_n": 356,
+        "topup_legs": 0,
+        "topup_markets": 0,
+        "win_rate": 0.6986301369863014,
+        "wins": 255
+      },
+      "caveat": "Historical model/gate packaging check at T-299. The current T-150 timing evidence is pinned in entry_window_validation. Ask-hi 0.95 added zero fills and zero PnL versus 0.85.",
+      "markets": 668,
+      "period": "2026-08-14T00:00:00+00:00/2026-08-14T14:25:00+00:00",
+      "reference_2pct_base": {
+        "deployed_usd": 587.6500000000001,
+        "ev_per_dollar": 0.08182058698803883,
+        "ev_per_filled_trade_usd": 0.13173114505074254,
+        "fill_rate": 0.5464071856287425,
+        "fills": 365,
+        "markets": 668,
+        "max_drawdown_usd": 16.42033264274665,
+        "orders_including_topups": 365,
+        "pnl_usd": 48.081867943521026,
+        "tier_a_n": 356,
+        "topup_legs": 0,
+        "topup_markets": 0,
+        "win_rate": 0.6986301369863014,
+        "wins": 255
+      },
+      "reference_2pct_t3": {
+        "deployed_usd": 1042.65,
+        "ev_per_dollar": 0.07153738507243741,
+        "ev_per_filled_trade_usd": 0.2043519302624024,
+        "fill_rate": 0.5464071856287425,
+        "fills": 365,
+        "markets": 668,
+        "max_drawdown_usd": 28.833223567248112,
+        "orders_including_topups": 820,
+        "pnl_usd": 74.58845454577687,
+        "tier_a_n": 356,
+        "topup_legs": 455,
+        "topup_markets": 238,
+        "win_rate": 0.6986301369863014,
+        "wins": 255
+      },
+      "settlement_label": "PMData resolved winning_outcome",
+      "t3": {
+        "deployed_usd": 603,
+        "ev_per_dollar": 0.07378037284541691,
+        "ev_per_filled_trade_usd": 0.12188921870078465,
+        "fill_rate": 0.5464071856287425,
+        "fills": 365,
+        "markets": 668,
+        "max_drawdown_usd": 15.291327768410817,
+        "orders_including_topups": 603,
+        "pnl_usd": 44.489564825786395,
+        "tier_a_n": 356,
+        "topup_legs": 238,
+        "topup_markets": 238,
+        "win_rate": 0.6986301369863014,
+        "wins": 255
+      }
+    }
+  }
+}
