@@ -181,22 +181,6 @@ def _cached_ledger_rows(
 
 
 @dataclass(frozen=True)
-class CapitalSnapshot:
-    realized_capital: float
-    peak_realized_capital: float
-    pending_exposure: float
-    drawdown_ratio: float
-    drawdown_pct_peak_frac: float
-    pending_by_sleeve: dict[str, float] = field(default_factory=dict)
-    pnl_by_sleeve: dict[str, float] = field(default_factory=dict)
-    n_settled: int = 0
-    # Net post-cutover capital flows already folded into realized_capital
-    # (deposits + rebates − withdrawals ± adjustments). Defaulted so legacy
-    # constructors and fixtures keep working.
-    net_flow_usd: float = 0.0
-
-
-@dataclass(frozen=True)
 class WalletSnapshot:
     wallet_id: str
     label: str
