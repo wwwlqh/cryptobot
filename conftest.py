@@ -1,18 +1,13 @@
 """Root conftest: keep pytest's temp tree inside the repo.
 
-The default temp root, ``%LOCALAPPDATA%\\Temp\\pytest-of-<user>``, is ACL-locked
-on this box (it cannot even be listed), so every ``tmp_path`` fixture died with
-``PermissionError: [WinError 5]`` and ~17 tests never ran.
+On some Windows machines the default temp root
+(``%LOCALAPPDATA%\\Temp\\pytest-of-<user>``) is not accessible, which makes
+every ``tmp_path`` fixture fail with ``PermissionError``.
 
-``PYTEST_DEBUG_TEMPROOT`` moves only the ROOT; pytest still creates its normal
-``pytest-of-<user>/pytest-N`` numbered dirs underneath, with locking and
-rotation — so unlike a fixed ``--basetemp`` (which pytest CLEARS at session
-start), concurrent pytest sessions do not wipe each other's temp dirs. This
-repo does get concurrent sessions, so that distinction has bitten before:
-a fixed basetemp produced 170 spurious errors across two parallel runs.
-
-The tree is disposable and gitignored (``.pytest_tmp/``); pytest's own rotation
-keeps only the 3 most recent runs.
+``PYTEST_DEBUG_TEMPROOT`` moves only the root; pytest still creates numbered
+``pytest-of-<user>/pytest-N`` directories under it with locking and rotation,
+so unlike a fixed ``--basetemp`` (cleared at session start) two concurrent
+runs do not wipe each other's files. The tree is gitignored (``.pytest_tmp/``).
 """
 import os
 from pathlib import Path

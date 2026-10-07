@@ -95,15 +95,9 @@ def test_does_not_cap_ask_or_bid_levels():
     assert snap.bids[-1]["price"] == pytest.approx(0.40)
 
 
-def test_book_read_keeps_client_timeout_and_has_no_predictfun_knob():
-    # Cross-venue parity, asserted from THIS side: predict.fun's per-request
-    # read_timeout knob must not couple into Polymarket. fetch_top_book has
-    # no such parameter and its pooled book read keeps the client-level
-    # timeout unchanged.
-    #
-    # Lived in the predict.fun suite until Phase 2, where it was the only
-    # thing making that package import this one. Stating it here needs no
-    # cross-venue import at all.
+def test_book_read_keeps_client_timeout():
+    # fetch_top_book takes no per-request read_timeout; its pooled book read
+    # keeps the client-level timeout.
     import inspect
 
     assert "read_timeout" not in inspect.signature(clob.fetch_top_book).parameters

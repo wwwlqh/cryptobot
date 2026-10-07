@@ -1,26 +1,9 @@
 /var/log/cryptobot/scanner.log
 /var/log/cryptobot/scanner.err
-/var/log/cryptobot/predictfun-scanner.log
-/var/log/cryptobot/predictfun-scanner.err
 {
-    # su is REQUIRED: /var/log/cryptobot is group-writable (ec2-user), and
-    # modern logrotate refuses to rotate logs under a group/world-writable
-    # parent dir unless told which user/group to rotate as. Without this the
-    # daily logrotate.service exits 1 and scanner.err grows unbounded (it hit
-    # 17G / ~19 days on 2026-07-01 before this was caught).
-    #
-    # 2026-08-04: the book-recorder.{log,err} and predictfun-recorder.{log,err}
-    # entries were dropped with the book-recorder retirement (both units are
-    # gone; nothing appends to those paths any more). Any leftover rotated
-    # files on a box are inert and age out.
-    #
-    # 2026-08-01: the list now covers EVERY unit that appends into this dir,
-    # not just the Polymarket scanner. Only scanner.{log,err} were listed
-    # before, so cryptobot-predictfun.service's own StandardError grew
-    # unrotated on the Ireland box until it hit 5.7 GB. `missingok` means a
-    # single-role box (Tokyo = predict.fun only; Ireland = Polymarket only
-    # after the 2026-08-01 cutover) rotates what it has and stays silent about
-    # the rest — so this ONE file is correct on BOTH box roles.
+    # su is required: /var/log/cryptobot is group-writable, and logrotate
+    # refuses to rotate under such a directory without being told which
+    # user/group to rotate as (without it scanner.err grows unbounded).
     su ec2-user ec2-user
     daily
     rotate 90

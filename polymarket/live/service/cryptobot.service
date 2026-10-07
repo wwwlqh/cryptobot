@@ -1,6 +1,6 @@
 [Unit]
 Description=cryptobot live scanner (Polymarket *-updown-* + Binance spot)
-Documentation=https://github.com/your-org/cryptobot
+Documentation=https://github.com/wwwlqh/cryptobot
 After=network-online.target
 Wants=network-online.target
 StartLimitIntervalSec=300
@@ -20,8 +20,8 @@ EnvironmentFile=/etc/cryptobot.env
 # Python venv + project import path
 ExecStart=/home/ec2-user/cryptobot/.venv/bin/python -m cryptobot
 
-# Restart-on-failure with linear backoff (5s, 10s, 20s capped at 60s).
-# Don't restart on clean exit (SIGTERM during shutdown returns 0).
+# Restart after a crash; a clean exit (SIGTERM at shutdown returns 0) is not
+# restarted.
 Restart=on-failure
 RestartSec=5
 
@@ -35,14 +35,7 @@ StandardError=append:/var/log/cryptobot/scanner.err
 KillSignal=SIGTERM
 TimeoutStopSec=30
 
-# Resource guard rails for the upsized ~4 GB box (2026-07-05: raised from
-# 1500M/1200M, which was sized for the old t3.small/2 GB and stalled the boot
-# — the 614 MB checkpoint_v1 forest alone exceeds 1.5 GB with the pandas/
-# sklearn import graphs, so the service thrashed at the cgroup ceiling and
-# never reached 'boot OK'. The rf_v1 + hgb_v1 + decision_table load that
-# accompanied it was retired 2026-07-31; the ceiling is left as-is with the
-# headroom it buys).
-# 3300M/2900M leaves ~500 MB for the OS on the 3819 MB box.
+# Memory limits for the 4 GB instance; leaves ~500 MB for the OS.
 MemoryMax=3300M
 MemoryHigh=2900M
 LimitNOFILE=4096

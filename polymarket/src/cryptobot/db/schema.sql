@@ -105,10 +105,7 @@ CREATE TABLE IF NOT EXISTS ledger (
     exit_price              REAL,                     -- realized sell VWAP of the stop exit
     exit_ts                 TEXT,                     -- ISO UTC of the stop-sell fill
     exit_kind               TEXT,                     -- 'stop_loss' when closed early; NULL otherwise
-    -- Venue dimension (deliverable 5). Every new bet is stamped with the
-    -- config.VENUE it was placed on ('polymarket' default / 'predictfun'). The
-    -- DEFAULT makes legacy rows and the CRYPTOBOT_VENUE-unset path read back as
-    -- 'polymarket' with zero behavior change.
+    -- The venue the bet was placed on (config.VENUE); defaults to 'polymarket'.
     venue                   TEXT NOT NULL DEFAULT 'polymarket',
     created_at              TEXT NOT NULL DEFAULT (datetime('now'))
 );

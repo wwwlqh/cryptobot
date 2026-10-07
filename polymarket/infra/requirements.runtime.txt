@@ -1,73 +1,33 @@
-# Runtime-only deps for the cryptobot live scanner.
-# Drops the research/notebook/viz deps (statsmodels, xgboost, shap, matplotlib,
-# seaborn, jupyterlab, nbformat, nbclient, ipykernel) to keep the EC2 footprint
-# small and the cold-install fast. (The size rationale dates from the t3.small
-# box; the target is a t3.medium / ~4 GB x86_64 since 2026-07-05, but the unit
-# still runs under MemoryMax=3300M so the trim still matters.)
+# Runtime dependencies for the live bot on EC2 (no research or notebook deps).
 requests>=2.31
-# A2 latency: [http2] extra (h2) enables multiplexed HTTP/2 on the Polymarket
-# read clients + the CLOB signing client (walker._install_clob_http_timeout
-# passes http2=True). main.py fails soft to HTTP/1.1 when absent.
+# The [http2] extra lets the Polymarket clients multiplex over HTTP/2; the bot
+# falls back to HTTP/1.1 without it.
 httpx[http2]>=0.27
-# WS book mirror — ON in production (config.py's default is off, but
-# install_remote.sh force-pins CRYPTOBOT_BOOK_WS_ENABLED=1 on every deploy and
-# the mirror has been AUTHORITATIVE, not shadow, since 2026-07-10). So this is a
-# HARD runtime dep on the box, not an optional extra: daemon thread that
-# mirrors the CLOB market channel so the tick reads a venue-timestamped book
-# snapshot instead of the inline POST /books. Uses the sync API
-# (websockets.sync.client.connect, added in websockets 13). Imported lazily so
-# the module loads even if absent, but pin it so the WS path works on EC2 —
-# websocket support is NOT in py-clob-client-v2.
+# WebSocket book mirror and Chainlink TWAP feed (sync API, websockets >= 13).
 websockets>=13.0,<16.0
 apscheduler>=3.10
 pytz>=2024.1
 tzlocal>=5.2
-# config (per-strategy LIVE plan §U2: Pydantic singleton for POLY_* creds)
 pydantic>=2.0
 pydantic-settings>=2.0
 numpy>=1.26
 scipy>=1.13
 pyarrow>=15
 joblib>=1.3
-# ⚠️ EXACT-PINNED — the model artifacts are PICKLES, and a pickle is only
-# loadable by the library version lineage that wrote it. These are NOT ordinary
-# version floors; a silent minor bump breaks boot on any FRESH box.
-#
-# Learned the hard way 2026-07-25 during the Ireland->London migration: the
-# fresh venv resolved `scikit-learn>=1.4` to 1.9.0 while every artifact in
-# data/models was pickled by 1.8.0. HistGradientBoosting pickles reference
-# sklearn's PRIVATE `_loss` module, which moved between those releases, so
-# load_hgb() died with `ModuleNotFoundError: No module named '_loss'` and the
-# scanner crash-looped 11 times and never booted. The already-running Ireland
-# box was unaffected because its venv predated the release — i.e. the bug was
-# invisible until someone built a box from scratch.
-#
-# Bump these ONLY together with a re-pickle of data/models (and re-run the
-# checkpoint/parity tests), never as a routine upgrade. Same reasoning as the
-# exact pin on predict_sdk in pyproject.toml.
+# Exact pins: the models in data/models are pickles, which only load under the
+# library versions that wrote them. A newer scikit-learn moved the private
+# module HistGradientBoosting pickles reference, so a fresh box crash-looped at
+# boot. Bump only together with re-exporting the models and re-running the
+# tests.
 scikit-learn==1.8.0
 pandas==3.0.3
-# Polymarket CLOB V2 — REQUIRED for live order placement. Without this the
-# OrderClient cannot construct, order_client stays None, and a wallet flipped
-# to LIVE silently places NO real orders (_live_wallet_skip_reason short-
-# circuits). Confirm boot logs show "OrderClient initialized" before go-live.
+# Polymarket CLOB V2: required for live orders. Without it no OrderClient is
+# built and a LIVE wallet places nothing; check the boot log says
+# "OrderClient initialized".
 py-clob-client-v2==1.0.1
 py-builder-relayer-client==0.0.2
 eth-abi==5.2.0
 eth-utils==6.0.0
-# predict.fun LIVE order signing (EIP-712 via OrderBuilder + Kernel
-# predict-account support) — REQUIRED for the predictfun live unit. Without
-# it PredictFunOrderClient raises PredictFunClientUnavailable at boot and the
-# unit runs silently DRY-only (LIVE cells SKIP). DRY paper + the book
-# recorder never import it. Exact-pinned (== pyproject) so a deploy
-# pip-install can never change real-money signing behavior silently; bump
-# deliberately + re-run cbot-predictfun-live-validation --stage build.
-predict_sdk==0.0.20
-# Signing speedup (A-latency): py-clob-client-v2 signs every order's EIP-712
-# via eth-account -> eth-keys, whose DEFAULT ECC backend is pure-Python ECDSA
-# (~10-40ms/sign) unless coincurve's C backend is importable. eth-keys
-# auto-detects it with NO code change (backends/__init__.get_default_backend_class
-# -> is_coincurve_available() = a bare `import coincurve`), so merely installing
-# the wheel switches signing to CoinCurveECCBackend and yields BYTE-IDENTICAL
-# signatures (same secp256k1 curve). Drop-in; unset by uninstalling.
+# Fast order signing: eth-keys switches to coincurve's C backend automatically
+# when it is installed (same signatures, much faster than pure Python).
 coincurve>=19

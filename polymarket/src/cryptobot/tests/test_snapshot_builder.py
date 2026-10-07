@@ -2069,7 +2069,7 @@ def test_per_venue_rollups_emitted(db: sqlite3.Connection, portfolio):
                         window_start_ts=1_715_923_500),
     )
     db.execute(
-        "UPDATE ledger SET outcome='LOSS', pnl_net=-1.0, venue='predictfun', "
+        "UPDATE ledger SET outcome='LOSS', pnl_net=-1.0, venue='other', "
         "resolution_ts='2026-06-01 20:00:00' WHERE id=?",
         (pf,),
     )
@@ -2077,20 +2077,20 @@ def test_per_venue_rollups_emitted(db: sqlite3.Connection, portfolio):
 
     payload = build_payload(db, portfolio)[0]
     by_venue = payload["ledger_rollup_by_venue"]
-    assert set(by_venue) == {"polymarket", "predictfun"}
+    assert set(by_venue) == {"polymarket", "other"}
     assert by_venue["polymarket"]["wins"] == 1
     assert by_venue["polymarket"]["pnl_net"] == pytest.approx(2.0)
     assert by_venue["polymarket"]["win_rate"] == pytest.approx(1.0)
-    assert by_venue["predictfun"]["losses"] == 1
-    assert by_venue["predictfun"]["pnl_net"] == pytest.approx(-1.0)
+    assert by_venue["other"]["losses"] == 1
+    assert by_venue["other"]["pnl_net"] == pytest.approx(-1.0)
     # Venue counts sum to the combined rollup (same population).
     roll = payload["ledger_rollup"]
     assert sum(v["total"] for v in by_venue.values()) == roll["total"]
 
     daily_by_venue = payload["ledger_daily_by_venue"]
-    assert set(daily_by_venue) == {"polymarket", "predictfun"}
-    assert daily_by_venue["predictfun"][0]["losses"] == 1
-    assert daily_by_venue["predictfun"][0]["date"] == "2026-06-02"  # MYT day
+    assert set(daily_by_venue) == {"polymarket", "other"}
+    assert daily_by_venue["other"][0]["losses"] == 1
+    assert daily_by_venue["other"][0]["date"] == "2026-06-02"  # MYT day
     # Per-venue daily pnl sums to the combined daily pnl.
     combined = sum(d["pnl"] for d in payload["ledger_daily"])
     split = sum(

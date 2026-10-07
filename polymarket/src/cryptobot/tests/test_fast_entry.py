@@ -745,8 +745,8 @@ def test_chain_registers_the_hook_on_the_sources_that_have_one():
 
 
 def test_chain_with_no_hooked_source_reports_zero_rather_than_failing():
-    # predict.fun's market-keyed mirror has no hook yet: the sweep rung must
-    # still arm rather than failing the boot.
+    # A book source without an ask-update hook: the sweep still arms rather
+    # than failing the boot.
     plain = SimpleNamespace(note_tokens=lambda _t: None, get=lambda t, *, now_ts: None)
     assert _chain(plain).set_ask_update_callback("cb") == 0
     assert _chain().set_ask_update_callback("cb") == 0

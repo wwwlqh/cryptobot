@@ -333,34 +333,13 @@ def test_encoded_snapshot_path_requires_auth(server: str, dashboard_dir: Path) -
     assert _head(f"{server}/%73napshot.json", cookie=_cookie_header(set_cookie)) == 200
 
 
-def test_retired_predictfun_dumps_are_not_served_even_authenticated(
+def test_snapshot_json_requires_auth(
     server: str, dashboard_dir: Path
 ) -> None:
-    """The predict.fun dashboard dumps were RETIRED 2026-08-01 with the
-    cross-venue view.
-
-    They used to be allowlisted AND auth-gated (they carry trading rows, wallet
-    addresses and operator state). Now they are off the allowlist entirely, so
-    they 404 — before auth is even consulted — even for a session that HAS the
-    cookie. This is the stronger property and the one that matters on a box
-    still holding a stale dump from before the cutover.
-
-    The allowlist and the auth tuple must change TOGETHER: an allowlisted JSON
-    missing from the auth tuple would serve unauthenticated."""
-    for retired in ("predictfun_paper.json", "predictfun_live.json"):
-        (dashboard_dir / retired).write_text(
-            '[{"id": 1, "venue": "predictfun"}]', encoding="utf-8"
-        )
-
+    """snapshot.json is auth-gated: 401 without a session, 200 with one."""
     _, _, set_cookie = _post(f"{server}/api/v2/auth/login", {"password": "secret"})
     cookie_kv = _cookie_header(set_cookie)
-    for retired in ("predictfun_paper.json", "predictfun_live.json"):
-        status, _ = _get(f"{server}/{retired}", raw=True)
-        assert status == 404, f"/{retired} must not be served unauthenticated"
-        status, _ = _get(f"{server}/{retired}", cookie=cookie_kv, raw=True)
-        assert status == 404, f"/{retired} must not be served even with a session"
 
-    # snapshot.json is still the one auth-gated JSON: 401 without, 200 with.
     (dashboard_dir / "snapshot.json").write_text('{"ok": true}', encoding="utf-8")
     status, body = _get(f"{server}/snapshot.json")
     assert status == 401

@@ -74,15 +74,6 @@ def test_server_serves_static_files_and_events(tmp_path: Path):
     dash.mkdir()
     (dash / "index.html").write_text("hi from dashboard", encoding="utf-8")
     (dash / "ledger_full.json").write_text('{"secret":true}', encoding="utf-8")
-    # RETIRED 2026-08-01 with the cross-venue dashboard view: the predict.fun
-    # dumps are no longer allowlisted, so a file sitting in the dashboard dir
-    # (e.g. left over on a box from before the cutover) must 404 like every
-    # other non-allowlisted JSON. Written here precisely so the guard is
-    # exercised against a file that EXISTS.
-    (dash / "predictfun_paper.json").write_text(
-        '[{"id": 7, "venue": "predictfun"}]', encoding="utf-8"
-    )
-    (dash / "predictfun_live.json").write_text('{"venue":"predictfun"}', encoding="utf-8")
 
     bc = Broadcaster(max_clients=5)
     # Use port 0 to let the OS pick a free port.
@@ -113,23 +104,6 @@ def test_server_serves_static_files_and_events(tmp_path: Path):
         with pytest.raises(urllib.error.HTTPError) as exc:
             urllib.request.urlopen(req, timeout=2)
         assert exc.value.code == 404
-        # The retired predict.fun dumps are OFF the allowlist: a stale file on
-        # disk must never be served, GET or HEAD.
-        for retired in ("predictfun_paper.json", "predictfun_live.json"):
-            with pytest.raises(urllib.error.HTTPError) as exc:
-                urllib.request.urlopen(
-                    f"http://127.0.0.1:{port}/{retired}", timeout=2
-                )
-            assert exc.value.code == 404
-            with pytest.raises(urllib.error.HTTPError) as exc:
-                urllib.request.urlopen(
-                    urllib.request.Request(
-                        f"http://127.0.0.1:{port}/{retired}", method="HEAD"
-                    ),
-                    timeout=2,
-                )
-            assert exc.value.code == 404
-
         # SSE stream — open with a short read timeout, then publish a payload.
         req = urllib.request.Request(f"http://127.0.0.1:{port}/events")
         with urllib.request.urlopen(req, timeout=2) as resp:
