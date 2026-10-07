@@ -1,49 +1,32 @@
 // ===========================================================================
-// pages-subminute.jsx — SubminutePage: operator console for the sub-minute
-// strategy — a single ask band over the last-30s per-second window,
-// first-fill-wins per resolution. The band set is DATA-DRIVEN from spec.bands
-// (derived server-side from the deployed manifest): one band since the
-// 2026-07-21 amendment (subminute_5m/15m, ask (0.65, 0.85], pred_edge ≥ 0.03).
+// pages-subminute.jsx — SubminutePage: the console for the sub-minute strategy (ask bands over a
+// per-second entry window, first fill wins per resolution). The bands come from spec.bands, derived
+// on the server from the deployed config.
 //
-// Reads `live.v2` from the SSE payload: the frozen decision spec (spec.bands),
-// the equity-fraction sizing state (base fracs · DD-brake · hard halt), the
-// fill-rate breaker (re-anchored to v2 realizability), and recent per-bet
-// rows carrying pred_edge (model_p − ask − fee) and the sized stake. When the
-// block is absent the sub-minute executor is disabled on this deployment
-// and the page degrades to an EmptyState. Registration in NAV/app routing is
-// wired elsewhere — this file only defines the page component.
+// Reads `live.v2` from the SSE payload: the decision spec (spec.bands), the sizing state (base
+// fractions, drawdown brake, hard halt), the fill-rate breaker, and recent per-bet rows with
+// pred_edge (model_p - ask - fee) and stake. Without the block, sub-minute trading is disabled on
+// this deployment and the page shows an EmptyState. Navigation and routing are wired in app.jsx and
+// shell.jsx.
 //
-// This file also owns SubminuteSpecPage (Config → "Strategy"): the full
-// deployed strategy contract as a per-band comparison table (operator
-// 2026-07-12) — one column per spec band (band rows fill each column, shared
-// rows span them), so it renders a clean single-column sheet under today's
-// manifest and grows columns back if a band is re-admitted — every value read
-// from the live payload (live.v2.spec + live.v2.sizing + portfolio per-coin
-// caps), with '—' fallbacks. The frozen spec figure was MOVED here from the
-// sub-minute page (operator 2026-07-11), so the operational page leads with
-// the DD-brake banner, not the spec card.
+// This file also holds SubminuteSpecPage (Config → "Strategy"): the deployed strategy as a
+// reference table with one column per band, every value read from the payload (live.v2.spec,
+// live.v2.sizing, per-coin caps from the portfolio) with '—' fallbacks.
 //
-// The cross-attempt resolution rollup (fold every attempt — retries and
-// top-ups — into ONE row per POSITION, missed PnL counted once) lives in
-// data.jsx / window.CB.groupResolutions so it can be unit-tested; this file
-// only renders the grouped rows and the fill-tax aggregates. Since 2026-08-05
-// the fills of one position fold too: groupResolutions runs the fills through
-// the Trade journal's OWN `groupTrades` helper, so a base bet and its T3
-// top-ups render as a single "N in 1" row (Σ size, Σ P&L, size-weighted price)
-// that expands into the per-attempt table — the same trade, counted the same
-// way, on both tabs. The ATTEMPT/reject telemetry stays per-ORDER: the attempt
-// and reject counts, the drill-down rows and the whole missed-trades panel
-// still describe individual orders, because a top-up really is its own order.
+// The resolution rollup (every attempt folded into one row per position, missed P&L counted once)
+// is in data.jsx (window.CB.groupResolutions) so it can be unit-tested; this file renders the
+// grouped rows and the fill-tax totals. A position's fills fold through the Trade journal's
+// `groupTrades` helper, so a multi-fill position is one "N in 1" row on both tabs and expands to
+// the per-attempt table. Attempt and reject counts stay per order, because each attempt is a
+// separate order.
 // ===========================================================================
 (function () {
 const { fmt, tone, groupResolutions, paginate, useOpenSet,
   missedTradeIndex, missedTradeForGroup, directionFromSide } = window.CB;
 const { useState, useMemo } = React;
 
-// ── spec band derivation (shared by the Config spec page) ────────────
-// Bands come from spec.bands; when an older scanner payload predates spec.bands
-// (deploy skew) it falls back to the legacy flat ask_lo/ask_hi/gate — a single
-// MID band.
+// ── spec band derivation (shared by the Config spec page) ──────────── Bands come from spec.bands;
+// an older payload without it falls back to the flat ask_lo/ask_hi/gate fields as a single band.
 function specBands(s) {
   return Array.isArray(s.bands) && s.bands.length
     ? s.bands
@@ -52,10 +35,9 @@ function specBands(s) {
         : []);
 }
 
-// Throttle-removed detection (operator 2026-07-31): floor ×1.00 makes
-// max(floor, 1 − dd/scale) == 1.00 at every drawdown, so the brake is INERT.
-// Every brake surface must read that as "off", never as "pinned at its floor" —
-// otherwise the panel warns about a throttle that is not throttling.
+// Throttle-off detection: with floor ×1.00, max(floor, 1 − dd/scale) is 1.00 at every drawdown, so
+// the brake does nothing. Every brake display must read that as "off", not "pinned at its floor",
+// or it would warn about a throttle that is not throttling.
 const throttleOff = (floor) => !(floor < 0.999);
 
 // DD-brake meter normalization: map brake ∈ [floor..1] → [0..1] for the bar fill.
@@ -65,33 +47,26 @@ const brakeMeter = (brake, floor) => (throttleOff(floor)
   ? 1
   : Math.max(0, Math.min(1, (brake - floor) / Math.max(1e-9, 1 - floor))));
 
-// Deploy-skew fallbacks only (every live payload carries the real values) —
-// mirror config.V2_BRAKE_FLOOR / V2_BRAKE_SCALE / MAX_DRAWDOWN_HALT_FRAC
-// (throttle removal 2026-07-31): floor ×1.00 = no throttle, hard halt 30%.
+// Fallbacks for older payloads only (live payloads always carry the values); they mirror
+// config.V2_BRAKE_FLOOR / V2_BRAKE_SCALE / MAX_DRAWDOWN_HALT_FRAC.
 const BRAKE_FLOOR_FALLBACK = 1.0;
 const BRAKE_SCALE_FALLBACK = 0.60;
-const HARD_HALT_FALLBACK = 0.30;
+const HARD_HALT_FALLBACK = 0.40;
 
-// ── DD-brake / hard-halt banner ──────────────────────────────────────
-// Graduated throttle: brake = max(floor, 1 − dd/scale). At dd=0 the sleeve
-// runs full size (×1.00), ramping down to the floor; the hard halt
-// (sizing.hard_halt_frac — 30% since the 2026-07-31 throttle removal) then
-// stops all placement. Every figure renders from the payload.
-// SINCE 2026-07-31 the throttle is REMOVED (floor ×1.00): the brake reads
-// ×1.00 at every drawdown and the halt is the only drawdown control.
+// ── drawdown brake / hard halt banner ─────────────────────────────────── Brake = max(floor, 1 −
+// dd/scale): full size (×1.00) at dd=0, falling to the floor; at the hard halt
+// (sizing.hard_halt_frac) all placement stops. With the floor at ×1.00 the brake is always ×1.00
+// and the halt is the only drawdown control. Every figure comes from the payload.
 //
-// 2026-08-05 (operator declutter): under today's manifest this banner was a
-// permanent full-width paragraph restating two constants ("Hard halt: bot
-// stops at 30% …" / "Stake throttle: removed …") that never change while the
-// brake is inert. It now renders ONLY THE ANOMALOUS STATES:
-//   * trading_halted        → the full hard-halt banner (unchanged);
-//   * brake < ×1.00 / at a real floor → a compact warn banner carrying the
-//     live multiplier, the dd that produced it and the floor;
-//   * brake == ×1.00 and not halted   → NOTHING is rendered.
-// No warning path is lost: the halt banner still fires on halt, the throttled
-// banner still fires the moment the brake bites, and the halt THRESHOLD stays
-// permanently on-screen on Overview's dd-from-peak rail tile ("halts at 30%")
-// and in Config → Strategy ("hard halt" row).
+// Renders only unusual states:
+//
+//   * trading_halted → the full hard-halt banner;
+//   * brake below ×1.00, or resting on a real floor → a compact warning with
+//     the live multiplier, the drawdown that caused it and the floor;
+//   * brake ×1.00 and not halted → nothing.
+//
+// The halt threshold is always visible on Overview's drawdown tile ("halts at N%") and in Config →
+// Strategy ("hard halt").
 function BrakeBanner({ sizing }) {
   const z = sizing || {};
   const halt = z.hard_halt_frac != null ? z.hard_halt_frac : HARD_HALT_FALLBACK;
@@ -162,12 +137,9 @@ function driftClass(x) {
   return x == null ? 'muted' : x > 0 ? 'neg' : x < 0 ? 'pos' : '';
 }
 
-// status chip — reuses existing pill classes; NO_FILL/PARTIAL are the only new
-// keys (both map onto pill-neg/pill-warn — no new visual language).
-// NO_FILL reads "miss", never "no fill" (operator 2026-07-31): the words were
-// redundant against the on-chain verdict chip, which says the same thing AND
-// names the cause. On a grouped row that HAS a verdict the pill is dropped
-// entirely — see ResolutionRows.
+// Status chip, reusing the existing pill classes (NO_FILL and PARTIAL map onto pill-neg/pill-warn).
+// NO_FILL reads "miss": the on-chain verdict chip says the same and also names the cause, so on a
+// grouped row that has a verdict the pill is dropped (see ResolutionRows).
 const STATUS_PILL = { WIN: 'pill-pos', LOSS: 'pill-neg', PENDING: 'pill-mute',
   GHOST_FILL: 'pill-warn', NO_FILL: 'pill-neg', PARTIAL: 'pill-warn' };
 const STATUS_LABEL = { GHOST_FILL: 'ghost', NO_FILL: 'miss', PARTIAL: 'partial' };
@@ -194,20 +166,13 @@ function MissKindPill({ kind }) {
   return <span className={'pill ' + m.pill} title={m.title}>{m.label}</span>;
 }
 
-// ── ON-CHAIN miss verdict — THE miss-cause taxonomy (operator 2026-07-30:
-// "classify every missed trade from CHAIN evidence — faster taker vs maker
-// cancel — not just bullshit") ────────────────────────────────────────
-// This REPLACED the old inferred taxonomy (taker race / maker pull / ghost /
-// moved-away), which read a cause out of the ~1s post-reject book re-read.
-// That re-read physically cannot tell an ask that TRADED AWAY from one that
-// was PULLED, and the tape proved it backwards: ~84% FASTER_TAKER / ~13%
-// REPRICED_ONLY / ~2% MAKER_CANCEL against the ~68%-maker-cancel it implied.
-// So there is ONE cause axis now, and it is evidence.
+// ── on-chain miss verdict: the miss-cause taxonomy ─────────────────────── Every missed trade is
+// classified from chain evidence (faster taker vs maker cancel). Re-reading the book after a reject
+// cannot tell an ask that traded away from one that was pulled; the trade tape can.
 //
-// The VOCABULARY is the server's (miss_forensics constants → snapshot_builder):
-// every strip/table iterates the SERVER's key order, and this map only decorates
-// what arrives — `verdictMeta` falls back to the raw key so a verdict added
-// upstream shows up as a plain chip instead of silently vanishing.
+// The vocabulary is the server's (miss_forensics constants via snapshot_builder): every strip and
+// table follows the server's key order, and this map only adds labels. `verdictMeta` falls back
+// to the raw key, so a new verdict shows as a plain chip instead of disappearing.
 const CHAIN_VERDICT = {
   FASTER_TAKER: { label: 'faster taker', pill: 'pill-info',
     reason: 'a print AT OUR LEVEL — the quote was real, another taker got there first',
@@ -243,10 +208,8 @@ function beatDt(x) {
   const s = Math.abs(x) < 0.05 ? '0' : (Math.abs(x) < 10 ? Math.abs(x).toFixed(1).replace(/\.0$/, '') : Math.round(Math.abs(x)));
   return (x > 0 ? '+' : x < 0 ? '−' : '') + s + 's';
 }
-// The per-miss chip shows the verdict ALONE (operator order 2026-07-30 — the
-// inline evidence string made rows unreadable). The beat evidence (dt / price /
-// size / rival maker) moves into the hover title, so the chain grounding stays
-// one hover away instead of on the row.
+// The per-miss chip shows only the verdict; the evidence (dt, price, size, rival maker) is in the
+// hover title so rows stay readable.
 function ChainVerdictChip({ verdict, dt, price, size, rival, detail }) {
   if (!verdict) return null;
   const m = verdictMeta(verdict);
@@ -293,8 +256,8 @@ function CountPill({ n, neg }) {
   return <span className={'pill ' + (neg && n > 0 ? 'pill-neg' : 'pill-mute')}>{n}</span>;
 }
 
-// band badge — the ask band that attempted this resolution: MID (0.65–0.85).
-// Chrome pill (never green/red) — it identifies the sleeve, not an outcome.
+// Band badge: the ask band that attempted this resolution. A neutral pill (never green/red); it
+// identifies the sleeve, not an outcome.
 function BandPill({ band }) {
   if (!band) return <span className="muted">—</span>;
   return <span className="pill pill-mute" title="ask band(s) that attempted this resolution">{band}</span>;
@@ -340,9 +303,9 @@ function AttemptTable({ group }) {
             return (
               <tr key={i}>
                 <td className="num" style={{ whiteSpace: 'nowrap' }}>{a.offset != null ? `+${a.offset}s` : '—'}
-                  {/* base / top-up N — the same fill vocabulary the Trade
-                      journal's expanded trade uses, so a grouped row is always
-                      auditable back to the fills it folded. */}
+                  {/* base / top-up N: the same fill labels as the Trade journal's expanded trade,
+                     so a grouped row can always be traced back to its fills.
+                     */}
                   {a.fillLabel && <span className="slot-ref"> {a.fillLabel}</span>}</td>
                 <td className="num muted">{a.n}</td>
                 <td><SidePill side={a.side} /></td>
@@ -438,16 +401,12 @@ function ResolutionRows({ groups, openSet, toggle, missIdx }) {
             {' → '}
             {g.fillPx != null ? fmt.prob(g.fillPx, 3) : '—'}
           </td>
-          {/* THE miss cause: the tape's answer to "faster taker or maker
-              cancel", with the beat-us evidence inline. Absent until the
-              forensics job classifies this row — a non-book miss (ghost /
-              venue error) can never get one, so it shows its KIND instead
-              to say why.
-              Operator 2026-07-31: whichever chip is present IS the miss
-              label, so the redundant status pill is dropped on those rows —
-              a NO_FILL row never spells out "no fill". With neither chip
-              (verdict not adjudicated yet) the pill carries the row alone,
-              reading "miss". */}
+          {/* The miss cause: the tape's answer to "faster taker or maker cancel". Absent until the
+             forensics job classifies the row; a miss that never reached the book (ghost, venue
+             error) never gets one and shows its kind instead. Whichever chip is present is the
+             miss label, so the status pill is dropped on those rows; with neither chip (not
+             classified yet) the pill alone reads "miss".
+             */}
           <td>{chainChipProps(miss)
               ? <ChainVerdictChip {...chainChipProps(miss)} />
               : miss && MISS_KIND[miss.miss_kind]
@@ -477,19 +436,18 @@ function ResolutionRows({ groups, openSet, toggle, missIdx }) {
   });
 }
 
-// ── on-chain forensics aggregate strip (v2.reject_stats.chain_forensics) ──
-// Three questions, in the order the operator asks them:
-//   1. what actually happened to our misses? (verdict counts from the TAPE,
-//      not from a book re-read that cannot tell traded-away from pulled)
-//   2. by how much did we lose the races? (median beat-us dt, in venue-match
-//      time — the block timestamp minus the calibrated settlement lag)
-//   3. IS SPEED WORTH BUYING? The speed prize compares the FASTER_TAKER
-//      cohort's would-win WR against the break-even WR implied by the price we
-//      bid. Those are the only misses a faster bot could ever have won, so if
-//      the two are equal the entire latency lever is worth ~$0 no matter how
-//      many races we lose. (2026-07-30: 78.9% vs 76.1%.) This line exists so
-//      that verdict is re-checked continuously instead of once by hand.
-// Renders nothing at all until the job has classified something.
+// ── on-chain forensics strip (v2.reject_stats.chain_forensics) ─────────── Three questions, in
+// order:
+//
+//   1. What happened to our misses? (verdict counts from the trade tape)
+//   2. By how much did we lose the races? (median beat time, in venue-match
+//      time: the block timestamp minus the calibrated settlement lag)
+//   3. Is speed worth buying? The speed prize compares the FASTER_TAKER
+//      misses' would-be win rate with the break-even rate implied by the price
+//      we bid. Those are the only misses a faster bot could have won, so if the
+//      two are about equal, more speed is worth roughly nothing.
+//
+// Renders nothing until the job has classified something.
 function ChainForensicsStrip({ cf }) {
   if (!cf || !cf.n) return null;
   const counts = cf.counts || {};
@@ -546,17 +504,11 @@ function ChainForensicsStrip({ cf }) {
   );
 }
 
-// ── missed-trades panel (the fill-tax aggregate — rows fold into the
-// resolution table above; this is the honest rollup) ──────────────────
-// Counts are labeled attempts vs trades: N FAK retries of one window = ONE
-// missed trade; a window that later filled = ZERO. Every counterfactual is
-// priced AT OUR LIMIT, uniformly.
-// The CAUSE split is the on-chain verdict and nothing else (2026-07-30). It
-// replaced a reachable/unreachable split inferred from the ~1s post-reject
-// book re-read, which the tape refuted: a re-read cannot tell an ask that
-// traded away from one that was pulled, and ~84% of the "pulls" were in fact
-// faster takers. Older payloads (pre-rollup snapshots) get the legacy
-// four-tile strip — guard-rendered, never a crash.
+// ── missed-trades panel (the fill-tax totals; rows fold into the resolution table above)
+// ────────────────────────────────────────────────────────── Attempts and trades are labelled
+// separately: N FAK retries of one window are one missed trade, and a window that later filled is
+// none. Every counterfactual is priced at our limit. The cause split is the on-chain verdict. Older
+// payloads without the rollup get the simpler four-tile strip.
 function RejectStats({ stats, missedTrades }) {
   const rs = stats || {};
   // Per-VERDICT would-be WR, computed client-side from the server
@@ -712,23 +664,14 @@ function RejectStats({ stats, missedTrades }) {
   );
 }
 
-// The stop-loss EXIT ANALYSIS panel (StopLossPanel — realized vs
-// held-to-resolution over exit_kind='stop_loss' rows, its 5 KPI cells and its
-// paged exit table) was DELETED 2026-08-05 by operator order: stop-loss is
-// gone from the dashboard UI. Historical stop rows still exist in the ledger
-// and now simply read as LOSSES everywhere. Do not re-add.
 
 // ── page ─────────────────────────────────────────────────────────────
 const RESOLUTION_PAGE_SIZE = 30;   // rows per page (Previous / Next paging)
 
 function SubminutePage({ live }) {
-  // The sub-minute stream (live.v2 bets/rejects/sizing) is whatever THIS
-  // process wrote, so it always belongs to this console's own deployment
-  // venue. The cross-venue guard that used to blank this tab — "selector says
-  // predict.fun but this deployment is Polymarket" — went away with the venue
-  // selector on 2026-08-01: there is no way to ask a console for a venue it
-  // does not run.
-  // hooks must precede the no-v2 early return (rules of hooks)
+  // The sub-minute stream (live.v2 bets, rejects, sizing) is whatever this process wrote, so it
+  // always belongs to this console's venue. Hooks must come before the no-v2 early return (rules of
+  // hooks).
   const v2 = live.v2;
 
   // Fold every attempt (fills + rejects — retries and top-ups) for a
@@ -775,8 +718,8 @@ function SubminutePage({ live }) {
   const fillWarn = fr.fill_rate != null
     && (fr.n_orders || 0) >= (fr.min_orders || 0)
     && fr.min_fill_rate != null && fr.fill_rate < fr.min_fill_rate;
-  // The BREAKER is a live control: it stays visible whenever it is tripped or
-  // inside its trip condition, and is silent otherwise (2026-08-05 declutter).
+  // The breaker is a live control: shown whenever it is tripped or inside its trip condition,
+  // hidden otherwise.
   const breakerWarn = fillWarn || !!fr.tripped;
   const brake = sizing.brake_multiplier != null ? sizing.brake_multiplier : 1;
   const brakeFloor = sizing.brake_floor != null ? sizing.brake_floor : BRAKE_FLOOR_FALLBACK;
@@ -797,16 +740,11 @@ function SubminutePage({ live }) {
           title={sizing.equity_basis === 'ledger_fallback'
             ? 'ledger paper equity — no CLOB balance yet'
             : 'live wallet balance from the CLOB'}
-          /* the "· net deposits $X (ledger)" fragment was DELETED 2026-08-05
-             (operator): operator funding is not a sub-minute execution fact,
-             and it read as if it were part of the equity result. */
           sub={sizing.peak_capital != null ? `peak ${fmt.money(sizing.peak_capital)}` : null} />
-        {/* DD-brake tile: ANOMALOUS-ONLY since the 2026-08-05 declutter. With
-            the throttle removed (floor ×1.00) it read a constant "×1.00 · dd
-            from peak 0.0% · throttle removed (floor ×1.00)" forever, which is
-            clutter, not telemetry. It reappears — with the live multiplier,
-            the dd that caused it and the floor — the instant the brake bites
-            (`showBrakeTile`), alongside the warn banner above. */}
+        {/* Drawdown-brake tile: shown only when the brake is active (`showBrakeTile`), with the
+           live multiplier, the drawdown that caused it and the floor, alongside the warning banner
+           above.
+           */}
         {showBrakeTile && (
           <KpiCell label="DD-brake" value={`×${fmt.num(brake, 2)}`} valueSm
             valueClass={sizing.brake_at_floor ? 'neg' : 'warn'}
@@ -817,12 +755,10 @@ function SubminutePage({ live }) {
         )}
         <KpiCell label="next stake" value={fmt.money(stake15)} valueSm
           title={`stake = equity × base frac × DD-brake · 15m ${fmt.pct(sizing.base_frac_15m)} · 5m ${fmt.money(stake5)} (${fmt.pct(sizing.base_frac_5m)})`} />
-        {/* TOP-RIGHT = ROLLING 24h (operator 2026-08-05); the full-history
-            figure lives bottom-right in the missed-trades strip. The breaker's
-            own window/threshold is NOT displayed while the breaker is idle —
-            it reappears as a warn sub the moment the breaker is tripped or
-            within its trip condition (`fillWarn`), so no safety signal is
-            lost to the declutter. */}
+        {/* Top right is the rolling 24h fill rate; the full-history figure is bottom right in the
+           missed-trades strip. The breaker's window and threshold appear as a warning sub-line
+           only when it is tripped or within its trip condition (`fillWarn`).
+           */}
         <KpiCell label="fill rate · 24h"
           value={fr.fill_rate_24h != null ? fmt.pct(fr.fill_rate_24h) : '—'}
           valueClass={breakerWarn ? 'neg' : ''}
@@ -833,18 +769,10 @@ function SubminutePage({ live }) {
           bar={{ pct: (fr.fill_rate_24h || 0) * 100, color: breakerWarn ? 'var(--neg)' : 'var(--pos)' }} />
       </div>
 
-      {/* The ledger-paper equity/PnL panel (EquityChart + DrawdownChart on
-          lifetimeEquity) was DELETED here 2026-08-05 by operator order: this
-          page is the sub-minute EXECUTION console, and the equity curve is
-          the Overview hero's job — rendering it twice off the same selector
-          made the paper basis look like a second, independent account. The
-          charts themselves stay shared (Overview is their consumer). */}
-      {/* Titled "resolutions", NOT "bets" (operator 2026-08-09): this count
-          includes resolutions that never filled (pure misses fold in from the
-          rejects stream) and pending ones, over a newest-rows window — a
-          population that can never equal the settled opened TRADE GROUPS the
-          word "bets"/"trades" means everywhere else. The row set is unchanged;
-          the miss rows are the point of this console. */}
+      {/* Titled "resolutions", not "bets": the count includes resolutions that never filled (pure
+         misses from the rejects stream) and pending ones, over the newest rows, so it is a
+         different population from the settled trades counted elsewhere.
+         */}
       <Panel title="resolutions" q={`${groups.length}`}
         titleHint={(exactGrouping ? '' : 'Grouping is APPROXIMATE — the window key is not yet in the payload. ')
           + 'ATTEMPT-level population: one row per resolution/position INCLUDING resolutions that never filled — not the settled-trade count the Overview/Journal report. '
@@ -868,8 +796,6 @@ function SubminutePage({ live }) {
       </Panel>
       <div className="section-gap" />
 
-      {/* the stop-loss exits panel sat here until 2026-08-05 — see the note
-          above StopLossPanel's deletion */}
       <RejectStats stats={v2.reject_stats} missedTrades={v2.missed_trades} />
     </div>
   );

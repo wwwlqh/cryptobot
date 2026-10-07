@@ -1,10 +1,5 @@
 // ===========================================================================
-// pages-live.jsx — JournalPage (open positions + settled ledger with
-// expandable fill detail). The former LivePage ("Live markets & gates":
-// status band → wallet groups → per-market decision tables → gate flow) was
-// retired 2026-07-11 (operator order); its nav entry + route were removed and
-// this file now hosts only the Trade journal. The file is KEPT because
-// JournalPage lives here (and app.jsx / index.html still load it).
+// pages-live.jsx — JournalPage: open positions and the settled ledger, with expandable fill detail.
 // ===========================================================================
 (function () {
 const {
@@ -14,10 +9,8 @@ const {
 } = window.CB;
 const { useState, useMemo } = React;
 
-// Display outcome for a FILL. A booked stop-loss exit is a realized LOSS and
-// renders as one — the standalone "STOP" badge (and every other SL surface on
-// this page) was removed 2026-08-05 by operator order; the row's DB outcome is
-// CANCELLED, which would otherwise read as a voided cancel.
+// Display outcome for a fill. A stop-loss exit is a realized loss and shows as LOSS; its DB outcome
+// is CANCELLED, which would otherwise read as a voided cancel.
 function rowOutcome(r) {
   if (!r) return null;
   return isLossRow(r) ? 'LOSS' : r.outcome;
@@ -191,10 +184,9 @@ function LedgerRows({ groups, openSet, toggle, showPnl, showMark }) {
           {showMark && <MarkCell r={r} />}
           <td className="num">{g.model_p != null ? fmt.prob(g.model_p, 3) : '—'}</td>
           <td><OutcomePill outcome={g.outcome} /></td>
-          {/* OPEN time of the base fill (operator 2026-08-06: the settled
-              table shows when the position was OPENED, not when it settled —
-              both tables carry the "opened" header now). Settlement still
-              orders the list and keys the Calendar day. */}
+          {/* Open time of the base fill: the settled table shows when the position was opened, not
+             when it settled. Settlement still orders the list and decides the Calendar day.
+             */}
           <td className="num muted" title={g.settled ? `settled ${fmt.dateMyt(g.settleTs)} ${fmt.hmMyt(g.settleTs)}` : undefined}>{fmt.dateMyt(r.bet_ts)} {fmt.hmMyt(r.bet_ts)}</td>
           {showPnl && <td className={'num ' + (g.pnl == null ? 'muted' : tone(g.pnl))}>{g.pnl == null ? (g.open ? '…' : '—') : fmt.moneyDelta(g.pnl)}</td>}
         </tr>
@@ -221,9 +213,7 @@ const OUTCOME_SCOPES = ['WIN', 'LOSS', 'PENDING'];
 
 function JournalPage({ live, range, venueSel }) {
   const sel = venueSel || 'all';
-  // Venue-scoped ledger (rows filtered by the selected venue; 'all' passes
-  // through). The coin filter respects the venue universe (BNB only under
-  // predictfun).
+  // Venue-scoped ledger; the coin filter offers the venue's coins.
   const scoped = useMemo(() => scopeLive(live, venueSel), [live, venueSel]);
   const allLedger = scoped.ledger || [];
   const ranged = useMemo(() => inRange(allLedger, range), [allLedger, range]);
@@ -239,10 +229,9 @@ function JournalPage({ live, range, venueSel }) {
   // scoped rows (historical coins — a coin dropped by a past universe
   // amendment stays filterable as long as its rows are in view).
   const coins = useMemo(() => scopedCoins(live, venueSel, allLedger), [live, venueSel, allLedger]);
-  // Pills filter the TABLES only; the KPI row reads the pre-pill ranged
-  // population (item 10 — it is labeled with the range, not the pills).
-  // The outcome pill matches the TRADE's verdict, so a stop-closed row is
-  // reachable under LOSS (there is no STOP scope any more — 2026-08-05).
+  // Pills filter the tables only; the KPI row uses the whole range (it is labelled with the range,
+  // not the pills). The outcome pill matches the trade's verdict, so a stop-closed row appears
+  // under LOSS.
   const ledger = useMemo(
     () => ranged.filter((r) => (!coinScope || r.coin === coinScope)),
     [ranged, coinScope],
@@ -262,12 +251,10 @@ function JournalPage({ live, range, venueSel }) {
   );
   const open = useMemo(() => trades.filter((g) => g.open)
     .sort((a, b) => ((b.anchor.id || 0) - (a.anchor.id || 0))), [trades]);
-  // Settled TRADES = groups that settled AND actually opened. A voided
-  // never-filled cancel is not a trade (operator 2026-08-09), so it neither
-  // counts in the panel badge/pager nor renders as a row here — the journal's
-  // row set is now exactly the population the equity curve plots and the hero
-  // tile counts. Voided groups stay visible as the `N voided` sub on the KPI
-  // tile below.
+  // Settled trades = groups that settled and actually opened. A voided, never-filled cancel is not
+  // a trade, so it is not counted in the badge or pager and has no row here; the journal shows
+  // exactly the population the equity curve plots and the hero tile counts. Voided groups appear as
+  // the `N voided` sub on the KPI tile below.
   const settled = useMemo(() => trades.filter((g) => g.settled && !g.voided)
     .sort((a, b) => (b.settleMs || 0) - (a.settleMs || 0)), [trades]);
   // KPI-row summary: PRE-PILL population (the whole ranged window), so the
@@ -289,10 +276,8 @@ function JournalPage({ live, range, venueSel }) {
   // not the browsable window, so they stay representative. Only a legacy
   // payload/static snapshot falls back to the client aggregate.
   const life = useMemo(() => lifetimeSummary(scoped, allLedger), [scoped, allLedger]);
-  // Read the explicit settled-OPENED scalar, never `total − open`: `total` is
-  // the audit count and still carries the voided never-filled cancels, so the
-  // old subtraction put them inside a tile whose own sub-line reported them
-  // separately (operator 2026-08-09 — the headline and its caption overlapped).
+  // Use the explicit settled-and-opened count, never `total - open`: `total` is the audit count
+  // and includes voided cancels, which the tile's sub-line reports separately.
   const lifeSettled = life.settled;
   const pager = paginate(settled, page, 15);
   const openNotional = openKpi.reduce((a, g) => a + g.size, 0);
@@ -317,9 +302,9 @@ function JournalPage({ live, range, venueSel }) {
 
   return (
     <div className="content">
-      {/* The pill row filters the TABLES only; the tiles below stay the whole
-          range window. That used to be a `.scope-note` sentence under the grid
-          — it is the grid's hover tooltip now (2026-08-05 declutter). */}
+      {/* The pill row filters the tables only; the tiles below cover the whole range (this is the
+         grid's tooltip).
+         */}
       <div className="kpi-grid c5" title={`pills filter the tables below — these tiles stay the unfiltered ${range} window`}>
         <KpiCell label="open positions" value={openKpi.length} valueSm
           sub={`${fmt.money(openNotional)} notional`}
@@ -371,11 +356,10 @@ function JournalPage({ live, range, venueSel }) {
       </Panel>
       <div className="section-gap" />
 
-      {/* The settled TABLE is honestly a bounded window: the stream retains
-          the newest N fills, while the settled/win-rate tiles above read the
-          server lifetime rollup. Rows are TRADES — expand one to see the
-          individual fills it folded. That caveat is the panel-title tooltip +
-          the pager tooltip now; it was visible caption text until 2026-08-05. */}
+      {/* The settled table is a bounded window (the stream keeps the newest N fills), while the
+         settled and win-rate tiles read the server's lifetime rollup. Rows are trades; expand one
+         to see its fills. The panel-title and pager tooltips say so.
+         */}
       <Panel title="settled trades" q={`${settled.length}`}
         titleHint={life.lifetime && lifeSettled > settled.length
           ? `${lifeSettled} settled since reset — this table streams the newest rows only`

@@ -5,13 +5,8 @@
 (function () {
 const { fmt, tone, useSecond, directionFromSide, venueOf } = window.CB;
 
-// ── venue identity (this console renders ONE box) ────────────────────
-// The topbar venue SWITCHER was removed 2026-08-01 with the cross-venue view:
-// :8800 is the Polymarket console, :8801 is the predict.fun console, and
-// neither can render the other. What is left is LABELLING — the payload
-// carries `venue`, so every venue-specific string is derived from it rather
-// than hardcoded to Polymarket (which is what made the predict.fun console
-// call its own wallet "POLY_FUNDER" and quote Polymarket's taker delay).
+// ── venue identity ────────────────────────────────────────────────────── The payload carries
+// `venue`, and every venue-specific label is derived from it.
 const VENUE_LABEL = { polymarket: 'Polymarket' };
 const VENUE_LABEL_CAPS = { polymarket: 'POLYMARKET' };
 function venueLabel(live) { return VENUE_LABEL[venueOf(live)] || VENUE_LABEL.polymarket; }
@@ -31,9 +26,6 @@ const I = {
 };
 
 // ── page registry (order = sidebar order) ────────────────────────────
-// No `sub:` any more — the topbar page SUBTITLES were deleted in the
-// 2026-08-05 declutter (operator): every one of them restated what the page
-// title and the panels below already say. The title alone names the page.
 const NAV = [
   { section: 'Trading' },
   { key: 'overview', label: 'Overview', title: 'Overview', range: true },
@@ -74,10 +66,8 @@ function Sidebar({ page, setPage, live }) {
   const k = live.kpis;
   const sse = window.__SSE_STATE || 'connecting';
   const counts = {
-    // Open TRADES (CLOB positions), not open fills — an unlabeled badge cannot
-    // carry a caveat, so it must show the same number the Journal page's "open
-    // positions" tile shows (operator 2026-08-09). Legacy payloads without the
-    // grouped scalar fall back to the per-fill count.
+    // Open trades (CLOB positions), not open fills, so the badge matches the Journal's "open
+    // positions" tile. Older payloads without the grouped count fall back to the per-fill count.
     journal: (k && (k.n_pending_trades != null ? k.n_pending_trades : k.n_pending)) || null,
     operator: live.operator && live.operator.state && live.operator.state !== 'LIVE' ? 1 : null,
   };
@@ -126,10 +116,7 @@ function Topbar({ meta, live, range, setRange }) {
       </div>
       <div className="topbar-spacer" />
       <div className="topbar-right">
-        {/* PASSIVE venue badge. The segmented SWITCHER it replaced was removed
-            2026-08-01: each console is single-venue by deployment, so a
-            switcher could only ever pin the console to a venue it cannot
-            render. This states which box you are looking at. */}
+        {/* Passive badge naming the venue this console shows. */}
         <span className="badge badge-venue">
           {venueLabelCaps(live)}
         </span>
@@ -151,9 +138,6 @@ function Topbar({ meta, live, range, setRange }) {
   );
 }
 
-// The activity tape (BetTape — most-recent bets as a horizontal strip) was
-// DELETED 2026-08-05: Overview was its only consumer and the operator retired
-// it in the declutter pass. Its `.tape*` CSS went with it. Do not re-add.
 
 // ── Halt banner ──────────────────────────────────────────────────────
 function HaltedBanner({ live }) {
@@ -165,9 +149,8 @@ function HaltedBanner({ live }) {
   // below switches with it rather than calling both "from peak".
   const ddFromPeak = k.drawdown_pct_peak != null;
   const dd = ddFromPeak ? k.drawdown_pct_peak : (k.drawdown_pct || 0);
-  // v2 hard halt is 40% (portfolio.max_drawdown_halt_frac, risk retune
-  // 2026-07-21); the payload always carries max_drawdown_halt_pct, so this
-  // literal is only a defensive fallback.
+  // Fallback only; the payload always carries max_drawdown_halt_pct
+  // (portfolio.max_drawdown_halt_frac).
   const halt = k.max_drawdown_halt_pct || 40;
   const n = (k.halted_wallets || []).length || k.n_wallets_halted || 1;
   return (
@@ -204,11 +187,9 @@ function KpiCell({ label, value, sub, bar, valueClass, valueSm, title }) {
   );
 }
 
-// `titleHint` is the hover tooltip on the panel heading. It exists because the
-// 2026-08-05 declutter deleted the visible caption sentences that used to sit
-// under panel titles: the ones that carried real honesty (accounting basis,
-// window caveat, "these are different populations") moved HERE rather than
-// being lost.
+// `titleHint` is the hover tooltip on a panel heading. Caveats such as the accounting basis, a
+// window limit or "these are different populations" go here rather than as caption text under the
+// title.
 function Panel({ title, titleHint, sub, q, actions, flush, className, children }) {
   return (
     <section className={'card' + (flush ? ' flush' : '') + (className ? ' ' + className : '')}>
@@ -249,13 +230,11 @@ function MeterBar({ ratio, color }) {
   return <div className="meter"><div style={{ width: pct + '%', background: color || 'var(--accent)' }} /></div>;
 }
 
-// Shared "showing a–b of n · prev/next" table pager. Takes a pager bundle from
-// window.CB.paginate ({ pg, pages, start, end, total }) + the page setter, so the
-// bounded-DOM tables (journal, sub-minute resolutions) render one identical footer.
-// Optional `label` is the honest window note (e.g. "newest 500 of 3,214
-// settled") for when the paged array is a bounded slice of a larger population.
-// It rides the pager as a HOVER TOOLTIP, not visible text — the 2026-08-05
-// declutter dropped the visible window stamps but kept the caveat reachable.
+// Shared "showing a–b of n · prev/next" table pager. Takes a pager bundle from window.CB.paginate
+// ({ pg, pages, start, end, total }) and the page setter, so the bounded tables (journal,
+// sub-minute resolutions) share one footer. Optional `label` is a window note (e.g. "newest 500
+// of 3,214 settled") for when the paged array is a slice of a larger population; it is shown as a
+// tooltip.
 function TablePager({ pager, setPage, label }) {
   const { pg, pages, start, end, total } = pager;
   return (
@@ -275,42 +254,31 @@ function AsOfTag({ ms }) {
   return <span className="muted mono" style={{ textTransform: 'none', letterSpacing: 0 }}> · as of {fmt.hmMyt(ms)} ({fmt.agoShort(ms)})</span>;
 }
 
-// Shared net-P&L headline — the alignment made structural. Reads ONLY the money
-// bundle (window.CB.money). CASH-first (operator 2026-07-24, reverses the 07-23
-// paper-first flip): net = the ERA cash result (m.net = account_pnl_era_cash =
-// cash_now − cash_at_reset), so the headline matches the equity tile + the cash
-// curve and reads GREEN when the account is up. The value stands ALONE — no paper/"unsettled" sub (operator 2026-07-24: nothing is
-// unsettled; the cash-vs-paper gap is a measurement artifact, not pending money).
-// Falls back to paper as the headline only when no cash figure exists. As-of tag
-// only when the cash sample is degraded.
-// 2026-08-05 declutter: the visible basis TAG ('cash · since reset' /
-// 'ledger paper') is gone — the basis is a hover tooltip now, so the chrome is
-// the label and the figure and nothing else.
-// `variant` only swaps the wrapper so the existing hero-metric / kpi /
-// cal-headline CSS is reused — no new tokens.
+// Shared net-P&L headline. Reads only the money bundle (window.CB.money). Cash first: net is the
+// cash result since the reset (m.net = account_pnl_era_cash = cash_now - cash_at_reset), so the
+// headline matches the equity tile and the cash curve. The value stands alone; the cash-vs-paper
+// gap is a measurement artifact, not pending money. Falls back to paper only when there is no cash
+// figure. Shows an as-of tag only when the cash sample is degraded. The basis is in the tooltip.
+// `variant` only swaps the wrapper so the existing hero-metric / kpi / cal-headline CSS is
+// reused.
 function MoneyHeadline({ variant, m }) {
   const net = m.net;                                   // cash-first (money(): cashNet ?? paper)
   const netIsCash = m.netIsCash != null ? m.netIsCash : m.hasCash;  // false when withPaperBasis forces a period's paper
-  // Only the CASH figure gets to be called "net P&L" — the paper basis (calendar
-  // / date-range period, via withPaperBasis) is "booked bets" so it never
-  // competes with the one headline number the operator reads.
+  // Only the cash figure is called "net P&L"; the paper basis (calendar or date-range period, via
+  // withPaperBasis) is "booked bets" so it never competes with the headline number.
   const label = netIsCash ? 'net P&L' : 'booked bets';
-  // Accounting basis — tooltip only (was the visible tag until 2026-08-05).
+  // Accounting basis, as a tooltip.
   const basis = netIsCash
     ? 'cash basis since reset: account balance now − balance at reset'
     : 'ledger paper: Σ pnl_net over the settled rows in view';
   const asOf = m.degraded && m.asOfMs != null ? <AsOfTag ms={m.asOfMs} /> : null;
-  // Operator 2026-07-24: the headline is JUST the net figure — NO paper /
-  // "unsettled" sub-line. Nothing is unsettled (positions all resolve, 0 open),
-  // and the cash-vs-paper gap is a measurement artifact, not pending money. The
-  // only sub kept is the degraded-sample as-of tag.
+  // The headline is just the net figure. The only sub-line is the as-of tag for a degraded cash
+  // sample.
 
   if (variant === 'kpi') {
     return <KpiCell label={<React.Fragment>{label}{asOf}</React.Fragment>} value={fmt.moneyDelta(net)} valueClass={tone(net)} valueSm title={basis} />;
   }
-  // 'headline' — the only other live variant. The old 'hero' branch died with
-  // the 2026-08-05 declutter, which dropped MoneyHeadline from the Overview
-  // hero row (Overview renders .hero-metric cells directly now).
+  // 'headline' is the only other variant in use.
   return (
     <div className="cal-headline" title={basis}>
       <div className="cal-headline-row">

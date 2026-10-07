@@ -1,21 +1,17 @@
 // ===========================================================================
-// data.jsx — constants, formatters, live hooks, and client-side ledger
-// analytics for the cryptobot operator journal.
+// data.jsx — constants, formatters, live hooks and client-side ledger analytics for the dashboard.
 //
-// The live scanner streams the SSE payload (window.LIVE) defined in
+// The bot streams the SSE payload (window.LIVE) defined in
 //   src/cryptobot/observability/snapshot_builder.py :: build_payload()
-// and a static research snapshot (window.SNAPSHOT) from snapshot.json. The
-// payload carries server-side LIFETIME rollups (ledger_rollup / ledger_daily /
-// ledger_equity + their per-venue variants) computed over the FULL ledger —
-// prefer-server selectors (lifetimeSummary / selectDaily / lifetimeEquity)
-// read those first and fall back to CLIENT-SIDE aggregates over the streamed
-// ledger array only for older payloads / static snapshots. Row-based
-// aggregates are bounded by how many ledger rows the stream has delivered this
-// session (bootstrap + deltas, retained by live-bridge.js); analytics surfaces
-// label their row window honestly.
+// and a static snapshot (window.SNAPSHOT) from snapshot.json. The payload carries server-side
+// lifetime rollups (ledger_rollup / ledger_daily / ledger_equity and their per-venue variants)
+// computed over the full ledger. The selectors (lifetimeSummary / selectDaily / lifetimeEquity)
+// read those first and fall back to client-side aggregates over the streamed ledger only for older
+// payloads or the static snapshot. Row-based aggregates only cover the rows streamed this session
+// (bootstrap plus deltas, kept by live-bridge.js), and analytics panels label their window.
 //
-// Everything shared across the JSX files is hung on `window.CB`. Component
-// files (charts/shell/pages/app) load AFTER this file and read from it.
+// Everything shared across the JSX files is on `window.CB`. Component files (charts, shell,
+// pages, app) load after this file and read from it.
 // ===========================================================================
 
 (function () {
@@ -108,17 +104,14 @@ const fmt = {
 function tone(x) { return x == null || !isFinite(x) ? '' : x > 0 ? 'pos' : x < 0 ? 'neg' : ''; }
 function directionFromSide(side) { return side === 'YES' ? 'UP' : side === 'NO' ? 'DOWN' : (side || '—'); }
 function isSettled(r) { return !!r && SETTLED.has(r.outcome); }
-// WIN/LOSS contract (mirrors the server ledger_rollup / payload.contracts
-// .win_rate): win rate = wins/(wins+losses) over TRADE GROUPS.
-//   loss   = a decided LOSS, OR a booked stop-loss exit (exit_kind='stop_loss'
-//            with a real pnl_net). A stop exit is a realized loss, so it is
-//            simply a LOSS — the 2026-08-05 operator order removed the separate
-//            "SL" class from every dashboard surface. `isBookedStop` survives
-//            ONLY to classify those historical rows: their DB outcome is
-//            'CANCELLED', so without it they would read as voided cancels and
-//            silently leave the denominator.
-//   voided = a CANCELLED row with NO exit_kind (never filled / refunded) —
-//            excluded from win rate AND from daily trade counts everywhere.
+// Win/loss rule (matches the server's ledger_rollup / payload.contracts .win_rate): win rate = wins
+// / (wins + losses) over trade groups.
+//   loss   = a decided LOSS, or a stop-loss exit (exit_kind='stop_loss' with a
+//            real pnl_net). `isBookedStop` identifies those older rows: their
+//            DB outcome is 'CANCELLED', so without it they would read as voided
+//            cancels and drop out of the denominator.
+//   voided = a CANCELLED row with no exit_kind (never filled or refunded);
+//            excluded from the win rate and from daily trade counts.
 function isBookedStop(r) { return !!r && r.exit_kind === 'stop_loss' && typeof r.pnl_net === 'number'; }
 function isWinRow(r) { return !!r && r.outcome === 'WIN'; }
 function isLossRow(r) { return !!r && (r.outcome === 'LOSS' || isBookedStop(r)); }
@@ -127,15 +120,11 @@ function rowStake(r) {
   if (r && typeof r.effective_bet_size === 'number') return r.effective_bet_size;
   return r && typeof r.bet_size === 'number' ? r.bet_size : 0;
 }
-// Canonical settle-timestamp accessor — the ONE place the fallback chain
-// lives (raw payload string). H1 day-bucket contract (payload.contracts.
-// day_bucket, mirrors the server _MYT_DAY_SQL): a stop-loss row realizes its
-// pnl at its IMMUTABLE exit_ts (resolution_ts stays NULL until a display-only
-// sweep backfill may stamp the late sweep clock), so stop rows key on exit_ts
-// when the payload carries it, then fall through resolution_ts → bet_ts like
-// every other row. Every surface that shows or sorts by settle time goes
-// through this, so the chain can never drift between the journal sort, the
-// settled column, the tape, and the client aggDaily fallback.
+// The one settle-timestamp accessor. Day-bucket rule (payload.contracts .day_bucket, matching the
+// server's _MYT_DAY_SQL): a stop-loss row keys on its exit_ts, when present, because that is when
+// its loss was realized; then resolution_ts, then bet_ts, like every other row. Every place that
+// shows or sorts by settle time goes through this, so the journal sort, the settled column and the
+// aggDaily fallback always agree.
 function settleTs(r) {
   return window.CB_TIME.settlementTimestamp(r);
 }
@@ -183,8 +172,7 @@ function venueOf(live) {
   const v = String(raw).toLowerCase();
   return VENUE_META[v] ? v : 'polymarket';
 }
-// The venue's coin universe (BTC/ETH/SOL/XRP on polymarket, BTC/ETH/BNB on
-// predict.fun) — the boot-window fallback for coin filters/iconography.
+// The venue's coin list, the fallback for coin filters and icons before the first tick.
 function venueUniverse(live) { return VENUE_META[venueOf(live)].coins.slice(); }
 
 // Read the coin universe from the live markets array, falling back to the
@@ -197,23 +185,9 @@ function liveCoins(live) {
   return venueUniverse(live);
 }
 
-// ── venue scope (SINGLE-VENUE consoles) ───────────────────────────────
-// 2026-08-01 (predict.fun Tokyo cutover): the cross-venue view is GONE. This
-// dashboard is ONE app PARAMETERIZED by venue — :8800 renders the Polymarket
-// box, :8801 renders the predict.fun box, and neither can show the other. What
-// was removed and must not come back:
-//   * VENUE_SELECTORS + the topbar switcher — a viewer could pin the OTHER
-//     venue in localStorage and a console would render an empty (or foreign)
-//     ledger on the box it is supposed to be watching;
-//   * pfPaperRows / mergedLedger + window.PF_PAPER — the predict.fun paper
-//     instance is retired and its predictfun_paper.json producer is deleted;
-//   * the window.PF_LIVE payload swap in app.jsx (predictfun_live.json, also
-//     deleted). Its money process is on another continent now; a 30s snapshot
-//     of a REAL-MONEY box masquerading as a live console is exactly the
-//     surface you do not want during an incident.
-// The `venueSel` argument that still flows through these helpers is now always
-// THIS deployment's venue (app.jsx derives it from live.venue) — kept as an
-// argument so the row-level venue tagging stays explicit rather than implied.
+// ── venue scope ───────────────────────────────────────────────────────── The dashboard is one app
+// parameterized by venue; `venueSel` is always this deployment's venue (app.jsx takes it from
+// live.venue). It is still passed explicitly so row-level venue tagging stays visible.
 function normVenueSel(sel) {
   // Unset resolves to THIS deployment's venue — stashed by App from the live
   // payload (window.__CB_DEPLOY_VENUE) — never a cross-venue passthrough.
@@ -238,22 +212,16 @@ function venueFilter(rows, sel) {
 function rowKey(r) {
   return rowVenue(r) + ':' + String(r && r.id != null ? r.id : '');
 }
-// A venue-scoped shallow view of the live payload: ledger filtered to THIS
-// deployment's venue, with the server LIFETIME rollups resolved per venue.
-// Account-level KPIs are not partitioned by venue and pass through untouched
-// (kpis is spread as-is). Rollup resolution order:
-//   1. the server per-venue rollups (ledger_rollup_by_venue /
-//      ledger_daily_by_venue, H5) when the payload emits them — identical
-//      W·L·SL definitions computed over the FULL DB, not the bounded stream.
-//   2. when the venue filter removed ZERO rows the payload's ledger IS this
-//      venue — KEEP the all-venue lifetime rollups instead of nulling them
-//      (the failure where every surface collapsed to the bounded 500-row
-//      stream window).
-//   3. otherwise null ⇒ the prefer-server selectors fall back to a client
-//      aggregate over the scoped ledger.
-// The static-paper merge (window.PF_PAPER) that used to run BEFORE the filter
-// is gone with the cross-venue view — the ledger is now exactly what THIS
-// box's own SSE stream carries.
+// A venue-scoped shallow view of the live payload: the ledger filtered to this deployment's venue,
+// with the server's lifetime rollups resolved per venue. Account-level KPIs are not split by venue
+// and pass through unchanged. Rollups resolve in this order:
+//
+//   1. the server's per-venue rollups (ledger_rollup_by_venue /
+//      ledger_daily_by_venue), computed over the full database, when present;
+//   2. if the venue filter removed no rows, the payload's ledger already is
+//      this venue, so keep the all-venue lifetime rollups (rather than fall back
+//      to the bounded streamed window);
+//   3. otherwise null, and the selectors aggregate the scoped ledger.
 function scopeLive(live, sel) {
   if (!live) return live;
   const s = normVenueSel(sel);
@@ -268,11 +236,9 @@ function scopeLive(live, sel) {
   const byAnalytics = (live.ledger_analytics_by_venue
     && typeof live.ledger_analytics_by_venue === 'object')
     ? live.ledger_analytics_by_venue[s] : null;
-  // keepAll = "the scoped view IS the server's own population" — only then may
-  // the server's all-venue rollups stand in for the venue view.
-  // rows.length > 0 guard: with an EMPTY stream (right after a RESET_RECORDS
-  // cutover) 0===0 must not leak all-venue blocks into a named-venue view (the
-  // predict.fun tab rendered Polymarket lifetime numbers, 2026-07-22).
+  // keepAll: the scoped view is exactly the server's population, so its all-venue rollups may stand
+  // in. The rows.length > 0 check stops an empty stream (just after a records reset) from counting
+  // as a match.
   const keepAll = rows.length > 0 && scoped.length === rows.length;
   return {
     ...live,
@@ -286,12 +252,10 @@ function scopeLive(live, sel) {
     ledger_equity: keepAll ? live.ledger_equity : null,
   };
 }
-// Coin universe for the scoped venue. The DEPLOYED venue reads the live scan
-// universe (markets array = config.COINS, e.g. BTC/ETH on predict.fun) so the
-// pills never pin a retired coin; a non-deployed venue (only reachable through
-// historic rows) falls back to its VENUE_META registry universe. Optional
-// `rows` (an already venue-scoped ledger) unions in any historical coins still
-// present in the rows — e.g. XRP settled rows stay filterable after the drop.
+// Coin list for the scoped venue. The deployed venue uses the live scan universe (markets array =
+// config.COINS), so a removed coin never stays pinned; any other venue falls back to its VENUE_META
+// list. Optional `rows` (an already-scoped ledger) adds coins still present in the rows, so
+// settled rows of a dropped coin stay filterable.
 function scopedCoins(live, sel, rows) {
   const s = normVenueSel(sel);
   const coins = (s === venueOf(live))
@@ -331,9 +295,8 @@ function money(k) {
   const kk = k || {};
   const cashLive = kk.account_capital_live != null ? kk.account_capital_live
     : (kk.account_capital != null ? kk.account_capital : null);
-  // Era-anchored cash net (cash_now − cash_at_reset) preferred so the cash P&L
-  // matches the reset-era window the paper rollup already uses; falls back to
-  // the audited lifetime-basis account_pnl_total (kept for reconciliation).
+  // Prefer the cash net since the reset (cash_now - cash_at_reset), which covers the same period as
+  // the paper rollup; fall back to the lifetime account_pnl_total (kept for reconciliation).
   const cashNet = kk.account_pnl_era_cash != null ? kk.account_pnl_era_cash
     : (kk.account_pnl_total_live != null ? kk.account_pnl_total_live
     : (kk.account_pnl_total != null ? kk.account_pnl_total : null));
@@ -363,14 +326,11 @@ function money(k) {
     paper,
     paperLive,
     bridgePaper,
-    // Operator 2026-07-24: the headline net is the ERA-anchored CASH result
-    // (account_pnl_era_cash = cash_now − cash_at_reset) so it matches the equity
-    // tile + the cash equity curve and reads GREEN when the account is up; the
-    // ledger-PAPER trading result rides the sub-line (net = paper + drift bridge).
-    // Supersedes the 2026-07-23 paper-headline choice (operator confirmed the
-    // calendar-blind trade-off: cash is one balance, not a per-day figure, so a
-    // date-range pick re-scopes the breakdown below but not this headline). Paper
-    // is the fallback only when no cash figure exists.
+    // The headline net is the cash result since the reset (account_pnl_era_cash = cash_now -
+    // cash_at_reset), so it matches the equity tile and the cash curve; the ledger paper result is
+    // on the sub-line (net = paper + drift). Cash is one balance, not a per-day figure, so a
+    // date-range selection re-scopes the breakdown below but not this headline. Paper is the
+    // fallback when there is no cash figure.
     net: cashNet != null ? cashNet : bridgePaper,
     // Whether `net` IS the cash figure (drives the MoneyHeadline tag/sub).
     // Equals hasCash here, but withPaperBasis forces it false when it overrides
@@ -388,11 +348,10 @@ function money(k) {
   };
 }
 
-// Re-anchor a money bundle to a caller-supplied `paper` figure, keeping it
-// self-consistent. The Calendar headlines Σ(rendered heatmap cells) as its
-// "paper", so net and the drift bridge must be recomputed against that
-// number. Paper-first headline (operator 2026-07-23): net IS the new paper;
-// drift = cash − new paper. The ONE place a consumer overrides "paper".
+// Re-anchor a money bundle to a caller-supplied `paper` figure, keeping it consistent. The
+// Calendar uses the sum of its rendered cells as "paper", so net and the drift are recomputed
+// against it (net = the new paper, drift = cash - new paper). The only place a consumer overrides
+// "paper".
 function withPaperBasis(m, paper) {
   return {
     ...m,
@@ -432,27 +391,23 @@ function dailyInRange(daily, range) {
 }
 
 // ===========================================================================
-// Trade groups (CLOB positions) — operator 2026-08-05
+// Trade groups (CLOB positions)
 // ===========================================================================
-// The ledger writes ONE ROW PER FILL: a base entry plus every top-up it took in
-// the same market window is several rows. On the venue that is ONE position —
-// one token balance that settles once — so every count this dashboard labels a
-// "trade" (or uses as a win-rate denominator) counts GROUPS, not rows. Dollar
-// sums are untouched: Σ over groups of Σ over fills == Σ over fills.
+// The ledger writes one row per fill: an entry plus any top-ups in the same market window are
+// several rows. On the venue that is one position (one token balance that settles once), so
+// everything this dashboard calls a "trade" (or uses as a win-rate denominator) counts groups, not
+// rows. Dollar sums are the same either way.
 //
-// The key is the position's identity, mirroring the producer's
-// `_TRADE_GROUP_KEY_SQL` exactly (payload.contracts.trade_group):
+// The key is the position's identity, matching the server's `_TRADE_GROUP_KEY_SQL`
+// (payload.contracts.trade_group):
 //
 //     venue · coin · interval_min · window_start_ts · side · wallet
 //
-// (coin, interval_min, window_start_ts) names the market window, `side` names
-// WHICH outcome token was bought (a YES and a NO position in the same window
-// are two different CLOB balances and must never merge), and the wallet keeps
-// two funded accounts apart. `is_topup` is NOT in the key — a top-up's whole
-// point is that it lands in its base bet's group; it only LABELS the fills
-// inside one. A row from a payload too old to carry window_start_ts gets a
-// row-unique key, so a legacy stream degrades to one-trade-per-fill (the old
-// behaviour) instead of merging unrelated positions.
+// (coin, interval_min, window_start_ts) is the market window, `side` is which outcome token was
+// bought (YES and NO in one window are two balances), and the wallet keeps accounts apart.
+// `is_topup` is not in the key; it only labels fills within a group. A row from a payload too old
+// to have window_start_ts gets a unique key, so old streams show one trade per fill instead of
+// merging unrelated positions.
 function tradeGroupKey(r, i) {
   if (!r) return 'row:?' + i;
   // No window key ⇒ the row's own identity, so it stays a trade of one. `i` is
@@ -556,15 +511,12 @@ function gOutcome(g) { return !!g && (g.win || g.loss); }
 // Every COUNT below is one-per-trade-group; every $ figure is the same Σ over
 // fills it always was.
 
-// Equity curve: replay settled TRADES in settlement order, compounding the
-// realized capital from `base`. Returns points + peak + max drawdown.
+// Equity curve: replay settled trades in settlement order, compounding realized capital from
+// `base`. Returns points, peak and max drawdown.
 //
-// ONE POINT PER TRADE GROUP (operator 2026-08-09) — the client twin of the
-// server _ledger_equity_series. Fills fold into CLOB positions first (a base
-// bet + its top-ups = one point, not three) and voided never-filled cancel
-// groups never plot, so this fallback curve's x-axis is the TRADE number, the
-// same population the hero "trades" tile counts. `n` is a trade count.
-// Σ over groups == Σ over rows, so anchoredEquity's back-out is unaffected.
+// One point per trade group, like the server's _ledger_equity_series: fills fold into positions
+// first and voided cancel groups are skipped, so the x-axis is the trade number the hero "trades"
+// tile counts. Sums over groups equal sums over rows, so anchoredEquity's back-out is unaffected.
 function aggEquity(ledger, base) {
   const rows = groupTrades((ledger || []).filter((r) => isSettled(r) && typeof r.pnl_net === 'number'))
     .filter((g) => g.settled && !g.voided)
@@ -676,10 +628,8 @@ function aggWeekly(daily) {
   return [...m.values()].sort((a, b) => (a.week < b.week ? -1 : 1));
 }
 
-// Per-TRADE (group) P&L distribution histogram — a base bet and its top-ups
-// contribute ONE bar-count at their combined P&L, not one per fill. Voided
-// never-filled cancels are excluded (operator 2026-08-09): a $0 refund is not
-// a break-even trade and must not pile up in the centre bin.
+// P&L histogram per trade group: a position counts once, at its combined P&L. Voided never-filled
+// cancels are excluded so $0 refunds do not pile up in the centre bin as break-even trades.
 function aggHistogram(ledger, nbins = 11) {
   const vals = groupTrades(ledger).filter((g) => g.settled && g.hasPnl && !g.voided).map((g) => g.pnl);
   if (!vals.length) return [];
@@ -711,8 +661,8 @@ function aggCoins(ledger) {
   groupTrades(ledger).forEach((g) => {
     if (!g.coin) return;
     const e = m.get(g.coin) || { coin: g.coin, bets: 0, resolved: 0, wins: 0, losses: 0, pnl: 0, gw: 0, gl: 0, stake: 0, stakeSettled: 0 };
-    // `bets`/`resolved` are the "trades" column — voided never-filled cancels
-    // are in neither (operator 2026-08-09), matching the server _analytics_entry.
+    // `bets` / `resolved` are the "trades" column; voided cancels are in neither, as in the
+    // server's _analytics_entry.
     if (!g.voided) e.bets += 1;
     e.stake += g.size;
     if (g.settled && !g.voided) {
@@ -732,10 +682,8 @@ function aggCoins(ledger) {
   })).sort((a, b) => b.pnl - a.pnl);
 }
 
-// Per-slice (interval × entry_minute) performance over TRADE GROUPS — the
-// slice is the BASE bet's, so a top-up placed a minute later never files the
-// trade under a second slice. Voided never-filled cancels are excluded
-// (operator 2026-08-09) so Σ(slice.n) equals the hero "trades" tile.
+// Per-slice (interval × entry_minute) performance over trade groups, filed under the base bet's
+// slice. Voided cancels are excluded so the slice counts add up to the hero "trades" tile.
 function aggSlices(ledger) {
   const m = new Map();
   groupTrades(ledger).filter((g) => g.settled && !g.voided).forEach((g) => {
@@ -751,8 +699,8 @@ function aggSlices(ledger) {
   })).sort((a, b) => (a.interval === b.interval ? (a.entry - b.entry) : (a.interval < b.interval ? -1 : 1)));
 }
 
-// Win/loss streaks over decided TRADE GROUPS in settlement order — a stop-loss
-// exit is a realized loss, so it breaks a win streak like any LOSS.
+// Win/loss streaks over decided trade groups in settlement order; a stop-loss exit is a loss and
+// breaks a win streak.
 function aggStreaks(ledger) {
   const dec = groupTrades(ledger).filter(gOutcome)
     .sort((a, b) => (a.settleMs || 0) - (b.settleMs || 0));
@@ -795,15 +743,12 @@ function aggRatios(ledger, base, dailyIn, opts) {
   const eqBase = o.equity ? eq.base : base;
   const totalRet = eqBase > 0 ? (eq.final - eqBase) / eqBase : 0;
   const calmar = eq.maxDD < 0 ? totalRet / Math.abs(eq.maxDD) : null;
-  // PF over decided TRADE GROUPS: a stop-loss exit's realized loss counts in
-  // the gross loss like any other loss.
+  // Profit factor over decided trade groups; a stop-loss exit's loss counts in the gross loss.
   const groups = groupTrades(ledger);
   let gw = 0, gl = 0;
   groups.filter(gOutcome).forEach((g) => { const p = g.pnl || 0; if (p >= 0) gw += p; else gl += Math.abs(p); });
   const pf = o.pf !== undefined ? o.pf : (gl > 0 ? gw / gl : (gw > 0 ? Infinity : null));
-  // Expectancy = mean realized P&L per booked TRADE (not per fill, and not
-  // per voided never-filled cancel — their $0 dragged the mean toward zero
-  // until 2026-08-09).
+  // Expectancy = mean realized P&L per trade (not per fill, and not counting voided cancels).
   const settled = groups.filter((g) => g.settled && g.hasPnl && !g.voided);
   const expectancy = o.expectancy !== undefined ? o.expectancy
     : (settled.length ? settled.reduce((a, g) => a + g.pnl, 0) / settled.length : null);
@@ -838,11 +783,9 @@ function aggSummary(ledger) {
     return es.length ? es.reduce((a, b) => a + b, 0) / es.length : null;
   })();
   return {
-    // `settled` = settled groups that actually OPENED (operator 2026-08-09):
-    // a voided never-filled cancel is not a trade, so it sits in `voided`
-    // only. total == settled + open + voided, three disjoint buckets — the
-    // same split the server _analytics_entry emits, so this fallback and the
-    // server block can never report a different trade count.
+    // `settled` = settled groups that actually opened; voided cancels are only in `voided`.
+    // total == settled + open + voided, the same split as the server's _analytics_entry, so the
+    // fallback and the server always agree.
     total: groups.length,
     settled: settled.length - voided,
     open: groups.length - settled.length,
@@ -872,10 +815,8 @@ function lifetimeSummary(live, fallbackLedger) {
       settled: (typeof r.settled_opened === 'number')
         ? r.settled_opened
         : Math.max(0, (r.total || 0) - (r.open || 0) - (r.voided || 0)),
-      // Booked stop exits are already inside the server's `losses` (2026-08-05
-      // — the standalone `stops` column is gone from the payload). A legacy
-      // payload that still carries one folds it in here so the client can never
-      // render a stop-blind loss count.
+      // Stop-loss exits are already counted in the server's `losses`. An older payload with a
+      // separate `stops` count gets it folded in here.
       losses: (r.losses || 0) + (r.stops || 0),
       voided: r.voided || 0,
       open: r.open, winRate: r.win_rate, pnl: r.pnl_net, stake: r.stake, roi: r.roi,
@@ -900,13 +841,10 @@ function lifetimeSummary(live, fallbackLedger) {
 // passed windowed curve (anchoredEquity result) for the static-snapshot/legacy
 // path. Mirrors lifetimeSummary's prefer-server pattern.
 function lifetimeEquity(live, fallback) {
-  // Prefer the PER-TRADE ledger curve (window.LIVE.ledger_equity) — one point
-  // per settled trade group (operator 2026-08-09: the x-axis must be the TRADE
-  // number, matching the hero "trades" tile, not wall-clock time; voided
-  // never-filled cancels are excluded server-side). The hourly cash-balance
-  // curve (cash_equity) stays as the fallback, then the windowed
-  // anchoredEquity result. The equity TILE stays cash-basis regardless — only
-  // the chart's x-axis changed.
+  // Prefer the per-trade ledger curve (window.LIVE.ledger_equity): one point per settled trade
+  // group, so the x-axis is the trade number (voided cancels are excluded on the server). The
+  // hourly cash-balance curve (cash_equity) is the fallback, then the client's anchoredEquity. The
+  // equity tile stays on the cash basis regardless.
   const ledgerCurve = live && live.ledger_equity;
   const e = ledgerCurve || (live && live.cash_equity);
   if (e && Array.isArray(e.points) && e.points.length >= 2) {
@@ -930,43 +868,33 @@ function ledgerWindow(ledger) {
 }
 
 // ===========================================================================
-// v2 "step1last" resolution grouping (cross-attempt; one row per RESOLUTION).
+// Sub-minute resolution grouping (one row per resolution, across attempts)
 //
-// A RESOLUTION is (coin, interval, window_start, side) — NOT the sleeve. A
-// single resolution can draw SEVERAL attempts (per-second retries, T3 top-ups,
-// and historically a second sleeve on the same window), first-fill-wins. They
-// MUST fold into ONE row so a missed resolution (no attempt filled) is counted
-// ONCE, not once per attempt. The pre-fix bug keyed on the sleeve, so XRP 15m
-// DOWN attempted twice rendered as TWO rows, each showing the full missed
-// −$2.63 — double-counting the miss.
+// A resolution is (coin, interval, window_start, side), not the sleeve. One resolution can draw
+// several attempts (per-second retries, or a second sleeve on the same window), and first fill
+// wins. They fold into one row, so a missed resolution (nothing filled) is counted once, not once
+// per attempt.
 //
-// interval is taken from the row's own field when present, else derived from
-// the sleeve label (subminute_5m/subminute_15m → "5m"/"15m"). Keeping the
-// interval in the key (not just window_start_ts) holds a 5m and a 15m window
-// that share a boundary epoch (e.g. both on a :00) in separate resolutions.
+// The interval comes from the row when present, else from the sleeve label (subminute_5m /
+// subminute_15m -> "5m" / "15m"). Keeping it in the key keeps a 5m and a 15m window starting at the
+// same second apart.
 //
-// FILLS fold into POSITIONS, not rows-per-fill (operator 2026-08-05). A base
-// entry and the T3 top-ups that landed in the same market window are ONE CLOB
-// balance that settles once, so they collapse into one row carrying Σ size,
-// Σ P&L and the SIZE-WEIGHTED effective price — exactly what the Trade journal
-// shows — with an "N in 1" badge and the individual fills kept in the
-// drill-down. The membership test is the SHARED `groupTrades` helper (the
-// journal's own, keyed on venue·coin·interval·window_start·side·wallet), never
-// a second copy of the rule, so the two tables can never disagree about what
-// one trade is. A resolution that genuinely holds two positions (a second
-// sleeve/wallet on the same window) still renders two rows.
-// The no-fill attempts (rejects + ghost/$0 accepts) collapse into ONE no-fill row
-// per resolution (shown only when the resolution produced no fill at all); a
-// resolution that did fill attaches its remaining attempts to the FIRST fill's
-// drill-down. Missed (counterfactual, PAPER) PnL is the single attempt
-// carrying the full intended size (max requested_usd) — deterministic,
-// size-honest, and counted ONCE per resolution.
+// Fills fold into positions: all fills in one market window are one CLOB balance, shown as one row
+// with total size, total P&L and the size-weighted price, an "N in 1" badge, and the individual
+// fills in the drill-down. The grouping uses the shared `groupTrades` helper (the journal's own),
+// so both tables agree on what one trade is. A resolution that really holds two positions (two
+// sleeves or wallets on one window) still shows two rows.
+//
+// No-fill attempts (rejects and $0 accepts) collapse into one no-fill row per resolution, shown
+// only if nothing filled; otherwise they attach to the first fill's drill-down. Missed
+// (counterfactual) P&L comes from the one attempt with the largest requested size and is counted
+// once per resolution.
 // ===========================================================================
 function sleeveInterval(sleeve) {
   const m = /(\d+)m/.exec(sleeve || '');
   return m ? m[1] + 'm' : null;
 }
-// MID band badge from the sleeve label.
+// Band badge from the sleeve label.
 function sleeveBand(sleeve) {
   const s = String(sleeve || '').toLowerCase();
   if (/subminute/.test(s)) return 'MID';
@@ -1010,18 +938,14 @@ function rejectOutcome(r) {
   return String(r.resolved_outcome).toUpperCase() === dir ? 'WIN' : 'LOSS';
 }
 
-// ── v2 bet → the ledger row shape `groupTrades` reads ────────────────
-// The sub-minute payload names the same facts differently from the ledger
-// stream the journal consumes (`time` not `bet_ts`, `interval` "5m" not
-// `interval_min` 5, `stake_usd`/`filled_usd` not `bet_size`). This adapter
-// renames them — and NOTHING else — so the sub-minute table can call the
-// journal's grouping helper instead of growing a second copy of the rule.
+// ── sub-minute bet → the ledger row shape `groupTrades` reads ───────── The sub-minute payload
+// names some fields differently from the ledger stream (`time` not `bet_ts`, `interval` "5m"
+// not `interval_min` 5, `stake_usd`/`filled_usd` not `bet_size`). This adapter only renames
+// them, so the sub-minute table can reuse the journal's grouping helper.
 //
-// `effective_bet_size` is the REALIZED fill value (`filled_usd`), so the size
-// groupTrades sums and size-weights the price by is the money that actually
-// landed on the position, not the intent (the intent is the row's `target`,
-// summed separately). `_v2` carries the untouched payload row back out for
-// rendering — no field of the original is lost or overwritten.
+// `effective_bet_size` is the realized fill value (`filled_usd`), so groupTrades sums and
+// weights by the money that actually landed, not the intent (the intent is `target`, summed
+// separately). `_v2` carries the original payload row through for rendering.
 function subminuteFillRow(b) {
   return {
     ...b,
@@ -1053,12 +977,10 @@ function buildResolutionRow(res, opts) {
   const nAccepted = groupFills.length + ghosts.length;  // ghosts = accepted-but-$0
   const attempts = nAccepted + nRejects;
 
-  // TARGET is the intent (Σ of the fills' requested stakes — a top-up asked for
-  // its own money), FILLED the realized Σ groupTrades already computed.
-  // requested_usd (ledger.target_usd, exported 2026-08-09) is the sizer's
-  // intent; stake_usd is the REALIZED fill value, kept only as the legacy
-  // fallback — comparing filled against Σ stake_usd was filled-vs-itself, so
-  // a partially filled FAK could never read PARTIAL.
+  // TARGET is the intent (sum of the fills' requested stakes); FILLED is the realized sum
+  // groupTrades already computed. requested_usd (ledger.target_usd) is the sizer's intent;
+  // stake_usd (the realized fill value) is only an older-payload fallback, since filled vs
+  // stake_usd would compare a value with itself and never show PARTIAL.
   const target = anchor
     ? groupFills.reduce((a, f) => a + (f.requested_usd != null ? f.requested_usd
         : (f.stake_usd != null ? f.stake_usd : 0)), 0)
@@ -1069,13 +991,9 @@ function buildResolutionRow(res, opts) {
 
   let status;
   if (anchor) {
-    // A HISTORICAL stop-closed position (exit_kind='stop_loss') is a
-    // booked-once early exit: its pnl_net is a realized loss and it merges into
-    // its resolution like any settled bet. The standalone STOP badge was
-    // retired with the engine's stop-loss (2026-08-05) — these rows now render
-    // as the LOSS they are, matching the journal. Discriminate ONLY on
-    // exit_kind so legacy voided CANCELLED rows (exit_kind NULL) keep their
-    // current display semantics instead of being mislabelled losses.
+    // A stop-closed position (exit_kind='stop_loss') has a realized loss in pnl_net and merges into
+    // its resolution like any settled bet, shown as LOSS. Only exit_kind is checked, so voided
+    // CANCELLED rows (exit_kind NULL) are not mislabelled as losses.
     status = (anchor.exit_kind === 'stop_loss') ? 'LOSS'
       : !(filled > 0) ? 'GHOST_FILL'
       // PARTIAL is a RELATIVE shortfall (2% of the stake, floored at half a
@@ -1140,9 +1058,8 @@ function buildResolutionRow(res, opts) {
     kind: 'reject', side: r.side, band: sleeveBand(r.sleeve),
     offset: r.offset_sec != null ? r.offset_sec : offsetFromTs(r.time, ws),
     price: r.limit_price, requested: r.requested_usd, filled: 0,
-    // `drift` = requote_ask − our limit: a PRICE metric (how far the book
-    // moved after the reject), never a cause. The refuted probe taxonomy that
-    // used to read a cause out of it was deleted 2026-07-30.
+    // `drift` = requote_ask - our limit: how far the book moved after the reject. A price metric,
+    // never a cause.
     fillPx: null, drift: r.requote_drift, pnl: null, missed: r.missed_pnl,
     // Per-attempt ON-CHAIN verdict (server miss_forensics job) — the ONLY
     // miss-cause axis: the trade tape's answer to faster-taker vs maker-cancel,
@@ -1333,32 +1250,25 @@ function useSecond() {
   React.useEffect(() => { const h = setInterval(force, 1000); return () => clearInterval(h); }, []);
 }
 
-// ── latency: the venue taker-delay shortfall (Latency page) ──────────
-// How much of the venue's DOCUMENTED uncancellable taker delay a measured POST
-// figure did NOT already contain. Lives here (not in pages-latency.jsx) so the
-// invariant can be unit-tested, the way groupResolutions does for Subminute.
+// ── latency: the taker-delay shortfall (Latency page) ─────────────────── How much of the venue's
+// documented taker delay a measured POST figure did not already include. Kept here rather than in
+// pages-latency.jsx so it can be unit-tested.
 //
-// An ACCEPTED marketable order's POST round trip cannot return before the
-// enforced delay has elapsed, so wherever accepted orders were measured the
-// delay is already inside `post` and the shortfall is 0 — the total-latency
-// column adds nothing and cannot double-count. A REJECT-only window measures
-// post ~0 (a 400 skips matching and never waits), and there the shortfall is
-// the whole documented delay, so the total still never understates the wall.
-// Null/absent documented delay (predict.fun documents none) → 0.
+// An accepted marketable order cannot return before the delay has passed, so where accepted orders
+// were measured the delay is already inside `post` and the shortfall is 0 (no double count). A
+// reject-only window measures post ~0 (a 400 skips matching), so the shortfall is the whole
+// documented delay and the total never understates the wall. A null or absent documented delay
+// gives 0.
 function takerDelayShortfall(takerDelayMs, postMs) {
   if (takerDelayMs == null || !isFinite(takerDelayMs)) return 0;
   const measured = typeof postMs === 'number' && isFinite(postMs) ? postMs : 0;
   return Math.max(0, takerDelayMs - measured);
 }
 
-// ── latency: which stage rows ADD UP, and what the rest of the tick is ──
-// Operator 2026-08-05: "when sum up all ms, why not equal total ms?"
-//
-// Only these five stages are DISJOINT phases of one tick, so only these are
-// summed. `sign` and `post` are measured INSIDE `order` (the whole
-// place_gtc_limit_order envelope) and the taker-delay row is that same POST
-// round trip a third time — adding them would count the same milliseconds two
-// and three times over, which is exactly why the column never tallied.
+// ── latency: which stage rows add up, and what the rest of the tick is ── Only these five stages
+// are separate phases of one tick, so only they are summed. `sign` and `post` are measured
+// inside `order` (the whole place_gtc_limit_order call), and adding them would count the same
+// milliseconds twice.
 const LATENCY_ADDITIVE_STAGES = ['spot', 'ctx', 'gamma', 'book', 'order'];
 
 function latencyStageSum(stages, col) {
@@ -1371,25 +1281,21 @@ function latencyStageSum(stages, col) {
   return sum;
 }
 
-// The residual that makes the column tally: total − Σ(additive stages). It is
-// NOT decoration — it is a real, unmeasured quantity, and it absorbs two
-// different things at once:
+// The residual that makes the column add up: total - sum(additive stages). It is a real, unmeasured
+// quantity covering two things:
 //
-//   1. TICK WORK WITH NO STAGE OF ITS OWN. Only network-touching phases are
-//      instrumented (pipeline.TickStats), so scoring, gates, sizing, the
-//      SQLite writes, the post-POST tail (T3 pass, next-window prefetch, trace
-//      write) and the held-position book reads (`ms_book_stop`, split out of
-//      `book`) are inside `total` and inside NO row above it.
-//   2. PERCENTILE NON-ADDITIVITY. Each cell is an independent order statistic:
-//      a p50 of a sum is not the sum of p50s, and the order stages aggregate
-//      ORDER-BEARING ticks only while spot/ctx/gamma/book/total aggregate every
-//      tick (compare the `n` the payload carries per stage). Those are
-//      different populations, so the components can even EXCEED the same
-//      column's total.
+//   1. Tick work with no stage of its own. Only network phases are
+//      instrumented (pipeline.TickStats), so scoring, gates, sizing, SQLite
+//      writes, the post-POST tail (next-window prefetch, trace write) and the
+//      held-position book reads (`ms_book_stop`, split out of `book`) are in
+//      `total` but in no row.
+//   2. Percentiles do not add. Each cell is its own percentile: a p50 of a sum
+//      is not the sum of p50s, and the order stages cover only order-bearing
+//      ticks while spot/ctx/gamma/book/total cover every tick (see each stage's
+//      `n`). With different populations, the parts can even exceed the total.
 //
-// It is therefore returned SIGNED — never clamped. Clamping at zero would
-// silently break the one property the table now promises the operator: the
-// visible rows add to the visible total, exactly, in every column.
+// So it is returned signed, never clamped; clamping at zero would break the guarantee that the
+// visible rows add to the visible total in every column.
 function latencyResidual(stages, col, totalMs) {
   if (typeof totalMs !== 'number' || !isFinite(totalMs)) return null;
   return totalMs - latencyStageSum(stages, col);

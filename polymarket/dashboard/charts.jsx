@@ -245,9 +245,10 @@ function PnlHistogram({ bins, height = 150 }) {
         return (
           <g key={i}>
             <rect x={padL + i * bw + gap / 2} y={H - padB - bh} width={bw - gap} height={Math.max(0, bh)} rx="3" fill={col} fillOpacity="0.9">
-              {/* "trades", not "bets": b.n counts TRADE GROUPS (base + top-ups
-                  once, voided never-filled cancels excluded) — the same word
-                  the hero tile and the equity crosshair use (2026-08-09). */}
+              {/* "trades", not "bets": b.n counts trade groups (all fills of a position once,
+                 voided never-filled cancels excluded), the same word the hero tile and the equity
+                 crosshair use.
+                 */}
               <title>{`${b.n} trades · mid ${b.mid >= 0 ? '+' : ''}${b.mid.toFixed(2)}`}</title>
             </rect>
             <text x={padL + i * bw + bw / 2} y={H - padB - bh - 3} textAnchor="middle" fontSize="9" fill={C.fg3} fontFamily="JetBrains Mono, monospace">{b.n || ''}</text>

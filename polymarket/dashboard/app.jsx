@@ -1,13 +1,12 @@
 // ===========================================================================
-// app.jsx — root: sidebar nav shell + page routing.
+// app.jsx — root: sidebar nav shell and page routing.
 //
-// The dashboard is a sidebar + multi-page operator trading journal for the
-// cryptobot Polymarket 5m/15m trading bot. Live data arrives over SSE
-// (window.LIVE, see live-bridge.js); overview/journal/calendar analytics
-// are derived client-side from the streamed ledger in data.jsx.
+// A sidebar, multi-page trading journal for the Polymarket 5m/15m bot. Live data arrives over SSE
+// (window.LIVE, see live-bridge.js); overview, journal and calendar analytics are derived
+// client-side from the streamed ledger in data.jsx.
 //
-// Load order (see index.html): data → charts → shell → pages-* → app.
-// Shared helpers live on window.CB; components on window.<Name>.
+// Load order (see index.html): data → charts → shell → pages-* → app. Shared helpers live on
+// window.CB; components on window.<Name>.
 // ===========================================================================
 (function () {
 const { useLive } = window.CB;
@@ -68,16 +67,7 @@ function App() {
   const live = useLive();
   const [page, setPage] = useState('overview');
   const [range, setRange] = useState('All');
-  // SINGLE-VENUE CONSOLE (2026-08-01, predict.fun Tokyo cutover). There is no
-  // venue selector and no cross-venue payload swap any more:
-  //   * the topbar switcher is gone (shell.jsx) — a switcher on a
-  //     single-venue console could only pin it to a venue it cannot render,
-  //     and the localStorage pin it persisted survived redeploys;
-  //   * window.PF_LIVE / predictfun_live.json is gone — that swapped EVERY tab
-  //     to a 30s-stale read-only dump of the OTHER box, which on a real-money
-  //     desk is precisely the surface you do not want mid-incident. The
-  //     predict.fun box serves its own live console on :8801.
-  // The venue is simply whatever THIS process's payload says it is.
+  // The venue is whatever this process's payload says it is.
   useEffect(() => {
     if (live && live.venue) window.__CB_DEPLOY_VENUE = window.CB.venueOf(live);
   }, [live]);

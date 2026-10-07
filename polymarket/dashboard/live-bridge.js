@@ -1,17 +1,14 @@
-// EventSource bridge + snapshot.json loader.
+// EventSource bridge and snapshot.json loader.
 //
-// Wires the live scanner's `/events` SSE stream into `window.LIVE` and
-// dispatches `cryptobot:live` on every state transition. Mirrors the
-// payload contract defined in
-//   src/cryptobot/observability/snapshot_builder.py :: build_payload()
+// Connects the bot's `/events` SSE stream to `window.LIVE` and dispatches `cryptobot:live` on
+// every state change. The payload contract is defined in
+// src/cryptobot/observability/snapshot_builder.py :: build_payload():
 //
-// Payload shape (R-NEW-12):
-//   { tick_ts, kpis, portfolio, markets, ledger, ledger_rollup,
-//     ledger_equity, ledger_daily, live_wallet, operator, latency, v2 }
+//    { tick_ts, kpis, portfolio, markets, ledger, ledger_rollup,
+//      ledger_equity, ledger_daily, live_wallet, operator, latency, v2 }
 //
-// When no /events endpoint is reachable, keep the dashboard empty and surface
-// the connection state in the topbar. Do not render synthetic trades; stale
-// mock data is too easy to mistake for the live paper ledger.
+// When /events is unreachable the dashboard stays empty and the topbar shows the connection state.
+// No synthetic trades are ever rendered; mock data is too easy to mistake for the real ledger.
 
 function loadSnapshot() {
   // Static research snapshot for portfolio/backtest metadata.
@@ -35,15 +32,6 @@ function loadSnapshot() {
 
 loadSnapshot();
 
-// RETIRED 2026-08-01 (predict.fun Tokyo cutover) — do NOT re-add:
-//   * pollPredictfunPaper (predictfun_paper.json -> window.PF_PAPER)
-//   * pollPredictfunLive  (predictfun_live.json  -> window.PF_LIVE)
-// Both existed only to render the OTHER venue on this console. Each console is
-// now single-venue by deployment (:8800 Polymarket, :8801 predict.fun), so the
-// dumps had no consumer; their producers (refresh_dashboard_snapshots.sh, the
-// dump_snapshot_json oneshot) and their sse_server allowlist entries are gone
-// too. A cross-venue view must be built from a real read-only API, not a
-// periodically-dumped file that silently goes stale.
 
 (function initSse() {
   window.__SSE_STATE = 'connecting';

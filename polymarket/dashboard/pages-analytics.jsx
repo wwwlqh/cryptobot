@@ -1,7 +1,6 @@
 // ===========================================================================
-// pages-analytics.jsx — CalendarPage (daily realized-P&L heatmap), derived
-// entirely from the streamed ledger. (CalibrationPage was deleted in the
-// 2026-07-07 reconstruction — operator call.)
+// pages-analytics.jsx — CalendarPage (daily realized-P&L heatmap), derived entirely from the
+// streamed ledger.
 // ===========================================================================
 (function () {
 const { fmt, tone, selectDaily, money, withPaperBasis, scopeLive, stripCash } = window.CB;
@@ -80,12 +79,10 @@ function CalendarPage({ live, venueSel }) {
   // is null and the cell shows $0.00 (a single positive day is not a "worst").
   const worst = daily.reduce((m, d) => (d.pnl < 0 && (!m || d.pnl < m.pnl) ? d : m), null);
 
-  // Headline is the shared MoneyHeadline, with the bridge's `paper` overridden
-  // to Σ(RENDERED cells) via withPaperBasis so the marquee equals its own
-  // heatmap. Account cash is not venue-split and this console always renders ONE
-  // venue, so the Calendar unconditionally drops the cash basis: net reads as
-  // pure ledger paper over the (scoped) rendered cells — stated in the
-  // headline's hover tooltip since the 2026-08-05 declutter.
+  // The headline is the shared MoneyHeadline with the bridge's `paper` replaced by the sum of the
+  // rendered cells (withPaperBasis), so the headline equals its own heatmap. Account cash is not
+  // split by venue, so the Calendar always drops the cash basis: net is ledger paper over the
+  // rendered cells, as the headline's tooltip says.
   const k = live.kpis || {};
   const m = useMemo(() => money(k), [k]);
   const mCal = stripCash(m);
@@ -107,8 +104,7 @@ function CalendarPage({ live, venueSel }) {
         title={`${MONTHS[ym.m0 + 1]} ${ym.y}`}
         actions={(
           <React.Fragment>
-            {/* Basis is a hover tooltip now — the visible "ledger paper" tag was
-                dropped in the 2026-08-05 declutter. */}
+            {/* The basis is in the tooltip. */}
             <span className={'mono ' + tone(monthPnl)} style={{ fontSize: 14, fontWeight: 700 }}
               title="ledger paper: Σ pnl_net over this month's settled rows">{fmt.moneyDelta(monthPnl)}</span>
             <button className="cal-nav" onClick={() => setYm(addMonth(ym, -1))}>‹</button>

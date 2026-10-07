@@ -1,11 +1,8 @@
 // ===========================================================================
-// pages-overview.jsx — OverviewPage (hero + rail + per-coin/per-slice).
-// Account headline and equity widgets use reconciled account cash basis when
-// comparable. Remaining strategy analytics derive from streamed ledger and
-// server lifetime rollups so cash and ledger accounting stay visibly separate.
-// (The standalone Performance page was retired 2026-07-11 — its "settled bets
-// by slice" table now lives at the foot of Overview; its other risk-adjusted /
-// by-coin panels were dropped with the tab. CoinTable is shared below.)
+// pages-overview.jsx — OverviewPage (hero, rail, per-coin and per-slice tables). The account
+// headline and equity widgets use the reconciled account cash when it is comparable; the strategy
+// analytics come from the streamed ledger and the server's lifetime rollups, so cash and ledger
+// accounting stay visibly separate. CoinTable is shared below.
 // ===========================================================================
 (function () {
 const {
@@ -29,11 +26,10 @@ function coinSpark(ledger, coin) {
   let acc = 0; return rows.map((r) => (acc += r.pnl_net));
 }
 
-// `sparkWindowed` marks the cum-P&L column as covering only the streamed rows:
-// the counts/P&L columns come from the server full-ledger block, but a sparkline
-// needs per-row data the block does not carry, so the two columns describe
-// different populations — said in the column TOOLTIP (the visible caption was
-// dropped in the 2026-08-05 declutter).
+// `sparkWindowed` marks the cumulative-P&L column as covering only the streamed rows: the count
+// and P&L columns come from the server's full-ledger block, but a sparkline needs per-row data that
+// block does not carry, so the two columns describe different populations (said in the column
+// tooltip).
 function CoinTable({ coins, ledger, showSpark, sparkWindowed }) {
   if (!coins.length) return <EmptyState msg="no bets recorded in this window" />;
   return (
@@ -94,14 +90,9 @@ function OverviewPage({ live, range, venueSel }) {
   const coins = an.coins;
   const slices = an.slices;
   const streaks = an.streaks;
-  // (`aggRatios` — sharpe / sortino / calmar / expectancy — is no longer called
-  // here: the rail tile that displayed them was deleted 2026-08-05. The helper
-  // stays in data.jsx for the fallback analytics path.)
   const win = ledgerWindow(ledger);
-  // Honest window stamp for the day-granular weekly panel (server daily).
-  // NOT rendered as visible text any more (2026-08-05 declutter, operator):
-  // it rides the panel-title TOOLTIP, so which population the bars describe is
-  // still one hover away instead of being lost.
+  // Window note for the weekly panel (server daily data), shown in the panel title's tooltip so it
+  // is clear which population the bars describe.
   const dailyLabel = serverDaily
     ? (range === 'All' ? 'full history' : `${range} · full history`)
     : (win ? `${win.n}-row window` : 'no rows');
@@ -127,19 +118,14 @@ function OverviewPage({ live, range, venueSel }) {
     ? `${life.wins}W · ${life.losses}L`
     : 'no decided trades yet';
   const noBetsYet = life.lifetime && life.total === 0;
-  // 24h tile: W·L when the payload carries the counts; the window is keyed
-  // by BET time (item 23), and open bets are excluded (realized only). These
-  // are per-FILL wallet-snapshot counts (capital.py), not the trade-group
-  // counts every ledger-derived surface reports — the "fills" qualifier was
-  // dropped from the visible sub 2026-08-05 (operator declutter); the fact
-  // rides the tile tooltip instead.
+  // 24h tile: wins/losses when the payload has them. The window is by bet time and open bets are
+  // excluded (realized only). These are per-fill wallet counts (capital.py), not trade-group
+  // counts; the tooltip says so.
   const wl24 = (k.wins_24h != null || k.losses_24h != null)
     ? `${k.wins_24h || 0}W · ${k.losses_24h || 0}L` : null;
-  // "open bets" everywhere on this page = open TRADE GROUPS (CLOB positions),
-  // the same thing the Journal's "open positions" tile counts. The server
-  // ships the grouped scalar as kpis.n_pending_trades (operator 2026-08-09);
-  // a payload that predates it falls back to the per-FILL n_pending and says
-  // so in the label, rather than silently calling 3 pending fills 3 bets.
+  // "Open bets" on this page means open trade groups (CLOB positions), the same as the Journal's
+  // "open positions" tile, from kpis.n_pending_trades. An older payload without it falls back to
+  // the per-fill n_pending and says so in the label.
   const openTrades = k.n_pending_trades != null ? k.n_pending_trades : (k.n_pending || 0);
   const openIsFills = k.n_pending_trades == null;
   const pnl24Sub = [
@@ -162,11 +148,8 @@ function OverviewPage({ live, range, venueSel }) {
   // instead of silently reading a stale number as live.
   const capitalAsOf = m.degraded ? m.asOfMs : null;
 
-  // Zero ledger rows on this console: say so explicitly rather than rendering
-  // a page of empty tables that reads like a data outage. Venue-aware — the
-  // account tiles below are THIS box's own account (the console is
-  // single-venue by deployment since 2026-08-01), which is what the old copy
-  // got wrong by naming Polymarket unconditionally.
+  // No ledger rows on this console: say so explicitly rather than show empty tables that look like
+  // a data outage. The account tiles below are this deployment's own account.
   const emptyVenueBanner = allLedger.length === 0 ? (
     <div className="halt-banner" style={{ background: 'var(--panel)', borderColor: 'var(--line)' }}>
       <span className="tag">{(VENUE_META[sel] || {}).short || sel}</span>
@@ -192,12 +175,10 @@ function OverviewPage({ live, range, venueSel }) {
         <div className="hero-main">
           <div className="hero-top">
             <div>
-              {/* The BASIS is a hover tooltip now (operator 2026-08-05): the
-                  visible label is the bare word, so the headline reads as a
-                  number, not an accounting footnote. The ternary is unchanged
-                  — "· live" is still EARNED, a degraded cash sample
-                  (reconciliation fallback) drops the live tag and shows its
-                  as-of instead (item 25); it just renders in title=. */}
+              {/* The basis is a tooltip; the visible label is the bare word. "· live" only appears
+                 for a live cash figure; a degraded sample (reconciliation fallback) shows its
+                 as-of time instead.
+                 */}
               <div className="hero-label" title={m.cashLive != null ? (m.degraded ? 'equity (CLOB) · cash' : 'equity (CLOB) · cash · live') : 'equity · ledger paper'}>equity{capitalAsOf != null && <AsOfTag ms={capitalAsOf} />}</div>
               {/* key remounts the row when capital changes → hero-pulse fires */}
               <div className="hero-vrow" key={String(capitalValue)}>
@@ -210,16 +191,12 @@ function OverviewPage({ live, range, venueSel }) {
               </div>
             </div>
             <div className="hero-metrics">
-              {/* Trade COUNT, not money (operator 2026-08-05): the net figure
-                  already lives in the decomposition strip inside this card, so
-                  the hero cell answers "how many trades" instead of restating
-                  it. Population = the settled TRADE GROUPS of the ACTIVE range
-                  window (the same server analytics block every panel below
-                  reads) — a base bet and its top-ups are ONE trade, matching
-                  what the venue holds as one CLOB position. Voided never-filled
-                  cancels are NOT trades and are excluded (operator 2026-08-09)
-                  — this is the same population the equity curve above plots one
-                  point per, so the two numbers agree by construction. */}
+              {/* Trade count, not money (the net figure is already in the decomposition strip in
+                 this card). Counts settled trade groups in the active range (the same server
+                 analytics block the panels below read): all fills of a position are one trade, and
+                 voided never-filled cancels are excluded. That is the population the equity curve
+                 above plots, so the two agree.
+                 */}
               <div className="hero-metric" title="settled CLOB positions in this range that actually opened — a base bet and its top-ups count once; voided never-filled cancels excluded">
                 <span className="k">trades</span>
                 <span className="v">{summary.settled}</span>
@@ -236,20 +213,17 @@ function OverviewPage({ live, range, venueSel }) {
               </div>
             </div>
           </div>
-          {/* TWO SEPARATE PANES (operator 2026-08-05). These are different
-              metrics on different scales — equity in dollars, drawdown in
-              percent below the running peak — and stacked flush they read as
-              ONE chart with a weird tail. Each pane now carries its own
-              titled header and the second is set off by a hairline + gap
-              (.hero-pane, night-desk style). The drawdown pane's title is
-              mandatory: it is the only place that curve is named. */}
+          {/* Two separate panes: equity in dollars and drawdown in percent below the peak are
+             different metrics on different scales, and stacked flush they read as one chart. Each
+             pane has its own title; the second is set off by a hairline and a gap (.hero-pane).
+             The drawdown pane's title is the only place that curve is named.
+             */}
           <div className="hero-pane">
             <div className="hero-pane-head">equity</div>
             <div className="hero-chart">
-              {/* `unit` labels the crosshair honestly: the preferred ledger
-                  series is one point per TRADE, the cash_equity fallback is
-                  one point per HOURLY balance bucket. Saying "trade 37/104"
-                  over an hour index was the bug (operator 2026-08-09). */}
+              {/* `unit` labels the crosshair: the ledger series has one point per trade, the
+                 cash_equity fallback one point per hourly balance bucket.
+                 */}
               <EquityChart points={eq.points} base={eq.base} height={228}
                 unit={eq.basis === 'cash' ? 'hour' : 'trade'} />
             </div>
@@ -260,18 +234,15 @@ function OverviewPage({ live, range, venueSel }) {
               <DrawdownChart points={eq.points} height={64} />
             </div>
           </div>
-          {/* Gross → fees → rebates → NET decomposition, INSIDE the equity card
-              (operator 2026-08-05: it used to sit in its own band below the
-              hero and the card had dead space under the drawdown strip). Read
-              left to right it is one running story that ENDS on the number the
-              operator reconciles against: gross − fees + rebates = what the
-              venue CLOB balance actually moved by.
-              NOTE the payload's `pnl_net_usd` stays the PAPER net (gross −
-              fees) — a pinned producer invariant asserts Σ(ledger_daily.pnl)
-              == pnl_net_usd, and a rebate is an account-level cash event no
-              ledger row can carry. The rebate is added HERE, on the client,
-              for display only; nothing downstream reads `netInclRebates`.
-              Producer block: _ledger_pnl_decomposition. */}
+          {/* Gross -> fees -> rebates -> net, inside the equity card. Read left to right, it ends
+             on the number to reconcile against: gross - fees + rebates = how much the CLOB balance
+             actually moved.
+
+             The payload's `pnl_net_usd` stays the paper net (gross - fees), because the producer
+             guarantees sum(ledger_daily.pnl) == pnl_net_usd and a rebate is an account-level cash
+             event no ledger row carries. The rebate is added here for display only; nothing reads
+             `netInclRebates`. Producer: _ledger_pnl_decomposition.
+             */}
           {(k.pnl_gross_usd != null || k.pnl_fee_usd != null) && (
             <div className="kpi-grid c4 hero-strip">
               <KpiCell label="gross P&L"
@@ -321,10 +292,7 @@ function OverviewPage({ live, range, venueSel }) {
               ? `halts at ${fmt.pctPoints(k.max_drawdown_halt_pct, 0)}`
               : `D14 parity · halt ${fmt.pctPoints(k.max_drawdown_halt_pct, 0)}`}</span>
           </div>
-          {/* The "profit factor" (+ ROI, avg edge) and "sharpe" (+ sortino ·
-              calmar · expectancy) rail tiles were DELETED 2026-08-05 (operator
-              declutter). They are gone from Overview entirely — do not re-add.
-              PF still rides the journal's P&L tile subtitle. */}
+          {/* Profit factor is shown in the journal's P&L tile subtitle. */}
           <div className="rail-item">
             <span className="rail-k">streak <span className="mono">{streaks.longestW}W best · {streaks.longestL}L worst</span></span>
             <span className={'rail-v ' + (streaks.current > 0 ? 'pos' : streaks.current < 0 ? 'neg' : '')}>

@@ -1,23 +1,18 @@
 // ===========================================================================
 // pages-latency.jsx — LatencyPage.
 //
-// STRUCTURE (rewritten 2026-07-25 after the Polymarket latency audit). The page
-// answers one question, top to bottom: WHERE DOES THE TIME GO, AND WHICH PART
-// CAN I ACTUALLY CHANGE? Three rules it now obeys that the old page did not:
+// The page answers one question, top to bottom: where does the time go, and which part can be
+// changed? Three rules:
 //
-//  1. DECISION latency (tick start -> first order POST on the wire) is the
-//     headline, not the whole-tick total. The total includes ~100ms of
-//     post-POST tail that delays no fill, so presenting it as "decision->fill"
-//     overstated the movable part by ~3x.
-//  2. ACCEPT and REJECT orders are never blended. A venue-refused FAK is a real
-//     completed round trip (~286ms — a 400 skips matching) vs ~415ms for an
-//     accept that waits out the 250ms taker delay. Before the walker fix the
-//     reject cohort recorded post=0 and got averaged in, so this page displayed
-//     order post p50 ~= 0.0ms.
-//  3. WALL-CLOCK and STALENESS are separate sections. A 1ms-fast tick that
-//     priced a 7s-old ladder is the worse outcome, and the venue WS pushes
-//     ~822 msg/s (p50 1ms inter-frame, measured), so a large book age is always
-//     a consumer defect — never the feed.
+//  1. Decision latency (tick start -> first order POST on the wire) is the
+//     headline, not the whole-tick total. The total includes ~100ms of post-POST
+//     work that delays no fill.
+//  2. Accepted and rejected orders are never averaged together. A rejected FAK
+//     is a complete round trip (~286ms; a 400 skips matching), against ~415ms
+//     for an accepted order that waits out the 250ms taker delay.
+//  3. Wall-clock time and staleness are separate sections. A fast tick that
+//     priced a seconds-old book is the worse outcome, and the venue WS pushes
+//     ~800 msg/s, so a large book age points at the consumer, never the feed.
 // ===========================================================================
 (function () {
 const { fmt, tone, takerDelayShortfall,
@@ -43,14 +38,6 @@ function stat(block, name, key) {
   return s && typeof s[key] === 'number' ? s[key] : null;
 }
 
-// The "where the tick goes" PANEL and its BudgetBar (a stacked decision /
-// venue-round-trip / post-POST-tail bar with the "one order tick · p50",
-// "Nms wall clock · Nms to fill" and "250ms taker delay — uncancellable"
-// captions, plus the BUDGET descriptor and its `.lat-*` CSS) were DELETED
-// 2026-08-05 by operator order: every figure on it is on this page already —
-// decision p50 in the KPI strip, the venue round trip in the accept/reject
-// cohort panel, the taker delay in its own stage row, and the whole-tick wall
-// in the stage table's `total`. Do not re-add.
 
 // ── 1. accept vs reject, never blended ───────────────────────────────
 function CohortPanel({ orders, venueFloor }) {
@@ -58,8 +45,7 @@ function CohortPanel({ orders, venueFloor }) {
   const acc = po.post, rej = po.post_rej;
   const nAcc = orders.n_accepted, nRej = orders.n_rejected;
   const nTot = (nAcc || 0) + (nRej || 0);
-  // `why` is no longer a COLUMN (2026-08-05 declutter — the operator deleted
-  // the "what it is" prose column): it rides the row label's title tooltip.
+  // `why` is shown as the row label's tooltip.
   const rows = [
     { k: 'accepted', s: acc, n: nAcc,
       why: 'waits out the venue taker delay + matching' },
@@ -102,10 +88,9 @@ function CohortPanel({ orders, venueFloor }) {
           </tbody>
         </table>
       </div>
-      {/* The "a p50 near X–Yms is the FLOOR, not instability" paragraph that
-          used to close this panel is gone (2026-08-05 declutter) — it rides the
-          panel-title tooltip above, taker_delay_ms null-branch and all, so the
-          predict.fun console still never renders "nullms". */}
+      {/* The "a p50 near X–Yms is the floor, not instability" note is in the panel title's tooltip
+         above.
+         */}
     </Panel>
   );
 }
@@ -117,12 +102,10 @@ function FreshnessPanel({ freshness }) {
   const age = freshness.ws_age || {};
   const nWs = freshness.n_ws_served_ticks || 0;
   const stale = age.p50 != null && age.p50 > 700;
-  // Stall watchdog (operator order 2026-08-06). Age alone gates nothing on
-  // these books — quietness reads exactly like a stalled subscription — so the
-  // honest reading of the tile beside it is "old, and the out-of-band REST
-  // cross-check still agrees". DECLUTTER: the watchdog is invisible while it is
-  // only agreeing (tooltip-only); it earns visible text only once it has
-  // actually evicted a ladder.
+  // Stall watchdog. Book age gates nothing on these books (a quiet market looks just like a stalled
+  // subscription), so the tile's honest reading is "old, and the REST cross-check still agrees".
+  // The watchdog only shows visible text once it has actually evicted a book; otherwise it is in
+  // the tooltip.
   const wd = freshness.watchdog || null;
   const wdArmed = !!(wd && wd.armed);
   const wdEvictions = wd ? (wd.evictions || 0) : 0;
@@ -151,57 +134,48 @@ function FreshnessPanel({ freshness }) {
           sub={`serves ${pct(src.prefetch || 0, total)} of all books`}
           title="the REST prefetch cache carries no age telemetry, so the ws figures beside it do NOT describe the majority of book reads — read them as the ws-served slice only, never as whole-path freshness" />
       </div>
-      {/* The ⚠️ "no age instrumentation" paragraph was deleted 2026-08-05: the
-          'prefetch age' tile above already says `unmeasured` on its face and
-          carries the full caveat in its tooltip. */}
+      {/* The 'prefetch age' tile above already says `unmeasured` and carries the caveat in its
+         tooltip.
+         */}
     </Panel>
   );
 }
 
-// ── 3. per-stage table (kept, relabelled) ────────────────────────────
-// The "meaning" prose COLUMN was deleted 2026-08-05 (operator declutter): each
-// stage's note now rides the title tooltip on its own row label, so the table
-// is stage name + numbers only.
+// ── 3. per-stage table ────────────────────────────────────────────── Each stage's note is the
+// tooltip on its row label; the table is stage names and numbers.
 //
-// TAKER DELAY (operator 2026-08-05): its own row, MEASURED-FIRST.
-//   * `venue_floor.taker_delay_measured_ms` — p50/p95/max/n of the ACCEPTED
-//     per-order POST round trip in this window. REAL RECORDED TIME (network +
-//     signing tail + the enforced delay), so it answers "is it really 250, or
-//     260?" with an observation instead of a constant. Preferred whenever the
-//     window contains an accepted order.
-//   * `venue_floor.taker_delay_ms` — the venue's DOCUMENTED constant (250ms on
-//     Polymarket, null on predict.fun, which documents none). The fallback
-//     when nothing was measured, and always the floor named in the tooltip.
-// Both come from the payload; nothing is hardcoded here, and a venue with
-// neither renders no row at all rather than a fake 0.
+// Taker delay comes from the payload, measured first:
 //
-// The `total` row never UNDERSTATES that wall: a tick whose orders were all
-// REJECTED never waits the delay out (a 400 skips matching), so its measured
-// `post` is ~0 and the measured total excludes the venue floor entirely — that
-// is the "shows 0" the operator saw. The total therefore adds
-// CB.takerDelayShortfall(documented floor, measured post) per percentile
-// column: 0 wherever the accepted POST already contains the delay (no double
-// count), the full delay on a reject-dominated window.
+//   * `venue_floor.taker_delay_measured_ms`: p50/p95/max/n of the accepted
+//     per-order POST round trip in this window. Real recorded time (network +
+//     signing + the enforced delay), used whenever the window has an accepted
+//     order.
+//   * `venue_floor.taker_delay_ms`: the venue's documented delay (250ms on
+//     Polymarket), used when nothing was measured and named in the tooltip.
 //
-// THE COLUMN NOW TALLIES (operator 2026-08-05: "when sum up all ms, why not
-// equal total ms?"). It never did, for three separate reasons, and the table
-// now shows each of them instead of leaving the operator to add rows that were
-// never addable:
-//   1. NESTING. `sign` and `post` are measured INSIDE `order`, and the
-//      taker-delay row is that same POST a third time. They are marked '↳ ...'
-//      and are NOT part of the sum — only `LATENCY_ADDITIVE_STAGES`
-//      (spot · ctx · gamma · book · order) is.
-//   2. UNMEASURED TICK WORK. Only network-touching phases are instrumented, so
-//      scoring/gates/sizing, SQLite, the post-POST tail and the held-position
-//      book reads live in `total` and in no row above it.
-//   3. PERCENTILE NON-ADDITIVITY. Every cell is its own order statistic over
-//      its own tick population (the order stages see order-bearing ticks only),
-//      and a p50 of a sum is not a sum of p50s.
-// (2) and (3) land in ONE explicit 'other · unmeasured gaps' row =
-// CB.latencyResidual(total column − Σ additive), computed per COLUMN against
-// that column's own total, SIGNED (a negative residual is (3) showing itself).
-// The invariant the table now promises: the rows that carry a sum marker add,
-// with the residual, to the total row — exactly, in every column.
+// Nothing is hardcoded; with neither value there is no row rather than a fake 0.
+//
+// The `total` row never understates that delay: a tick whose orders were all rejected never waits
+// it out (a 400 skips matching), so its measured `post` is ~0 and the measured total leaves the
+// venue floor out. The total therefore adds CB.takerDelayShortfall(documented floor, measured post)
+// per percentile column: 0 when the accepted POST already contains the delay (no double count), the
+// full delay in a reject-only window.
+//
+// Why the rows alone do not add up to the total:
+//
+//   1. Nesting. `sign` and `post` are measured inside `order`. They are
+//      marked '↳ ...' and are not part of the sum; only
+//      `LATENCY_ADDITIVE_STAGES` (spot · ctx · gamma · book · order) is.
+//   2. Unmeasured tick work. Only network phases are instrumented, so scoring,
+//      gates, sizing, SQLite and the post-POST tail appear in `total` and in
+//      no row.
+//   3. Percentiles do not add. Every cell is its own percentile over its own
+//      ticks (the order stages see only order-bearing ticks), and a p50 of a
+//      sum is not the sum of p50s.
+//
+// (2) and (3) go in one explicit residual row = CB.latencyResidual(total - sum of additive rows),
+// computed per column and signed (a negative residual is (3) showing). So the rows with a sum
+// marker, plus the residual, equal the total in every column.
 function StageTable({ stages, takerDelayMs }) {
   const rows = STAGE_ORDER.filter((name) => stages[name]);
   if (!rows.length) return <EmptyState msg="no stage timings aggregated yet" />;
@@ -215,11 +189,9 @@ function StageTable({ stages, takerDelayMs }) {
     order: 'whole placement envelope (contains sign + post) · SUM across the tick\'s orders',
     total: 'whole tick incl. the post-POST tail and the venue taker delay — NOT decision→fill',
   };
-  // ROUND ONCE, at the display boundary, and do every sum on the ROUNDED
-  // figures. The payload carries one decimal, `ms()` renders whole
-  // milliseconds, and a residual computed from the raw decimals would
-  // reconcile numbers the operator cannot see — leaving the column he CAN add
-  // up off by a millisecond or two. This is the arithmetic he sees.
+  // Round once, at display, and do every sum on the rounded figures. The payload has one decimal
+  // and `ms()` shows whole milliseconds; a residual computed from the raw decimals would not add
+  // up in the column as shown.
   const rounded = {};
   Object.keys(stages).forEach((k) => {
     const s = stages[k];
@@ -233,22 +205,16 @@ function StageTable({ stages, takerDelayMs }) {
   // How much of the venue's uncancellable delay the measured POST did NOT
   // already capture, per percentile column (pure helper — window.CB).
   const shortfall = (col) => takerDelayShortfall(takerDelayMs, post ? post[col] : null);
-  // The standalone ↳ taker row (measured/documented variants) was DELETED
-  // 2026-08-06 by operator order together with the "unmeasured gaps" label:
-  // the residual row below IS the taker-delay row now. The measured
-  // accepted-POST view survives in the accept/reject cohort panel above.
-  // The TOTAL as displayed (the measured tick wall + whatever of the venue's
-  // documented delay it did not already contain) — and therefore the figure
-  // the residual must reconcile the summed rows against, column by column.
+  // The residual row below is labelled as the taker delay; the measured accepted-POST view is in
+  // the accept/reject panel above. This is the total as displayed (the measured tick wall plus
+  // whatever part of the documented delay it did not already include), which the residual
+  // reconciles against column by column.
   const totalShown = (col) => (rounded.total ? rounded.total[col] + shortfall(col) : null);
   const residual = (col) => latencyResidual(rounded, col, totalShown(col));
-  // Operator 2026-08-06: this row is LABELLED "taker delay" because in the
-  // windows the operator watches it is dominated by the venue's uncancellable
-  // delay — with no accepted order measured, the total carries the documented
-  // floor and it all lands here. The tooltip keeps the full truth: the row is
-  // arithmetically total − Σ(stage rows), so it also holds the uninstrumented
-  // tick work, and once orders flow (delay measured inside `post`) it shrinks
-  // to just those gaps.
+  // Labelled "taker delay" because, with no accepted order measured, the total carries the
+  // documented delay and it all lands here. The tooltip gives the full picture: the row is total
+  // minus the sum of the stage rows, so it also holds uninstrumented tick work, and once orders are
+  // measured (delay inside `post`) it shrinks to just those gaps.
   const RESIDUAL_TITLE =
     'total − (spot + ctx + gamma + book + order). '
     + (takerDelayMs != null
@@ -300,11 +266,8 @@ function StageTable({ stages, takerDelayMs }) {
   );
 }
 
-// The per-tick "bk age" COLUMN was deleted 2026-08-05 by operator order. Book
-// staleness keeps its own dedicated surfaces — the "book age at decision" KPI
-// tile and the whole book-freshness panel (p50/p95/max, the over-700ms/2s/10s
-// shares and the unmeasured-prefetch caveat) — so nothing measurable was lost;
-// the payload still carries `ws_age`/`bk_ws` per tick. Do not re-add.
+// Book staleness has its own tile and panel (p50/p95/max, the over-700ms/2s/10s shares, the
+// prefetch caveat); the payload still carries `ws_age`/`bk_ws` per tick.
 function RecentTicksTable({ recent }) {
   if (!recent.length) return <EmptyState msg="no network-active ticks in this window" />;
   return (
@@ -354,8 +317,7 @@ function LatencyPage({ live }) {
   const orders = lat.orders && lat.orders.per_order ? lat.orders : null;
   const vf = lat.venue_floor || null;
   const venueName = 'Polymarket';
-  // Blocks added 2026-07-25 — absent on payloads from an older scanner, in
-  // which case the page falls back to the tick-level view rather than lying.
+  // Absent on payloads from older versions; the page then falls back to the tick-level view.
   const decision = lat.decision || null;
   const freshness = lat.freshness || null;
 
@@ -367,23 +329,14 @@ function LatencyPage({ live }) {
   const po = orders ? orders.per_order : null;
   const acceptP50 = po && po.post ? po.post.p50 : null;
   const rejectP50 = po && po.post_rej ? po.post_rej.p50 : null;
-  // VENUE-AWARE (2026-08-01). `taker_delay_ms` is null on predict.fun —
-  // snapshot_builder._LATENCY_VENUE_FLOOR_BY_VENUE records that the venue has
-  // NO documented uncancellable taker delay, only a ~700-900ms observed POST
-  // band. The old `vf ? vf.taker_delay_ms : 250` collapsed that null into the
-  // string "nullms" on the predict.fun console (and, on a payload without the
-  // block at all, asserted Polymarket's 250ms as if it were measured here).
-  // Render "—" and let the prose carry the venue's real floor.
+  // `taker_delay_ms` can be null; render "—" rather than "nullms" or an assumed 250ms, and let
+  // the tooltip describe the floor.
   const takerDelay = (vf && vf.taker_delay_ms != null) ? vf.taker_delay_ms : null;
-  // The MEASURED accepted-POST view (payload venue_floor.taker_delay_measured_ms)
-  // now renders ONLY in the accept/reject cohort panel — the stage table's
-  // standalone taker-delay ↳ row was deleted 2026-08-06 (operator) and the
-  // residual row carries the "taker delay" label instead.
+  // The measured accepted-POST view (`venue_floor.taker_delay_measured_ms`) is shown in the
+  // accept/reject panel; the stage table's residual row carries the "taker delay" label.
   const floorLo = vf ? vf.expected_decision_to_fill_ms_lo : null;
   const floorHi = vf ? vf.expected_decision_to_fill_ms_hi : null;
-  // The tile's SUB (the "uncancellable taker delay · inside the POST" line and
-  // its predict.fun twin) was deleted 2026-08-05 — the whole description rides
-  // the tooltip, null-branch and all, so no console ever renders "nullms".
+  // The tile's description is in its tooltip, null case included.
   const floorTitle = takerDelay != null
     ? `${venueName} reports a mandatory ${takerDelay}ms uncancellable taker delay inside the marketable-order POST round trip. No language, region or rewrite beats it.`
     : `No uncancellable taker delay is reported for this ${venueName} payload; the venue-floor telemetry is incomplete.`;
@@ -413,9 +366,6 @@ function LatencyPage({ live }) {
           title="staleness, not wall clock — the axis that actually drives no_liquidity rejects. Covers the ws-served slice only; prefetch age is unmeasured." />
       </div>
 
-      {/* the "where the tick goes" panel sat here until 2026-08-05 — see the
-          note above CohortPanel for why it was deleted and what carries its
-          figures now */}
 
       {orders && (
         <React.Fragment>
@@ -431,9 +381,7 @@ function LatencyPage({ live }) {
         </React.Fragment>
       )}
 
-      {/* the "p50 / p95 / max · Nm window" sub was deleted 2026-08-05
-          (operator): the column headers name the percentiles, and the window
-          lives in the panel tooltip. */}
+      {/* The column headers name the percentiles; the window is in the panel tooltip. */}
       <Panel title="per-stage latency · tick level"
         titleHint={`p50 / p95 / max over a ${windowMin}m window. `
           + "Rows without a ↳ are disjoint phases of one tick and ADD UP — with the 'taker delay' row — to the total row, exactly, in every column. The ↳ rows (sign, post) are measured INSIDE `order` and are shown for detail only, never summed. "
@@ -448,8 +396,7 @@ function LatencyPage({ live }) {
 
       <Panel title="recent network-active ticks"
         titleHint={`decision = tick start → POST, newest tick first. Rows over the ${SOFT_DEADLINE_MS}ms soft deadline are tinted.`}
-        /* the "N ticks · newest first" sub was deleted 2026-08-05 (operator):
-           the table is the count, and the ordering rides the tooltip. */
+        /* The table is the count; the ordering is in the tooltip. */
         flush>
         <RecentTicksTable recent={recent} />
       </Panel>

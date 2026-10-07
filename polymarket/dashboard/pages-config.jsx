@@ -1,8 +1,5 @@
 // ===========================================================================
-// pages-config.jsx - OperatorPage (console). (StrategyPage deleted 2026-07-09
-// with the exp044 retirement; the v2 tab owns spec+sizing display. The
-// deployed-execution-flags + predict.fun funder-wallet/recorder panels were
-// REMOVED by operator request 2026-07-23.) Reads the live SSE payload.
+// pages-config.jsx — OperatorPage (console). Reads the live SSE payload.
 // ===========================================================================
 (function () {
 const { fmt } = window.CB;
@@ -22,11 +19,8 @@ function statusDot(status) {
 }
 function OperatorConsolePage({ live }) {
   const op = live.operator || { state: 'STOPPED_PROCESSING', readiness: {} };
-  // The read-only `is_snapshot` guard that used to live here went away with
-  // the cross-venue view (2026-08-01): this console can only ever render THIS
-  // process's own live payload, so the operator POSTs always target the bot
-  // whose state is on screen. There is no longer any way to view one venue's
-  // state while the controls drive another's.
+  // This console only ever shows its own process's payload, so operator POSTs always target the bot
+  // whose state is on screen.
   const walletTitle = 'POLY_FUNDER wallet record';
   const collateral = 'pUSD';
   const lw = live.live_wallet || {};
@@ -142,10 +136,9 @@ function CapitalFlowsPanel({ flows, initial, startAt }) {
     note: 'starting balance',
     is_start: true,
   }] : [];
-  // Rebates live on the Overview P&L strip (operator 2026-08-05) — this panel
-  // shows only the money the operator moved. The net row therefore sums the
-  // DISPLAYED rows (excl. the opening balance), not kpis.net_deposits, which
-  // includes rebates.
+  // Rebates are shown on the Overview P&L strip; this panel shows only money the operator moved.
+  // The net row therefore sums the displayed rows (excluding the opening balance), not
+  // kpis.net_deposits, which includes rebates.
   const shown = (flows || []).filter((f) => f.kind !== 'rebate');
   const rows = [...opening, ...shown];
   const shownNet = shown.reduce((s, f) => s + (Number(f.amount_usd) || 0), 0);
