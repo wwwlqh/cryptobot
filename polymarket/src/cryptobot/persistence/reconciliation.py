@@ -99,11 +99,8 @@ def reconcile_open_orders(
             intent_price=_coerce_float(intent_price),
         )
 
-        if status in {"CANCELLED", "CANCELED", "EXPIRED", "INVALIDATED"} and (fill_size or 0) <= 0:
-            # D-LIVE-17: unfilled-and-cancelled → outcome=CANCELLED, pnl_net=0.
-            # INVALIDATED is a predict.fun terminal status (clob.py order-state
-            # enum) — an unfilled INVALIDATED order must auto-cancel here, not
-            # strand LIVE-PENDING until the stale-attempt CRITICAL escalation.
+        if status in {"CANCELLED", "CANCELED", "EXPIRED"} and (fill_size or 0) <= 0:
+            # Unfilled and cancelled: outcome=CANCELLED, pnl_net=0.
             conn.execute(
                 """
                 UPDATE ledger
@@ -612,21 +609,6 @@ def _make_default_order_fetcher(
     OrderClient's CLOB get_order/get_order_status method."""
 
     def _fetch(order_id: str) -> Optional[dict[str, Any]]:
-        # Venue-agnostic hook FIRST (predict.fun client, 2026-07-23): an
-        # order client that knows how to map its own REST order state onto
-        # the payload shape exposes fetch_order_payload; the Polymarket
-        # client has no such method and falls through to the CLOB attrs.
-        direct = getattr(order_client, "fetch_order_payload", None)
-        if callable(direct):
-            try:
-                return direct(order_id)
-            except Exception:  # noqa: BLE001
-                logger.debug(
-                    "reconcile_open_orders: fetch_order_payload failed for %s",
-                    order_id,
-                    exc_info=True,
-                )
-                return None
         client = getattr(order_client, "_client", None)
         if client is None:
             return None

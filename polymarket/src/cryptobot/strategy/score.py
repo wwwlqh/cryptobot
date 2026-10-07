@@ -63,40 +63,14 @@ def _fee_adjusted_edge(
     model_p: float,
     ask: float,
     *,
-    venue: Optional[str] = None,
     fee_rate_bps: Optional[float] = None,
 ) -> float:
-    """Model edge net of the ACTIVE VENUE's taker fee: ``p - ask - fee(ask)``.
+    """Model edge net of the taker fee: ``p - ask - theta * ask * (1 - ask)``.
 
-    VENUE-DISPATCHED (2026-08-01). Before the predict.fun Tokyo cutover this
-    charged the Polymarket PARABOLA on every venue, so the predict.fun entry
-    gate priced a fee its venue does not levy — over-charging the favourites it
-    actually bets (ask 0.75, 200 bps: real tent 0.005/share vs parabola
-    0.0135/share) and rejecting entries that clear the threshold. The 07-29
-    guardrail is that FEES ARE PER-VENUE; the walker already obeyed it
-    (``walk_fee_fn``), the gate did not.
-
-    * ``polymarket`` -> ``theta * ask * (1 - ask)`` with
-      ``theta = config.POLY_FEE_THETA``. Byte-identical to the pre-dispatch
-      formula (same float-op order, same theta), which is what keeps the
-      research parity chain (``sweep_lib.edge`` / ``strategy.parity.edge``)
-      green — see ``tests/test_audit_parity.py``.
-    * ``predictfun`` -> ``(fee_rate_bps / 10000) * min(ask, 1 - ask)``, with the
-      market's real per-market ``feeRateBps`` threaded from the decision context
-      (``CellDecision.fee_rate_bps``) and ``config.PREDICTFUN_DEFAULT_FEE_RATE_BPS``
-      as the fallback on the cheap pre-score, where no market is resolved yet.
-
-    ``venue`` defaults to ``config.VENUE`` (the process's pinned venue) and is
-    an explicit argument only so tests can exercise both shapes in one process.
-    Fail-closed on an unknown venue: ``fee_per_share`` raises rather than
-    guessing a shape on the real-money decision path.
+    Same float-op order as ``backtest.engine.sweep_lib.edge`` and
+    ``strategy.parity.edge``; ``tests/test_audit_parity.py`` pins the three.
     """
-    return model_p - ask - fee_per_share(
-        ask,
-        venue=venue or config.VENUE,
-        fee_rate_bps=fee_rate_bps,
-        theta=config.POLY_FEE_THETA,
-    )
+    return model_p - ask - fee_per_share(ask, theta=config.POLY_FEE_THETA)
 
 
 def score_side_hgb(

@@ -216,11 +216,11 @@ def test_live_row_571_shape_settles_from_fill_price(db: sqlite3.Connection):
     # Realized stake = 0.33 shares * 0.76 = $0.2508. A YES win pays ~ (1/0.76)
     # per share, so pnl is on the order of the $0.25 stake — NOT the $1.097
     # intended bet_size. Graded under the 2026-07-23 calibrated fee convention
-    # (venue-dispatched entry-leg fee; formula pinned in test_grade_fees).
+    # (entry-leg fee; formula pinned in test_grade_fees).
     from cryptobot.execution.grade_fees import graded_cash_pnl
 
     assert row["pnl_net"] == pytest.approx(
-        graded_cash_pnl("YES", 0.76, 1, 0.33 * 0.76, venue="polymarket"),
+        graded_cash_pnl("YES", 0.76, 1, 0.33 * 0.76),
         rel=1e-9,
     )
 
@@ -790,7 +790,7 @@ class TestWalkedVwapPnl:
         from cryptobot.execution.grade_fees import graded_cash_pnl
 
         assert row["pnl_net"] == pytest.approx(
-            graded_cash_pnl("YES", 0.60, 1, 10.0, venue="polymarket"), rel=1e-9
+            graded_cash_pnl("YES", 0.60, 1, 10.0), rel=1e-9
         )
 
     def test_pnl_falls_back_to_fill_price_when_walked_vwap_null(
@@ -816,7 +816,7 @@ class TestWalkedVwapPnl:
         from cryptobot.execution.grade_fees import graded_cash_pnl
 
         assert row["pnl_net"] == pytest.approx(
-            graded_cash_pnl("YES", 0.55, 1, 10.0, venue="polymarket"), rel=1e-9
+            graded_cash_pnl("YES", 0.55, 1, 10.0), rel=1e-9
         )
 
     def test_loss_path_uses_walked_vwap(self, db: sqlite3.Connection):
@@ -876,12 +876,11 @@ class TestWalkedVwapPnl:
 
 
 # ---------------------------------------------------------------------------
-# Calibrated fee grading (2026-07-23): row-venue dispatch + forward-only
+# Calibrated fee grading is forward-only
 # ---------------------------------------------------------------------------
 class TestCalibratedFeeGrading:
-    """The sweep dispatches the grade fee on the ROW's venue column — never
-    config.VENUE — and never rewrites an already-graded row. Formula pins live
-    in test_grade_fees; these tests pin the sweep's wiring of them."""
+    """The sweep never rewrites an already-graded row. Formula pins live in
+    test_grade_fees."""
 
     def _resolved(self, won_up: int):
         return lambda c, i, s: PolymarketResolution(
@@ -889,62 +888,6 @@ class TestCalibratedFeeGrading:
             window_start_ts=s, window_end_ts=s + i * 60, condition_id="C",
             won_up=won_up, up_price=1.0 if won_up else 0.0,
             down_price=0.0 if won_up else 1.0,
-        )
-
-    def _record_predictfun_row(self, db, monkeypatch, **kw) -> int:
-        from cryptobot import config
-
-        monkeypatch.setattr(config, "VENUE", "predictfun")
-        rid = record_bet(db, make_signal(**kw))
-        # Sweep runs under the polymarket config default — the ROW's venue
-        # column must drive the fee (mixed-history DB correctness).
-        monkeypatch.setattr(config, "VENUE", "polymarket")
-        # make_signal stamps fee_rate_bps=100; pin the live-market 200 bps to
-        # prove the per-row passthrough (not a constant) reaches the grade.
-        db.execute("UPDATE ledger SET fee_rate_bps=200.0 WHERE id=?", (rid,))
-        return rid
-
-    def test_predictfun_win_books_tent_off_row_venue(self, db, monkeypatch):
-        rid = self._record_predictfun_row(
-            db, monkeypatch, bet_size=10.0, fill_price=0.69, walked_vwap=0.69,
-            side="YES",
-        )
-        _expire(db, window_end_ts=2_000_000_000)
-        counters = run_resolution_sweep(
-            db, now_ts=2_000_000_100,
-            polymarket_resolution_fetch=self._resolved(1),
-        )
-        assert counters["settled"] == 1
-        row = db.execute(
-            "SELECT outcome, venue, pnl_net FROM ledger WHERE id=?", (rid,)
-        ).fetchone()
-        assert row["outcome"] == "WIN"
-        assert row["venue"] == "predictfun"
-        # S = 10/0.69 shares; WIN = S*(1-p) - (200/1e4)*min(p,1-p)*S — the
-        # TENT, not the Polymarket parabola the old grade booked.
-        shares = 10.0 / 0.69
-        expected = (1.0 - 0.69) * shares - 0.02 * 0.31 * shares
-        assert row["pnl_net"] == pytest.approx(expected, rel=1e-9)
-        wrong_venue = (1.0 - 0.69) * shares - 0.07 * 0.69 * 0.31 * shares
-        assert row["pnl_net"] != pytest.approx(wrong_venue)
-
-    def test_predictfun_loss_books_stake_plus_tent_fee(self, db, monkeypatch):
-        rid = self._record_predictfun_row(
-            db, monkeypatch, bet_size=10.0, fill_price=0.40, walked_vwap=0.40,
-            side="YES",
-        )
-        _expire(db, window_end_ts=2_000_000_000)
-        run_resolution_sweep(
-            db, now_ts=2_000_000_100,
-            polymarket_resolution_fetch=self._resolved(0),
-        )
-        row = db.execute(
-            "SELECT outcome, pnl_net FROM ledger WHERE id=?", (rid,)
-        ).fetchone()
-        assert row["outcome"] == "LOSS"
-        # -stake - tent: min(0.40, 0.60) = 0.40, 25 shares.
-        assert row["pnl_net"] == pytest.approx(
-            -10.0 - 0.02 * 0.40 * (10.0 / 0.40), rel=1e-9
         )
 
     def test_sweep_never_rewrites_a_graded_row(self, db, monkeypatch):

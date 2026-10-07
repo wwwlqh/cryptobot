@@ -1,22 +1,8 @@
-# Shell scripts MUST be LF-terminated — they run on EC2's bash, which
-# treats CRLF as a parse error ($'\r': command not found). Locking these
-# stops Windows + OneDrive + git autocrlf from silently flipping endings
-# and breaking the next deploy.
+# Files that run on the Linux server must keep LF line endings:
+# bash, logrotate and systemd all reject CRLF.
 *.sh text eol=lf
-
-# logrotate configs also run on EC2 — logrotate treats a CRLF line as a parse
-# error ("lines must begin with a keyword or a filename") and SILENTLY SKIPS the
-# whole file, so scanner.err never rotates and the log volume fills. Lock to LF.
 *.logrotate text eol=lf
-
-# systemd units are installed on EC2 (via install_remote.sh). Keep them LF so
-# Windows + OneDrive + git autocrlf can't flip endings under the running host.
 *.service text eol=lf
 *.timer text eol=lf
-
-# Env example files SEED /etc/cryptobot.env on a box's first install
-# (install_remote.sh copies the working-tree file verbatim). A CRLF checkout
-# shipped a CRLF env file to the fresh Tokyo box on 2026-08-01 — every value
-# grew a trailing \r. Lock to LF like everything else the boxes consume.
 *.env.example text eol=lf
 .env.example text eol=lf

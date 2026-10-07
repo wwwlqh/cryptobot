@@ -136,8 +136,6 @@ def run_settlement_backfill(
             fill,
             won_up,
             bet_size,
-            venue=row["venue"],
-            fee_rate_bps=row["fee_rate_bps"],
             slippage_haircut=0.0,
         )
         outcome = "WIN" if pnl_net > 0 else "LOSS"

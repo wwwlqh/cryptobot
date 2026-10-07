@@ -69,7 +69,7 @@ from cryptobot.scheduler.miss_forensics import (
     VERDICT_REPRICED_ONLY,
     VERDICT_UNRESOLVED,
 )
-from cryptobot.venues.fees import fee_per_share, row_fee_per_share
+from cryptobot.venues.fees import fee_per_share
 from cryptobot.strategy.portfolio_loader import V6Portfolio
 from cryptobot.strategy.spec_v2 import V2_SPEC
 
@@ -142,18 +142,6 @@ def _row_venue(r: Any) -> str:
     return str(v) if v else "polymarket"
 
 
-def _row_fee_rate_bps(r: Any) -> Optional[float]:
-    """Per-market ``feeRateBps`` when the row's SELECT carried it (predict.fun
-    tent input); None — the venue default — otherwise. The ledger schema has
-    no fee_rate_bps column today, so this exists to keep the fee seam honest
-    the day one is added, mirroring ``_row_venue``'s absent-in-SELECT shape."""
-    try:
-        v = r["fee_rate_bps"]
-    except (IndexError, KeyError, TypeError):
-        return None
-    return _float_or_none(v)
-
-
 def _json_safe(value: Any) -> Any:
     """Return a JSON-strict payload: no NaN/Infinity for browser JSON.parse."""
     if isinstance(value, float):
@@ -186,49 +174,13 @@ def _markets_block() -> list[dict]:
 # registered spec defaults so the numbers are correct even before the pins land.
 # ---------------------------------------------------------------------------
 def _fee_spec_text() -> str:
-    """One-line taker-fee contract for the DEPLOYED venue (display only).
-
-    The Strategy tab used to render a bare ``POLY_FEE_θ`` row from
-    ``POLY_FEE_THETA`` on every venue. On the predict.fun console that named a
-    constant predict.fun does not charge and hid the fee it DOES charge — the
-    200 bps TENT the entry gate and the walker actually price against
-    (``cryptobot_predictfun.fees``, and ``strategy.score._fee_adjusted_edge``
-    since the 2026-08-01 venue dispatch).
-
-    ``poly_fee_theta`` stays in the payload beside this (the parity chain pins
-    it and the reject-panel estimator still reads it), but the OPERATOR-facing
-    row renders this string.
-    """
-    venue = getattr(config, "VENUE", "polymarket")
-    if venue == "predictfun":
-        bps = float(getattr(config, "PREDICTFUN_DEFAULT_FEE_RATE_BPS", 200.0))
-        return (
-            f"TENT · {bps:g} bps default "
-            "· (fee_rate_bps / 10000) x min(ask, 1 - ask) "
-            "· per-market feeRateBps when the payload carries it"
-        )
+    """One-line taker-fee description for the Strategy tab."""
     theta = float(getattr(config, "POLY_FEE_THETA", 0.07))
     return f"PARABOLA · POLY_FEE_theta {theta:g} · theta x ask x (1 - ask)"
 
 
 def _fee_calibration() -> Optional[float]:
-    """Grade-time calibration multiplier on the booked taker fee (display).
-
-    ``config.POLY_FEE_CALIBRATION`` (0.864): booked fees are 0.864x the published
-    parabola, derived from the 2026-07-23 flat-to-flat wallet-tape audit ($1.73
-    realized vs $2.18 modeled at raw theta). It is applied ONLY in
-    execution.grade_fees, where realized pnl_net is booked — DECISION math
-    (edge gates, walkers, parity) keeps the raw published theta, so bet
-    selection is unchanged. Surfaced on the Strategy tab because the operator
-    reasonably asks why theta reads 0.07 while realized friction implies less:
-    the answer is this multiplier, and it belongs on the page rather than in a
-    config file.
-
-    None on predict.fun — its 2% tent share-fee is venue-measured exact and
-    POLY_FEE_CALIBRATION never touches it (venues/fees.py).
-    """
-    if getattr(config, "VENUE", "polymarket") == "predictfun":
-        return None
+    """Grade-time multiplier on the booked taker fee (see execution.grade_fees)."""
     return float(getattr(config, "POLY_FEE_CALIBRATION", 0.864))
 
 
@@ -679,8 +631,6 @@ def _stop_if_held_pnl(
     live_filled_price: Any,
     bet_size: Any,
     fill_price: Any,
-    venue: str = "polymarket",
-    fee_rate_bps: Optional[float] = None,
 ) -> Optional[float]:
     """Counterfactual PnL a stop-closed position WOULD have realized had it been
     held to binary settlement instead of stopped out early.
@@ -728,29 +678,9 @@ def _stop_if_held_pnl(
     entry_px = (cost / shares) if shares > 0 else None
     winner_fee = 0.0
     if entry_px is not None:
-        try:
-            winner_fee = fee_per_share(
-                entry_px,
-                venue=venue,
-                fee_rate_bps=fee_rate_bps,
-                theta=float(getattr(config, "POLY_FEE_THETA", 0.07)),
-            ) * shares
-        except (ValueError, NotImplementedError, ImportError):
-            # Unknown venue string on a garbage/legacy row — fee shape
-            # unknowable, so the counterfactual is too (display-only null).
-            # NotImplementedError joined ValueError in Phase 2: a REGISTERED
-            # venue with no fee shape yet (kalshi) now raises that instead of
-            # falling off the end of an if/elif, and this display path must
-            # keep returning None for it exactly as before.
-            # ImportError (which is ModuleNotFoundError's base class, so this
-            # one name covers both) is the DEPLOYED-TREE case: get_adapter
-            # resolves the registry string with importlib, and deploy.sh
-            # deliberately does NOT stage cryptobot_kalshi (deploy.sh:270-273).
-            # So on the box a kalshi-tagged row raises ModuleNotFoundError
-            # here, not NotImplementedError — the local tree, where every venue
-            # package is importable, cannot reproduce it. A display-only
-            # counterfactual must never take the dashboard down; render null.
-            return None
+        winner_fee = fee_per_share(
+            entry_px, theta=float(getattr(config, "POLY_FEE_THETA", 0.07))
+        ) * shares
     return shares - cost - winner_fee
 
 
@@ -780,8 +710,6 @@ def _stop_display_fields(
                 live_filled_price=live_filled_price,
                 bet_size=r["bet_size"],
                 fill_price=r["fill_price"],
-                venue=_row_venue(r),
-                fee_rate_bps=_row_fee_rate_bps(r),
             ))
             if r["exit_kind"] == "stop_loss" else None
         ),
@@ -3131,11 +3059,6 @@ _LATENCY_VENUE_FLOOR_BY_VENUE = {
         "expected_decision_to_fill_ms_lo": 300,
         "expected_decision_to_fill_ms_hi": 320,
     },
-    "predictfun": {
-        "taker_delay_ms": None,  # no documented uncancellable taker delay
-        "expected_decision_to_fill_ms_lo": 700,
-        "expected_decision_to_fill_ms_hi": 900,
-    },
 }
 
 
@@ -4370,12 +4293,7 @@ def _v2_block(
                 model_p = r["model_p"]
                 pred_edge = None
                 if ask is not None and model_p is not None:
-                    fee = row_fee_per_share(
-                        float(ask),
-                        venue=_row_venue(r),
-                        fee_rate_bps=_row_fee_rate_bps(r),
-                        theta=theta,
-                    )
+                    fee = fee_per_share(float(ask), theta=theta)
                     pred_edge = model_p - ask - fee
                 ghost = str(r["outcome"] or "").upper() == "GHOST_FILL"
                 # M1 partial fills (2026-07-21): filled_usd is the REALIZED
@@ -4478,52 +4396,6 @@ def _v2_block(
         # verdict) — the operator's "1 missing trade only".
         "missed_trades": aux.get("missed_trades", []),
         "reject_stats": aux.get("reject_stats"),
-    }
-
-
-def _predictfun_wallet_block(
-    live_balance_get: Optional[Callable[[], Optional[float]]] = None,
-) -> Optional[dict]:
-    """predict.fun wallet card for the dashboard (deliverable 6).
-
-    Emitted ONLY when ``config.VENUE == 'predictfun'``. The dashboard codes
-    against this EXACT shape::
-
-        {"address": str|null, "chain": "bnb", "api_key_present": bool,
-         "collateral": {"symbol": str, "balance": number}|null}
-
-    ``balance`` comes from the SAME cached balance live sizing reads
-    (``live_balance_get`` = the BalanceCache the 60s readiness job refreshes;
-    on predict.fun that IS the collateral balance) — zero network on the SSE
-    path. ``collateral`` is None when the wallet is not configured / not
-    reachable (fail-closed, never a fabricated balance).
-    """
-    if getattr(config, "VENUE", "polymarket") != "predictfun":
-        return None
-    address: Optional[str] = None
-    key = str(getattr(config, "PREDICTFUN_PRIVATE_KEY", "") or "").strip()
-    if key:
-        try:
-            from cryptobot_predictfun.wallet import derive_signer_address
-
-            address = derive_signer_address(key)
-        except Exception:  # noqa: BLE001 — a derive failure degrades to null
-            address = None
-    api_key_present = bool(str(getattr(config, "PREDICTFUN_API_KEY", "") or "").strip())
-    balance: Optional[float] = None
-    if live_balance_get is not None:
-        try:
-            balance = live_balance_get()
-        except Exception:  # noqa: BLE001 — a bad fetch degrades to None
-            balance = None
-    collateral: Optional[dict[str, Any]] = None
-    if balance is not None:
-        collateral = {"symbol": "USDT", "balance": _round_money(balance)}
-    return {
-        "address": address,
-        "chain": "bnb",
-        "api_key_present": api_key_present,
-        "collateral": collateral,
     }
 
 
@@ -4664,9 +4536,4 @@ def build_payload(
         # DD-brake, fill-rate breaker, recent per-bet rows.
         "v2": _v2_block(conn, portfolio, kpis, book_mark_get=book_mark_get),
     }
-    # predict.fun wallet card — emitted only on the predictfun venue (deliverable
-    # 6). Dashboard snapshot contract; balance from the cached BalanceCache read.
-    _pf_wallet = _predictfun_wallet_block(live_balance_get)
-    if _pf_wallet is not None:
-        payload["predictfun_wallet"] = _pf_wallet
     return _json_safe(payload), max_id

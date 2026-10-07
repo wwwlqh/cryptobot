@@ -40,7 +40,7 @@ def test_entry_fee_matches_live_grade_fees(price, shares):
     from cryptobot.execution.grade_fees import entry_fee_usd as live_entry_fee
 
     assert te.entry_fee_usd(price, shares) == pytest.approx(
-        live_entry_fee(venue="polymarket", entry_price=price, shares=shares),
+        live_entry_fee(entry_price=price, shares=shares),
         rel=0.0,
         abs=0.0,
     )

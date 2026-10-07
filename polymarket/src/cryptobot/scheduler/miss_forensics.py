@@ -169,23 +169,6 @@ class ChainPrint:
     taker: Optional[str] = None
 
 
-def miss_forensics_armed(*, enabled: bool, venue: Any) -> bool:
-    """Should the job be registered at all? (main.py's gate, made testable.)
-
-    Two independent conditions, both hard:
-
-    * the kill switch ``CRYPTOBOT_MISS_FORENSICS_ENABLED`` is on, and
-    * the venue is Polymarket. The evidence here is *Polygon's* trade tape read
-      through Polymarket's data-api/CLOB. The predict.fun paper unit shares this
-      whole core, and arming there would look up predict.fun token ids on
-      Polymarket endpoints — every lookup misses, so every row would be filed
-      MAKER_CANCEL, i.e. a table of confident falsehoods rather than an empty
-      one. Gated on the VENUE rather than the adapter registry because the
-      METHOD is venue-specific, not just an endpoint.
-    """
-    return bool(enabled) and str(venue or "").strip().lower() == "polymarket"
-
-
 def normalize_print(
     asset: Any, side: Any, price: Any, *, token_id: str, complement_id: Optional[str]
 ) -> Optional[tuple[float, str]]:

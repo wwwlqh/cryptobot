@@ -1,27 +1,13 @@
-"""``cryptobot_polymarket`` — the Polymarket venue adapter package.
+"""``cryptobot_polymarket``: the Polymarket adapter.
 
-Extracted out of ``cryptobot.*`` in Phase 2 of the venue-tree restructure. The
-modules themselves are unchanged code at new addresses:
+Modules: ``gamma`` (market discovery and settlement), ``clob`` (order books),
+``ws_mirror`` (WebSocket book mirror), ``twap_mirror`` (Chainlink TWAP),
+``walker`` (order placement), ``balance``/``transfer``/``relayer``/
+``primitives`` (wallet and on-chain helpers).
 
-===============================================  ==========================
-old (inside core ``cryptobot``)                  new (here)
-===============================================  ==========================
-``data/polymarket_clob.py``                      ``clob.py``
-``data/polymarket_gamma.py``                     ``gamma.py``
-``data/clob_ws_mirror.py``                       ``ws_mirror.py``
-``polymarket/primitives.py``                     ``primitives.py``
-``execution/walker.py``                          ``walker.py``
-``execution/polymarket_relayer.py``              ``relayer.py``
-``execution/polymarket_transfer.py``             ``transfer.py``
-``cli/derive_poly_creds.py``                     ``derive_creds.py``
-``cli/poly_wallet_diagnostics.py``               ``wallet_diagnostics.py``
-``reconciliation/backfill_polymarket_settlement.py`` ``backfill_settlement.py``
-===============================================  ==========================
-
-This module is deliberately IMPORT-LIGHT: it defines ``ADAPTER`` and nothing
-else at module scope. Every adapter method imports its implementation lazily, so
-merely resolving the registry (e.g. to price a historic ledger row's fee) never
-drags in httpx clients, the CLOB SDK or a websocket thread.
+Only ``ADAPTER`` is defined at import time. Each method imports its
+implementation lazily, so resolving the adapter never starts HTTP clients,
+the CLOB SDK or a WebSocket thread.
 """
 
 from __future__ import annotations
@@ -38,7 +24,7 @@ class PolymarketAdapter:
 
     name = "polymarket"
 
-    # -- market discovery + order books -------------------------------------
+    # -- market discovery and order books -----------------------------------
 
     def fetch_active_market(self, *args, **kwargs):
         from cryptobot_polymarket.gamma import fetch_active_market
@@ -67,20 +53,10 @@ class PolymarketAdapter:
 
         return market_cache_has(coin, interval_min, window_start_ts)
 
-    def book_fetch_kwargs(self) -> dict:
-        # Polymarket's fetchers take neither `bucket` nor `read_timeout`;
-        # binding either would be a TypeError. Empty dict == the pre-Phase-2
-        # `else` branch in main._build_deps_factory.
-        return {}
-
-    def prefetch_fetch_kwargs(self) -> dict:
-        return {}
-
     # -- execution ----------------------------------------------------------
 
     def build_order_client(self, *, runtime_cfg) -> Optional[object]:
-        """OrderClient, or None for DRY-only. Log lines are byte-identical to
-        the pre-split ``main.py`` branch."""
+        """OrderClient, or None to run DRY-only (no key or SDK missing)."""
         import logging
 
         from cryptobot_polymarket.walker import ClobClientUnavailable, OrderClient
@@ -116,14 +92,7 @@ class PolymarketAdapter:
         return build_pusd_balance_fetcher(config)
 
     def derive_wallet_topology(self, config):
-        """Derive signer/deposit wallets from ``POLY_PRIVATE_KEY``.
-
-        Reached from core's live-readiness gate, which runs this
-        Polymarket-shaped check on EVERY venue — that is pre-Phase-2 behavior,
-        preserved deliberately (core asks the registry for *this* adapter by
-        name rather than for the active venue's). Whether the gate should be
-        venue-dispatched is an operator decision, not a mechanical move.
-        """
+        """Derive signer and deposit wallets from ``POLY_PRIVATE_KEY``."""
         from cryptobot_polymarket.primitives import derive_wallets
 
         def _secret_value(value: object) -> str:
@@ -144,11 +113,9 @@ class PolymarketAdapter:
     # -- websocket book mirror ----------------------------------------------
 
     def build_ws_mirror(self, *, order_client) -> WsMirrorSetup:
-        """Construct + start the Polymarket CLOB book mirror.
+        """Construct and start the CLOB book mirror.
 
-        NOTE the asymmetry with predict.fun, preserved from the pre-split
-        ``main.py``: Polymarket's construction is NOT exception-guarded, so a
-        raise here still propagates and stops the boot exactly as before.
+        Construction is not exception-guarded: a failure here stops the boot.
         """
         from cryptobot import config
         from cryptobot.venues.shadow_book import ShadowBookComparator
@@ -157,41 +124,18 @@ class PolymarketAdapter:
         ws_mirror = ClobBookWsMirror(
             max_age_ms=config.BOOK_WS_MAX_AGE_MS,
             url=config.BOOK_WS_URL,
-            # 2026-07-25 orphan fix: evict a token's ladder the moment it
-            # leaves the subscribed set, so a rolled-off window can't price a
-            # live FAK. max_book_age_ms is the (default-off) safety net.
+            # Drop a token's ladder as soon as it leaves the subscribed set, so
+            # a finished window can never price a live order.
             evict_unsubscribed=config.BOOK_WS_EVICT_UNSUBSCRIBED,
             max_book_age_ms=config.BOOK_WS_MAX_BOOK_AGE_MS,
         )
         if config.BOOK_WS_SHADOW:
-            # W3: run the mirror ALONGSIDE REST (never authoritative) so the
-            # operator can watch WS/REST divergence for a day before flipping
-            # the mirror into the book source chain.
+            # Run alongside REST for comparison; REST stays authoritative.
             shadow = ShadowBookComparator(ws_mirror)
             shadow.start()
             return WsMirrorSetup(shadow=shadow)
         ws_mirror.start()
         return WsMirrorSetup(mirror=ws_mirror)
-
-    # -- fees ---------------------------------------------------------------
-
-    def fee_per_share(
-        self,
-        ask: float,
-        *,
-        fee_rate_bps: Optional[float] = None,
-        theta: Optional[float] = None,
-    ) -> float:
-        from cryptobot_polymarket.fees import poly_fee_per_share
-
-        if theta is None:
-            raise ValueError("polymarket fee_per_share requires theta")
-        return poly_fee_per_share(ask, theta)
-
-    def walk_fee_fn(self, *, fee_rate_bps: Optional[float] = None):
-        # None == "use walk_book's built-in parabola with the supplied
-        # fee_theta", i.e. the walker's arithmetic is untouched on this venue.
-        return None
 
 
 ADAPTER = PolymarketAdapter()

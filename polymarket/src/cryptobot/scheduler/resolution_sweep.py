@@ -86,31 +86,14 @@ def _graded_cash_pnl(
     fill_price: float,
     won_up: bool,
     stake_usd: float,
-    *,
-    venue: str | None,
-    fee_rate_bps: float | None,
 ) -> float:
-    """Settlement dollar P&L — calibrated entry-leg fee, ROW-venue dispatched.
+    """Settlement dollar P&L with the calibrated entry-leg fee on WIN and LOSS.
 
-    2026-07-23 calibrated fee grading: the venue charges its taker fee on
-    every fill, so WIN and LOSS both book the entry-leg fee — polymarket rows
-    pay ``POLY_FEE_CALIBRATION * theta * p * (1-p)`` per share (flat-to-flat
-    audit: k*theta = 0.06048 measured, re-based to k=0.864 at theta=0.07),
-    predictfun
-    rows pay the exact tent off the row's own ``fee_rate_bps``. Formula and
-    measured derivations live in ``cryptobot.execution.grade_fees``.
+    See ``cryptobot.execution.grade_fees`` for the fee derivation.
     """
     from cryptobot.execution.grade_fees import graded_cash_pnl
 
-    return graded_cash_pnl(
-        side,
-        fill_price,
-        won_up,
-        stake_usd,
-        venue=venue,
-        fee_rate_bps=fee_rate_bps,
-        slippage_haircut=0.0,
-    )
+    return graded_cash_pnl(side, fill_price, won_up, stake_usd, slippage_haircut=0.0)
 
 
 def _implied_live_fill_price(
@@ -566,17 +549,8 @@ def run_resolution_sweep(
         # through effective_fill so a losing $10 bet loses $10 plus its
         # entry-leg fee, not fill_price * $10. The ledger fill/VWAP is
         # already the actual price paid, so do not apply the strategy
-        # slippage_haircut again here. The fee is dispatched on the ROW's
-        # venue + fee_rate_bps (2026-07-23 calibrated fee grading) so DRY /
-        # paper rows grade byte-identically to LIVE ones on the same venue.
-        pnl_net = _graded_cash_pnl(
-            side,
-            effective_fill,
-            won_up,
-            bet_size,
-            venue=row["venue"],
-            fee_rate_bps=row["fee_rate_bps"],
-        )
+        # slippage_haircut again here.
+        pnl_net = _graded_cash_pnl(side, effective_fill, won_up, bet_size)
         outcome = "WIN" if pnl_net > 0 else "LOSS"
 
         conn.execute(

@@ -101,7 +101,6 @@ def walk_book_edge_preserving(
     max_walk_price: float | None = None,
     walk_anchor_price: float | None = None,
     return_levels: bool = False,
-    fee_fn: Optional[Callable[[float], float]] = None,
 ) -> Optional[WalkResult]:
     """Walk asks up to ``target_usd`` while preserving ``min_edge``.
 
@@ -148,16 +147,8 @@ def walk_book_edge_preserving(
     ):
         return None
 
-    # Venue fee dispatch. Default (fee_fn None) is byte-identical to the historic
-    # Polymarket PARABOLA `fee_theta * p * (1 - p)`. A venue seam
-    # (cryptobot.venues.fees.walk_fee_fn) may pass a TENT fee_fn for the
-    # predict.fun venue ONLY; `fee_theta` stays required (and finite-checked
-    # above) for call-site compatibility even when a fee_fn overrides its use.
-    if fee_fn is None:
-        def _fee(p: float) -> float:
-            return fee_theta * p * (1.0 - p)
-    else:
-        _fee = fee_fn
+    def _fee(p: float) -> float:
+        return fee_theta * p * (1.0 - p)
 
     asks = _sorted_asks(book)
     if not asks:

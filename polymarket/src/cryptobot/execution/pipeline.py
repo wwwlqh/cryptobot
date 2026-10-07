@@ -38,6 +38,7 @@ from typing import TYPE_CHECKING, Any, Callable, Optional
 from zoneinfo import ZoneInfo
 
 from cryptobot import config
+from cryptobot.venues.fees import fee_per_share
 from cryptobot.venues.types import BookSnapshot
 from cryptobot.execution.capital import (
     GroupCapState,
@@ -105,50 +106,10 @@ logger = logging.getLogger(__name__)
 _ET = ZoneInfo("America/New_York")
 
 
-def _venue_walk_fee_fn(fee_rate_bps: Optional[float] = None):
-    """Venue fee function for ``walk_book_edge_preserving``.
-
-    Returns ``None`` on the Polymarket venue (the walker's built-in PARABOLA runs
-    — byte-identical to today), or a TENT closure on the predict.fun venue. Only
-    ever consulted behind ``config.VENUE``; the per-market ``feeRateBps`` is
-    threaded from the resolved market (``d.fee_rate_bps`` / ``rq.fee_rate_bps``)
-    at every decision-path call site (deliverable 8), falling back to the config
-    default only when a call site has no market fee in scope.
-    """
-    from cryptobot.venues.fees import walk_fee_fn
-
-    return walk_fee_fn(config.VENUE, fee_rate_bps=fee_rate_bps)
-
-
-def _venue_fee_per_share(ask: float, fee_rate_bps: Optional[float] = None) -> float:
-    """Venue-dispatched scalar fee-per-share — the SAME seam as
-    ``_venue_walk_fee_fn``, for call sites that need one fee value rather than
-    a walker closure. Byte-identical PARABOLA on Polymarket
-    (``config.POLY_FEE_THETA``); per-market TENT on predict.fun with
-    ``fee_rate_bps`` threaded from the resolved market (config default when a
-    call site has no market fee in scope)."""
-    from cryptobot.venues.fees import fee_per_share
-
-    return fee_per_share(
-        ask,
-        venue=config.VENUE,
-        fee_rate_bps=fee_rate_bps,
-        theta=config.POLY_FEE_THETA,
-    )
-
-
 def _venue_market_cache_has(
     coin: str, interval_min: int, window_start_ts: int
 ) -> bool:
-    """Venue-dispatched per-window market-cache probe (pattern:
-    ``_venue_walk_fee_fn``). The A5 next-window prefetch and the A2 cold-cell
-    split previously consulted Gamma's cache unconditionally, so predictfun
-    cells always read an always-cold cache (every cell "cold" ⇒ needless
-    threaded fan-out / budget burn). Polymarket path byte-identical; the
-    predictfun branch consults predict.fun's own market cache.
-
-    Phase 2: the venue branch became a registry lookup; the two implementations
-    are unchanged."""
+    """Whether market metadata for this window is already cached."""
     from cryptobot.venues import get_adapter
 
     return get_adapter(config.VENUE).market_cache_has(
@@ -1636,7 +1597,6 @@ def _prepost_fresh_cover(
             fee_theta=config.POLY_FEE_THETA,
             # Deliverable 8: thread the per-market predict.fun feeRateBps into the
             # TENT fee (None on Polymarket => built-in parabola, byte-identical).
-            fee_fn=_venue_walk_fee_fn(fee_rate_bps),
             min_edge=_execution_min_edge(sleeve),
             min_bet_usd=config.MIN_BET_USD,
             max_walk_price=(
@@ -2177,7 +2137,6 @@ def _execute_fast_requote(
         prob_safe_floor=rq.model_p,
         fee_theta=config.POLY_FEE_THETA,
         # Deliverable 8: per-market predict.fun feeRateBps (None on Polymarket).
-        fee_fn=_venue_walk_fee_fn(rq.fee_rate_bps),
         min_edge=_execution_min_edge(sleeve),
         min_bet_usd=config.MIN_BET_USD,
         max_walk_price=_execution_max_walk_price(sleeve),
@@ -5764,7 +5723,6 @@ def _commit_cell(
             prob_safe_floor=d.score.model_p,
             fee_theta=config.POLY_FEE_THETA,
             # Deliverable 8: per-market predict.fun feeRateBps (None on Polymarket).
-            fee_fn=_venue_walk_fee_fn(d.fee_rate_bps),
             min_edge=_execution_min_edge(sleeve),
             min_bet_usd=config.MIN_BET_USD,
             max_walk_price=max_walk_price_cell,
@@ -5803,7 +5761,7 @@ def _commit_cell(
             # venue-fee call site). Observability-only: this warn-fee decides
             # whether a None walk on a non-empty book gets a pipeline_health
             # WARN.
-            _warn_fee = _venue_fee_per_share(_warn_top, d.fee_rate_bps)
+            _warn_fee = fee_per_share(_warn_top, theta=config.POLY_FEE_THETA)
             _top_clears_floor = (
                 d.score.model_p - _warn_top - _warn_fee
                 >= _execution_min_edge(sleeve)

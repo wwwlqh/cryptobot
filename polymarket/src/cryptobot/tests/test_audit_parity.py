@@ -88,13 +88,6 @@ def test_edge_formula_matches_backtest(seed: int, side: str):
     must equal ``_fee_adjusted_edge(1 - model_p, no_ask)`` — the live
     code applies the same formula but feeds the complementary
     probability and the complementary side's ask.
-
-    VENUE PIN (2026-08-01): ``_fee_adjusted_edge`` is venue-dispatched now and
-    defaults to ``config.VENUE``. The research parity chain is POLYMARKET's
-    (sweep_lib's theta parabola), so the venue is pinned explicitly here rather
-    than inherited from whatever ``CRYPTOBOT_VENUE`` the runner happens to
-    carry — on a predict.fun box this suite would otherwise compare a TENT
-    against a PARABOLA and fail for the right reason at the wrong site.
     """
     import numpy as np
     from polymarket.backtest.engine import sweep_lib  # type: ignore[import-not-found]
@@ -104,9 +97,9 @@ def test_edge_formula_matches_backtest(seed: int, side: str):
         yes_ask = rng.uniform(0.01, 0.99)
         no_ask = rng.uniform(0.01, 0.99)
         if side == "Up":
-            live = _fee_adjusted_edge(model_p, yes_ask, venue="polymarket")
+            live = _fee_adjusted_edge(model_p, yes_ask)
         else:  # "Down"
-            live = _fee_adjusted_edge(1.0 - model_p, no_ask, venue="polymarket")
+            live = _fee_adjusted_edge(1.0 - model_p, no_ask)
         runtime = float(parity.edge(
             np.array([model_p]), np.array([yes_ask]), np.array([no_ask]), side
         )[0])

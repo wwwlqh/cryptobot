@@ -47,11 +47,7 @@ from cryptobot.execution.strategy_constants import (
 )
 from cryptobot.execution.wallet_topology import _validate_wallet_config
 
-# Phase 2: pUSD is Polymarket's collateral, so PUSD_ADDRESS and the
-# build_pusd_balance_fetcher that used it moved to cryptobot_polymarket and are
-# reached through VenueAdapter.build_balance_fetcher. read_erc20_balance below
-# is generic JSON-RPC (predict.fun's collateral fetcher calls it too), so its
-# decimals default is now a plain literal — same value pUSD_DECIMALS carried.
+# pUSD (Polymarket collateral) has 6 decimals.
 _DEFAULT_ERC20_DECIMALS = 6
 
 if TYPE_CHECKING:
@@ -294,25 +290,10 @@ def read_erc20_balance(
 
 
 def build_venue_balance_fetcher(config: "Config") -> Callable[[], Optional[float]]:
-    """Venue-dispatched on-chain balance fetcher for live readiness (deliverable 7).
-
-    * ``polymarket`` (default) -> Polygon pUSD of ``POLY_FUNDER``, byte-identical
-      to today (the implementation moved to ``cryptobot_polymarket.balance``).
-    * ``predictfun`` -> the predict.fun collateral (USDT/BSC-USD) fetcher, which
-      is FAIL-CLOSED: it raises when the wallet plumbing is not configured so
-      readiness records chain_unreachable / NOT_READY and the venue stays DRY —
-      it never fakes a ready balance.
-
-    Phase 2: the ``if config.VENUE == "predictfun"`` branch became a registry
-    lookup. Dispatch still reads ``cryptobot.config.VENUE``, so an unpinned
-    deploy keeps the exact Polymarket fetcher.
-    """
-    from cryptobot import config as cfg_module
+    """On-chain balance fetcher for live readiness (Polygon pUSD of POLY_FUNDER)."""
     from cryptobot.venues import get_adapter
 
-    return get_adapter(getattr(cfg_module, "VENUE", "polymarket")).build_balance_fetcher(
-        config
-    )
+    return get_adapter().build_balance_fetcher(config)
 
 
 def prefetch_readiness_state(
@@ -346,23 +327,10 @@ def _secret_value(value: object) -> str:
 
 
 def _derive_topology(config: "Config") -> object | None:
-    """Derive the signer/deposit wallet pair for the wallet_topology_derived gate.
-
-    NOTE the hard-coded venue. This gate is Polymarket-shaped on EVERY venue and
-    always has been (it reads POLY_PRIVATE_KEY / POLY_FUNDER and is only reached
-    when POLY_SIGNATURE_TYPE==3), so Phase 2 preserved that rather than making it
-    dispatch on the active venue — which would have changed live-readiness
-    behavior on the predict.fun box. Asking the registry for the polymarket
-    adapter by name is a faithful encoding of today's behavior AND keeps core
-    free of direct venue imports.
-
-    TODO(operator): decide whether this gate should run at all on a non-poly
-    venue. That is a live-money policy call, not a mechanical move.
-    """
+    """Derive the signer/deposit wallet pair for the wallet_topology_derived gate."""
     from cryptobot.venues import get_adapter
-    from cryptobot.venues.fees import VENUE_POLYMARKET
 
-    return get_adapter(VENUE_POLYMARKET).derive_wallet_topology(config)
+    return get_adapter().derive_wallet_topology(config)
 
 
 def evaluate_readiness(
@@ -391,8 +359,6 @@ def evaluate_readiness(
     """
     onchain_required = bool(getattr(config, "live_onchain_verify_enabled", True))
     if chain_balance_fetcher is None and onchain_required:
-        # Venue-dispatched (deliverable 7): Polygon pUSD on Polymarket, predict.fun
-        # collateral (fail-closed) on the predictfun venue.
         chain_balance_fetcher = build_venue_balance_fetcher(config)
 
     if prefetched is None:

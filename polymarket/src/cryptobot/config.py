@@ -135,105 +135,10 @@ def _tristate_env(env_name: str) -> str:
     }.get(key, "off")
 
 
-# -- Venue selection ----------------------------------------------------------
-#
-# CRYPTOBOT_VENUE picks the trading venue. "polymarket" (default) keeps EVERY
-# current behavior byte-identical; "predictfun" selects the predict.fun adapters
-# at the market-discovery / book / order / settlement seams (resolved through
-# cryptobot.venues.get_adapter) and narrows the default scan universe to
-# predict.fun's crypto up-down coins.
-#
-# BOOT-LEVEL STRICT since Phase 2 (2026-07-28). An unrecognized value used to
-# log a warning and FALL BACK to "polymarket" — which means a typo in a unit
-# file would have quietly traded REAL MONEY on the wrong venue. It now refuses
-# to import. The allowlist is the venue registry's own map, so the env contract
-# and the adapter table cannot drift apart.
-#
-# This is BOOT-level only. Grade-time fee booking dispatches on a LEDGER ROW's
-# venue column and stays PERMISSIVE (unknown -> polymarket, matching the column
-# default) so a mixed-history DB never wedges the settlement sweep — see
-# cryptobot.venues.fees.row_fee_per_share.
-from cryptobot.venues.registry import KNOWN_VENUES as _KNOWN_VENUES
+# -- Venue ---------------------------------------------------------------------
 
-_VENUE_RAW = os.environ.get("CRYPTOBOT_VENUE", "polymarket").strip().lower()
-if _VENUE_RAW not in _KNOWN_VENUES:
-    raise ValueError(
-        f"CRYPTOBOT_VENUE={_VENUE_RAW!r} is not a known venue. "
-        f"Known venues: {', '.join(sorted(_KNOWN_VENUES))}. "
-        "Refusing to boot rather than falling back to 'polymarket' — an "
-        "unrecognized venue used to trade real money on the default one."
-    )
-VENUE: str = _VENUE_RAW
-
-# predict.fun REST + auth (only consulted on the predictfun venue / its recorder;
-# the polymarket path never reads these). PREDICTFUN_API_BASE is env-switchable
-# so the PUBLIC testnet (https://api-testnet.predict.fun/v1) can be used for
-# integration tests without a key; mainnet requires PREDICTFUN_API_KEY (a GET
-# 401s without it). PREDICTFUN_PRIVATE_KEY signs EIP-712 orders on the LIVE path
-# ONLY — DRY mode and the book recorder never read it.
-PREDICTFUN_API_BASE: str = (
-    os.environ.get("PREDICTFUN_API_BASE", "https://api.predict.fun/v1").strip().rstrip("/")
-)
-PREDICTFUN_API_KEY: str = os.environ.get("PREDICTFUN_API_KEY", "").strip()
-PREDICTFUN_PRIVATE_KEY: str = os.environ.get("PREDICTFUN_PRIVATE_KEY", "").strip()
-# predict.fun "Predict account" (Kernel smart wallet). UI accounts (email /
-# social login) custody funds on a Kernel smart account; the Privy-exported
-# private key controls a DIFFERENT owner EOA that signs for it. When this is
-# set: orders are built with maker=<this address> via predict_sdk's
-# predict_account option (signer stays the key's EOA), the /auth JWT flow
-# posts signer=<this address> with a Kernel-validated signature, and on-chain
-# collateral reads target THIS address (the EOA holds only BNB gas). Leave
-# EMPTY for an external-wallet account (maker == signer == the key's EOA).
-PREDICTFUN_PREDICT_ACCOUNT: str = os.environ.get(
-    "PREDICTFUN_PREDICT_ACCOUNT", ""
-).strip()
-# BNB chain id for EIP-712 order signing (56 mainnet / 97 testnet).
-PREDICTFUN_CHAIN_ID: int = int(os.environ.get("PREDICTFUN_CHAIN_ID", "56"))
-# Per-market taker fee fallback when a market payload omits feeRateBps. 200 bps
-# (2%) was observed on every probed predict.fun market (2026-07-21). The TENT fee
-# SHAPE (feeRateBps/10000 * min(p, 1-p)) lives in cryptobot.venues.fees; this
-# constant is only the fallback bps, NOT the Polymarket POLY_FEE_THETA parabola.
-PREDICTFUN_DEFAULT_FEE_RATE_BPS: float = _float_env(
-    "PREDICTFUN_DEFAULT_FEE_RATE_BPS", 200.0
-)
-# BNB-chain JSON-RPC endpoint for on-chain reads (collateral + gas balance,
-# redeem calldata). Read only by the predict.fun wallet diagnostics / wallet
-# helper (execution/predictfun_wallet.py); the polymarket path never touches it.
-# Default is a public BSC data-seed node; pin a dedicated authenticated RPC for
-# go-live (the same guidance as POLYGON_RPC_URL). The predict_sdk ships
-# bsc-dataseed.bnbchain.org — either host is a valid public BSC endpoint.
-PREDICTFUN_RPC_URL: str = os.environ.get(
-    "PREDICTFUN_RPC_URL", "https://bsc-dataseed.binance.org"
-).strip()
-# Collateral ERC-20 on predict.fun's BNB markets. VERIFIED (2026-07-21) from the
-# predict_sdk source + BscScan: BSC-USD / "USDT" (18 decimals, NOT 6). The token
-# + exchange + CTF contract ADDRESSES are deliberately env-required with NO hex
-# default here: they are only publicly discoverable from the SDK's
-# ADDRESSES_BY_CHAIN_ID export (docs publish none), so execution/predictfun_wallet
-# .py resolves them ENV-first -> predict_sdk-at-runtime -> fail-closed rather than
-# pinning a possibly mis-transcribed constant. An empty string = "not configured"
-# (the wallet helper then tries the SDK, then fails closed). Decimals default is
-# the verified 18.
-PREDICTFUN_COLLATERAL_TOKEN: str = os.environ.get(
-    "PREDICTFUN_COLLATERAL_TOKEN", ""
-).strip()
-PREDICTFUN_COLLATERAL_DECIMALS: int = int(
-    os.environ.get("PREDICTFUN_COLLATERAL_DECIMALS", "18")
-)
-# ctf-exchange fork the EIP-712 orders are signed against; and the Gnosis
-# ConditionalTokens (CTF) contract redeemPositions is called on. Env-required,
-# NO default (see the collateral-token note above).
-PREDICTFUN_EXCHANGE_CONTRACT: str = os.environ.get(
-    "PREDICTFUN_EXCHANGE_CONTRACT", ""
-).strip()
-PREDICTFUN_CTF_CONTRACT: str = os.environ.get("PREDICTFUN_CTF_CONTRACT", "").strip()
-# predict.fun on-chain redeem posting. Mirrors AUTO_REDEEM_ENABLED for Polymarket:
-# DEFAULT OFF. The wallet helper only ever BUILDS redeem calldata unless this is
-# explicitly enabled AND a signing key + verified contract addresses are present;
-# an unset flag means the live redeem-tx path is never taken (fail-closed).
-PREDICTFUN_AUTO_REDEEM_ENABLED: bool = os.environ.get(
-    "PREDICTFUN_AUTO_REDEEM_ENABLED", "0"
-).strip().lower() in ("1", "true", "yes")
+# Every ledger row records the venue it traded on.
+VENUE: str = "polymarket"
 
 
 # -- Scheduler cadence --------------------------------------------------------
@@ -332,54 +237,6 @@ GC_PAUSE_TELEMETRY: bool = os.environ.get(
 DECISION_READ_TIMEOUT_S: float = _float_env(
     "CRYPTOBOT_DECISION_READ_TIMEOUT_S", 3.0
 )
-
-# predict.fun ONLY: per-request read/write/pool timeout (seconds) for the
-# decision-path book GETs (the inline fetch_top_book + batch fetch_books_batch
-# that ride the shared pooled clob_client). Unset by default (None), which is
-# BYTE-IDENTICAL to today: the pooled client keeps its own client-level timeout
-# (DECISION_READ_TIMEOUT_S, default 3.0s) so an unpinned deploy is unchanged.
-# When set, main.py wraps it as httpx.Timeout(read=knob, write=knob, pool=knob,
-# connect=2.0) — the 2.0s connect cap on a cold reconnect is preserved — and
-# threads it into client.get() at the PF fetch partials only (Polymarket book
-# reads keep their existing effective timeout).
-#
-# GUIDANCE: keep this >= ~0.7-0.8s. The venue's warm book-read TTFB floor is
-# ~245ms but p90 reads can exceed 400ms, so a tighter cap (e.g. 400-600ms)
-# turns a slow-but-ALIVE batch into a FAILED batch, and the pipeline then
-# serializes a per-token fallback GET for every missed token — a "fallback
-# storm" that burns MORE of the already-binding 240/min local budget and can
-# worsen the reaction path (the opposite of the goal). This knob is defensive
-# worst-case insurance against a genuine venue STALL, not a steady-state
-# speedup; leave it unset unless a stall regime is actually observed.
-PREDICTFUN_BOOK_READ_TIMEOUT_S: float | None = _optional_float_env(
-    "CRYPTOBOT_PREDICTFUN_BOOK_READ_TIMEOUT_S"
-)
-
-# predict.fun ONLY: fill-push order-state wait over the authenticated
-# ``predictWalletEvents/{jwt}`` WS topic. When ON — and only with a LIVE order
-# client AND a running PF book WS mirror (the wallet topic rides the mirror's
-# existing socket/heartbeat/reconnect loop; DRY mode has order_client=None so
-# nothing subscribes) — a just-POSTed order awaits its pushed terminal event
-# FIRST, and the inline GET /orders/{hash} poll (~2s budget) runs UNCHANGED as
-# the fallback on ANY WS gap/timeout/ambiguity. The WS event may shortcut the
-# wait with status + executed SHARES at most; fill VWAP booking stays at the
-# cap price regardless (executedPriceWei/executedValueWei are never read).
-#
-# ⚠️ DEFAULT OFF = byte-identical runtime: no wallet subscription is sent, no
-# waiter is injected, and _await_terminal_state is exactly today's poll loop.
-PREDICTFUN_WS_WALLET_EVENTS: bool = os.environ.get(
-    "CRYPTOBOT_PREDICTFUN_WS_WALLET_EVENTS", "0"
-).strip().lower() in ("1", "true", "yes")
-# Upper bound (ms) on the WS-event-first wait before falling through to the
-# unchanged GET poll. 2000ms mirrors the poll's own ~2s budget
-# (_FILL_POLL_MAX x _FILL_POLL_DELAY_S): a pushed fill lands well under 1s, so
-# this bound only binds on a WS miss — where the full poll then still runs, so
-# the worst case is additive (~WS wait + poll) on that rare path. A pushed
-# terminal event with no bookable state wakes the wait EARLY (the common bare
-# FAK kill reaches the poll immediately, keeping the reject/retry path fast).
-PREDICTFUN_WS_WALLET_EVENTS_WAIT_MS: int = int(os.environ.get(
-    "CRYPTOBOT_PREDICTFUN_WS_WALLET_EVENTS_WAIT_MS", "2000"
-))
 
 # Entry-timing skip ("skip first N seconds of every minute" lever). The scanner
 # ticks at 1Hz; a positive N suppresses ALL bet placement during the first N
@@ -1484,11 +1341,6 @@ if _COINS_ENV:
     COINS: tuple[str, ...] = tuple(
         c.strip().upper() for c in _COINS_ENV.split(",") if c.strip()
     )
-elif VENUE == "predictfun":
-    # predict.fun's crypto up-down universe is BTC/ETH/BNB only (no SOL/XRP).
-    # An explicit CRYPTOBOT_COINS still wins above; this is only the venue
-    # default when the operator did not pin the scan set.
-    COINS = ("BTC", "ETH", "BNB")
 else:
     COINS = ("BTC", "ETH", "XRP") + (("SOL",) if SUBMINUTE_ENABLED else ())
 

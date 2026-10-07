@@ -103,8 +103,8 @@ where = [
     # ONE src root for polymarket since 2026-08-04: the engine and the venue
     # adapter share `polymarket/src/`, so this single entry serves both.
     "polymarket/src",
-    "predictfun/live/src",
-    "kalshi/live/src",
+    
+    
 ]
 include = ["cryptobot*"]
 
@@ -112,7 +112,7 @@ include = ["cryptobot*"]
 testpaths = [
     "polymarket/src/cryptobot/tests",
     "polymarket/src/cryptobot_polymarket/tests",
-    "predictfun/live/src/cryptobot_predictfun/tests",
+    
     "polymarket/backtest/tests",
     "polymarket/backtest/training/tests",
     "polymarket/dashboard/tests",
@@ -122,8 +122,8 @@ testpaths = [
 ]
 pythonpath = [
     "polymarket/src",
-    "predictfun/live/src",
-    "kalshi/live/src",
+    
+    
     ".",
 ]
 markers = [

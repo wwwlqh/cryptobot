@@ -178,23 +178,10 @@ def _build_deps_factory(
     from cryptobot import config
     from cryptobot.execution.pipeline import TickDeps
 
-    # Venue seam: market-discovery + order-book adapters come off the venue
-    # ADAPTER (cryptobot.venues), which the registry resolves from config.VENUE.
-    # Every venue exposes the SAME fetch_active_market / fetch_top_book /
-    # fetch_books_batch signatures + return shapes, so the tick path below is
-    # venue-agnostic.
-    #
-    # book_fetch_kwargs() carries the per-venue extras the DECISION path needs:
-    # {} on Polymarket (its fetchers accept neither, so binding one would be a
-    # TypeError), and predict.fun's split-rate bucket + optional book-read
-    # timeout. That is why the kwargs are a venue question rather than a
-    # branch here.
+    # Market discovery and order books come from the venue adapter.
     from cryptobot.venues import get_adapter
 
     _adapter = get_adapter(config.VENUE)
-    if config.VENUE != "polymarket":
-        logger.info("venue seam: %s adapters selected (CRYPTOBOT_VENUE)", config.VENUE)
-    _book_fetch_kwargs: dict = _adapter.book_fetch_kwargs()
     _fetch_market_impl = _adapter.fetch_active_market
     _fetch_book_impl = _adapter.fetch_top_book
     _fetch_books_impl = _adapter.fetch_books_batch
@@ -207,10 +194,10 @@ def _build_deps_factory(
 
     fetch_spots = partial(_fetch_spots_impl, client=spot_client)
     fetch_market = partial(_fetch_market_impl, client=gamma_client)
-    fetch_book = partial(_fetch_book_impl, client=clob_client, **_book_fetch_kwargs)
+    fetch_book = partial(_fetch_book_impl, client=clob_client)
     # A2 latency: batched POST /books — one round trip for every qualifying
     # cell's tokens per tick (pipeline falls back to fetch_book on failure).
-    fetch_books = partial(_fetch_books_impl, client=clob_client, **_book_fetch_kwargs)
+    fetch_books = partial(_fetch_books_impl, client=clob_client)
 
     def factory() -> TickDeps:
         return TickDeps(
@@ -271,13 +258,8 @@ def _build_sweep_job(
     from cryptobot import config
     from cryptobot.scheduler.resolution_sweep import run_resolution_sweep
 
-    # Venue seam: settlement source dispatches on config.VENUE. Polymarket uses
-    # Gamma's final outcomePrices; predict.fun reads the published UP/DOWN winner
-    # off the markets API (deliverable 4 — the API-outcome path in
-    # predictfun.markets.fetch_resolved_outcome; fail-closed OPEN on any
-    # ambiguity so rows stay PENDING and are retried, exactly like Polymarket's
-    # resolver). The batch regrade tool is
-    # reconciliation.backfill_predictfun_settlement.
+    # Settlement reads Gamma's final outcomePrices; rows stay PENDING until
+    # the market is decisively resolved.
     from cryptobot.venues import get_adapter
 
     _adapter = get_adapter(config.VENUE)
@@ -761,10 +743,6 @@ def main(argv: list[str] | None = None) -> int:
     partial_ret_engine = PartialRetEngine()
     twap_mirror = None
     if config.TWAP_SYMMETRIC_ENABLED:
-        if config.VENUE != "polymarket":
-            raise ValueError(
-                "CRYPTOBOT_TWAP_SYMMETRIC_ENABLED requires CRYPTOBOT_VENUE=polymarket"
-            )
         from cryptobot_polymarket.price_to_beat import fetch_price_to_beat
         from cryptobot_polymarket.twap_mirror import ChainlinkTwapRtdsMirror
 
@@ -829,11 +807,6 @@ def main(argv: list[str] | None = None) -> int:
     # credentials are empty, we boot in DRY-only mode (Phase 1). The
     # pipeline + scheduler jobs treat `order_client=None` as
     # `clob_unavailable` — LIVE wallets emit SKIP, DRY wallets continue.
-    # Phase 2: both branches (PredictFunOrderClient vs OrderClient) moved into
-    # their venue adapters, which own their own key/SDK gating and log lines.
-    # Fail-soft is unchanged on both: None here means DRY-only, which the
-    # pipeline + scheduler jobs read as `clob_unavailable` (LIVE wallets emit
-    # SKIP, DRY wallets continue).
     from cryptobot.venues import get_adapter
 
     order_client: Optional[object] = get_adapter(config.VENUE).build_order_client(
@@ -844,19 +817,14 @@ def main(argv: list[str] | None = None) -> int:
 
     # A3 latency: cached funder balance — the tick reads this instead of a
     # synchronous CLOB round trip every LIVE tick; the 60s readiness job
-    # keeps it fresh (store() below reuses that job's own fetch). Both the
-    # Polymarket OrderClient and the predict.fun order client expose
-    # check_balance(), so this is venue-agnostic (predict.fun returns its
-    # collateral balance / None fail-soft).
+    # keeps it fresh (store() below reuses that job's own fetch).
     balance_cache: Optional[BalanceCache] = None
     if order_client is not None:
         balance_cache = BalanceCache(order_client.check_balance)
 
     chain_balance_fetcher: Optional[Callable[[], Optional[float]]] = None
     if runtime_cfg.live_onchain_verify_enabled:
-        # Deliverable 7: venue-dispatched on-chain balance fetcher (Polygon pUSD
-        # on Polymarket; predict.fun collateral, fail-closed, on the predictfun
-        # venue).
+        # On-chain Polygon pUSD balance of the funder wallet.
         chain_balance_fetcher = build_venue_balance_fetcher(runtime_cfg)
 
     transfer_relayer_submitter: Optional[
@@ -908,23 +876,7 @@ def main(argv: list[str] | None = None) -> int:
     any_wallet_live = any(
         str(m).upper() == "LIVE" for m in wallet_modes.values()
     )
-    if (
-        any_wallet_live
-        and transfer_relayer_submitter is None
-        and config.VENUE != "polymarket"
-    ):
-        # The relayer (transfer submit + pUSD withdrawal) is a
-        # POLYMARKET-only surface; other venues have no relayer to wire, so
-        # its absence is by design, not a half-broken LIVE state. Escalating
-        # CRITICAL here blocked live_readiness (no_recent_boot_critical) for
-        # a full hour after EVERY boot of the predict.fun Tokyo box
-        # (observed 2026-08-01 16:06 UTC first boot).
-        logger.info(
-            "venue=%s has no Polymarket relayer surface; the transfer "
-            "UI is poly-only — skipping the relayer-gap CRITICAL",
-            config.VENUE,
-        )
-    elif any_wallet_live and transfer_relayer_submitter is None:
+    if any_wallet_live and transfer_relayer_submitter is None:
         relayer_gap_msg = (
             "a wallet is LIVE but the Polymarket relayer is not configured "
             "(RELAYER_API_KEY / RELAYER_API_KEY_ADDRESS / POLY_FUNDER / "
@@ -1145,31 +1097,9 @@ def main(argv: list[str] | None = None) -> int:
     # batch exactly as today. Both default OFF.
     book_sources: list = []
     book_shadow = None
-    # True once the predict.fun WS mirror is running AUTHORITATIVE (enabled, not
-    # shadow, constructed OK). It takes over the off-tick book-warming role from
-    # the A8 REST prefetcher, so the prefetcher below is skipped for PF in that
-    # state (the inline REST batch still covers WS misses). Stays False in shadow
-    # mode / on any construction failure so the prefetcher runs exactly as today.
-    # True once the venue's WS mirror is running AUTHORITATIVE (enabled, not
-    # shadow, constructed OK) AND that venue says the mirror takes over the
-    # off-tick book-warming role from the A8 REST prefetcher — predict.fun does,
-    # Polymarket does not. Stays False in shadow mode / on any construction
-    # failure, so the prefetcher runs exactly as today.
-    ws_replaces_rest_prefetch = False
-    # The AUTHORITATIVE mirror instance, kept for the stall watchdog below
-    # (None in shadow mode / WS off / construction failure => no watchdog).
+    # The authoritative mirror, kept for the stall watchdog below (None in
+    # shadow mode or with WS off).
     ws_mirror_authoritative = None
-    # Venue seam: the two venues speak DIFFERENT CLOB market channels, so each
-    # adapter builds its OWN mirror class — Polymarket's ClobBookWsMirror
-    # (public market channel) vs predict.fun's PredictFunBookWsMirror
-    # (predictOrderbook/{marketId}) with its optional wallet-events wiring.
-    # Neither imports the other; the shadow comparator is now the shared core
-    # one both venues were already using. Whatever the mirror does not serve
-    # fresh falls through to the REST prefetch/batch. Both default OFF.
-    #
-    # Per-venue fail-soft lives in the adapter: predict.fun swallows a
-    # construction/start failure and continues REST-only (returning an empty
-    # setup), Polymarket does not guard and still stops the boot.
     if config.BOOK_WS_ENABLED:
         _ws_setup = get_adapter(config.VENUE).build_ws_mirror(
             order_client=order_client
@@ -1183,30 +1113,12 @@ def main(argv: list[str] | None = None) -> int:
             # outranks the REST prefetch cache.
             book_sources.append(_ws_setup.mirror)
             ws_mirror_authoritative = _ws_setup.mirror
-        ws_replaces_rest_prefetch = _ws_setup.replaces_rest_prefetch
-    if config.BOOK_PREFETCH_ENABLED and ws_replaces_rest_prefetch:
-        # PF WS mirror is authoritative: it warms books off-tick over the push
-        # channel, so the REST prefetch-ahead daemon is redundant here and would
-        # only spend the shared 240/min key. Skip it; the pipeline's inline REST
-        # batch still backstops any WS miss/staleness (fail-open). In SHADOW mode
-        # pf_ws_authoritative is False, so the prefetcher runs unchanged.
-        logger.info(
-            "venue seam: predict.fun WS book mirror authoritative — REST "
-            "BookPrefetcher NOT started (WS warms books off-tick; inline REST "
-            "batch remains the fallback)"
-        )
-    elif config.BOOK_PREFETCH_ENABLED:
-        # Venue seam: the A8 prefetcher re-fetches the previous tick's token set
-        # — it must use the ACTIVE venue's batch fetch (the predictfun one
-        # resolves outcome tokens -> market books via the discovery registry;
-        # POSTing predict.fun onChainIds to Polymarket's /books would 4xx).
-        _bp_adapter = get_adapter(config.VENUE)
-        _bp_fetch = _bp_adapter.fetch_books_batch
-        _bp_kwargs: dict = _bp_adapter.prefetch_fetch_kwargs()
+    if config.BOOK_PREFETCH_ENABLED:
+        # Re-fetch the previous tick's token set just before each second.
         from cryptobot.scheduler.book_prefetch import BookPrefetcher
 
         book_prefetcher = BookPrefetcher(
-            partial(_bp_fetch, client=clob_client, **_bp_kwargs),
+            partial(get_adapter(config.VENUE).fetch_books_batch, client=clob_client),
             lead_ms=config.BOOK_PREFETCH_LEAD_MS,
             max_age_ms=config.BOOK_PREFETCH_MAX_AGE_MS,
         )
@@ -1478,32 +1390,7 @@ def main(argv: list[str] | None = None) -> int:
     # Re-reads the book ~1s after each LIVE FAK reject and back-fills
     # requote_ask/age. Uses only the read-only CLOB client + a scheduler-pool
     # connection, so it runs unconditionally (no OrderClient dependency).
-    # VENUE-DISPATCHED (2026-08-01, predict.fun Tokyo cutover). This drain was
-    # pinned to the POLYMARKET book fetcher on EVERY venue — a Phase-2
-    # preservation choice made when no one could watch a predict.fun box. On a
-    # predict.fun box that meant POSTing predict.fun token ids at Polymarket's
-    # /book once per reject: it can only fail, it burns a round trip per
-    # rejected order, and the requote_ask/age telemetry it exists to backfill
-    # was never written. Now it follows config.VENUE like every other book read.
-    #
-    # BUCKET: the PREFETCH bucket, never the decision bucket. This is
-    # OBSERVATION ONLY (no order is placed off it), so it must never consume
-    # the rate-limit budget the live entry path bids against — predict.fun
-    # splits its 240/min key allowance into a decision bucket and a slower
-    # prefetch bucket (0.6/s) for exactly this class of caller.
-    #
-    # FAIL-SOFT is unchanged: drain_requote_queue swallows per-row fetch
-    # failures, so a venue whose adapter offers no prefetch kwargs just runs
-    # with the adapter's defaults.
-    from cryptobot.venues import get_adapter as _get_adapter
-
-    _rr_adapter = _get_adapter(config.VENUE)
-    _rr_fetch_kwargs = {}
-    try:
-        _rr_fetch_kwargs = dict(_rr_adapter.prefetch_fetch_kwargs() or {})
-    except Exception:  # noqa: BLE001 — telemetry must never block boot
-        logger.debug("reject-requote prefetch kwargs unavailable", exc_info=True)
-    _rr_fetch_book = _rr_adapter.fetch_top_book
+    _rr_fetch_book = get_adapter(config.VENUE).fetch_top_book
     from cryptobot.execution.reject_requote import drain_requote_queue
 
     def _requote_drain_job() -> None:
@@ -1517,7 +1404,7 @@ def main(argv: list[str] | None = None) -> int:
             counters = drain_requote_queue(
                 conn,
                 fetch_book=partial(
-                    _rr_fetch_book, client=clob_client, **_rr_fetch_kwargs
+                    _rr_fetch_book, client=clob_client
                 ),
                 write_lock=db_write_lock,
             )
@@ -1725,11 +1612,7 @@ def main(argv: list[str] | None = None) -> int:
                 # Same venue-dispatched batch fetch + read-only client the A8
                 # prefetcher uses; one POST /books per pass, one rate-limit
                 # token regardless of token count.
-                partial(
-                    _wd_adapter.fetch_books_batch,
-                    client=clob_client,
-                    **_wd_adapter.prefetch_fetch_kwargs(),
-                ),
+                partial(_wd_adapter.fetch_books_batch, client=clob_client),
                 stall_suspect_ms=config.BOOK_WS_WATCHDOG_STALL_SUSPECT_MS,
                 max_tokens_per_pass=config.BOOK_WS_WATCHDOG_MAX_TOKENS_PER_PASS,
                 verify_ttl_ms=config.BOOK_WS_WATCHDOG_VERIFY_TTL_MS,
@@ -1757,17 +1640,8 @@ def main(argv: list[str] | None = None) -> int:
     # start_scheduler stays the single owner of the job set; flag-off wiring
     # stays byte-identical (param defaults None) and the heavy import happens
     # only inside the `if`.
-    #
-    # PINNED TO POLYMARKET — see miss_forensics.miss_forensics_armed(), which
-    # owns the flag-AND-venue predicate so the gate itself is unit-tested
-    # rather than only reachable through a full main() boot. The predicate
-    # module is stdlib-only; the job body's import stays inside the `if`.
-    from cryptobot.scheduler.miss_forensics import miss_forensics_armed
-
     _miss_forensics_job: Optional[Callable[[], None]] = None
-    if miss_forensics_armed(
-        enabled=config.MISS_FORENSICS_ENABLED, venue=config.VENUE
-    ):
+    if config.MISS_FORENSICS_ENABLED:
         from cryptobot.scheduler.miss_forensics import run_miss_forensics
 
         def _run_miss_forensics_job() -> None:

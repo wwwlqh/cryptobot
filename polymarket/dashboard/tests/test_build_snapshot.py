@@ -453,69 +453,6 @@ def test_v2_bet_exposes_trade_journal_exec_and_realized_fill(monkeypatch, tmp_pa
     assert bet["live_filled_price"] == pytest.approx(0.75)
 
 
-def test_v2_bet_edge_uses_the_row_venue_fee(monkeypatch, tmp_path):
-    """The Subminute telemetry must mirror the scorer's venue dispatch.
-
-    A predict.fun row at 0.70 pays the 200 bps tent (0.006 per share), not
-    Polymarket's theta parabola (0.01512). The dashboard is observability, but
-    showing the wrong edge can send an operator to the wrong gate diagnosis.
-    """
-    import sqlite3
-
-    from cryptobot import config
-    from cryptobot.db import init_db
-    from cryptobot.execution.ledger import record_bet
-    from cryptobot.observability import snapshot_builder
-    from cryptobot.strategy.portfolio_loader import load_sleeves
-    from cryptobot.tests.test_slot_state import make_signal
-
-    monkeypatch.setattr(config, "SUBMINUTE_ENABLED", True)
-    monkeypatch.setattr(config, "VENUE", "predictfun")
-    snapshot_builder.clear_aux_cache()
-    conn = init_db(tmp_path / "v2-venue-fee.db")
-    conn.row_factory = sqlite3.Row
-    try:
-        rid = record_bet(
-            conn,
-            make_signal(
-                coin="BTC", sleeve="subminute_5m", side="YES",
-                bet_size=5.0, fill_price=0.70,
-            ),
-            mode="DRY",
-        )
-        unknown_rid = record_bet(
-            conn,
-            make_signal(
-                coin="ETH", sleeve="subminute_15m", side="NO",
-                bet_size=5.0, fill_price=0.70,
-            ),
-            mode="DRY",
-        )
-        conn.execute(
-            "UPDATE ledger SET offset_sec=285, venue='predictfun', "
-            "fee_rate_bps=200.0, model_p=0.80, p_market=0.70, "
-            "exit_kind='stop_loss', exit_ts='2026-08-02T00:00:02Z' "
-            "WHERE id=?",
-            (rid,),
-        )
-        conn.execute(
-            "UPDATE ledger SET offset_sec=285, venue='legacy-unknown', "
-            "model_p=0.80, p_market=0.70 WHERE id=?",
-            (unknown_rid,),
-        )
-        conn.commit()
-        block = snapshot_builder._v2_block(conn, load_sleeves(), {})
-    finally:
-        conn.close()
-
-    assert block is not None
-    assert len(block["bets"]) == 2
-    by_coin = {row["coin"]: row for row in block["bets"]}
-    assert by_coin["BTC"]["pred_edge"] == pytest.approx(0.80 - 0.70 - 0.006)
-    assert by_coin["BTC"]["exit_ts"] == "2026-08-02T00:00:02Z"
-    assert by_coin["ETH"]["pred_edge"] == pytest.approx(0.0853)
-
-
 def test_v2_block_equity_uses_real_clob_balance(monkeypatch, tmp_path):
     """The v2 tab's equity + peak track the SAME per-tick live CLOB balance the
     hero uses (kpis.account_capital_live) — NOT the old _latest_live_balance

@@ -82,7 +82,7 @@ def test_backfill_regrades_pyth_rows_to_polymarket_final_outcome(
     expected = (1.0 - 0.20) * 50.0 - 0.864 * 0.07 * 0.20 * 0.80 * 50.0
     assert row["pnl_net"] == pytest.approx(expected, abs=1e-9)
     assert row["pnl_net"] == pytest.approx(
-        graded_cash_pnl("YES", 0.20, True, 10.0, venue="polymarket"),
+        graded_cash_pnl("YES", 0.20, True, 10.0),
         abs=1e-9,
     )
 

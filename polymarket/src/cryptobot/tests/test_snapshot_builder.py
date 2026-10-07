@@ -1582,57 +1582,6 @@ def test_stop_row_if_held_null_before_resolution_backfill(
     assert bet["stop_if_held_pnl"] is None
 
 
-def test_stop_if_held_null_when_registered_venue_is_unimportable(
-    db: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch,
-):
-    """A REGISTERED venue whose package is not installed must render a null
-    counterfactual, not blow up the whole snapshot.
-
-    This is the DEPLOYED-TREE case and it cannot happen locally: deploy.sh
-    stages cryptobot_polymarket and cryptobot_predictfun into the bundle but
-    deliberately NOT cryptobot_kalshi (see deploy.sh's staging block), so on the box
-    get_adapter('kalshi') dies inside importlib with ModuleNotFoundError —
-    while the local tree, where every venue package IS importable, only ever
-    produces the stub's NotImplementedError. Before the fix the except tuple
-    caught (ValueError, NotImplementedError) only, so a kalshi-tagged ledger
-    row would have raised out of build_payload on the box.
-
-    Simulated by pointing the registry entry at a module that does not exist,
-    which is exactly the shape of an unstaged package.
-    """
-    from cryptobot.observability import snapshot_builder as sb
-    from cryptobot.venues import registry
-
-    monkeypatch.setitem(
-        registry.VENUE_PACKAGES, "kalshi", "cryptobot_kalshi_not_staged_here",
-    )
-    registry._reset_cache_for_tests()
-
-    # Precondition: this really is the IMPORT path, not the stub's
-    # NotImplementedError — otherwise the test would pass for the wrong reason.
-    with pytest.raises(ModuleNotFoundError):
-        registry.get_adapter("kalshi")
-
-    # Direct: the winning-side branch is the one that prices the fee.
-    assert sb._stop_if_held_pnl(
-        side="YES", won_up=1, live_filled_size=5.0, live_filled_price=0.70,
-        bet_size=3.5, fill_price=0.70, venue="kalshi",
-    ) is None
-
-    # End to end: the ledger builder's SELECT carries the venue column, so the
-    # whole payload must still build with the row rendered as null.
-    portfolio = load_sleeves()
-    rid = _insert_stop_row(db, side="YES", won_up=1)
-    db.execute("UPDATE ledger SET venue='kalshi' WHERE id=?", (rid,))
-    db.commit()
-
-    payload, _ = build_payload(db, portfolio)
-    row = next(r for r in payload["ledger"] if r["id"] == rid)
-    assert row["venue"] == "kalshi"
-    assert row["exit_kind"] == "stop_loss"
-    assert row["stop_if_held_pnl"] is None
-
-
 def test_stop_row_pnl_in_journal_sum_legacy_cancelled_excluded(
     db: sqlite3.Connection,
 ):
@@ -2725,15 +2674,6 @@ def test_v2_spec_carries_the_booked_fee_calibration(db: sqlite3.Connection):
     # ...and the raw published theta is UNCHANGED beside it (decision math).
     assert spec["poly_fee_theta"] == pytest.approx(0.07)
     assert sb._v2_sizing_constants()["fee_calibration"] == pytest.approx(0.864)
-
-
-def test_fee_calibration_is_none_off_polymarket(monkeypatch: pytest.MonkeyPatch):
-    """predict.fun's 2% tent share-fee is venue-measured exact and
-    POLY_FEE_CALIBRATION never touches it — the row must render '—', not 0.864."""
-    from cryptobot.observability import snapshot_builder as sb
-
-    monkeypatch.setattr(config, "VENUE", "predictfun", raising=False)
-    assert sb._fee_calibration() is None
 
 
 def test_latency_freshness_block_carries_watchdog_counters(db: sqlite3.Connection):

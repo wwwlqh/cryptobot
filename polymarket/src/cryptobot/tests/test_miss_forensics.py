@@ -442,29 +442,11 @@ class TestTokenPair:
 
 
 # =========================================================================
-# GATING — flag off / wrong venue registers nothing
+# GATING
 # =========================================================================
 
 
 class TestGating:
-    def test_armed_on_polymarket_with_the_flag_on(self):
-        assert mf.miss_forensics_armed(enabled=True, venue="polymarket") is True
-
-    def test_flag_off_is_a_no_op(self):
-        assert mf.miss_forensics_armed(enabled=False, venue="polymarket") is False
-
-    def test_predictfun_paper_unit_never_arms(self):
-        """The shared core runs a predict.fun paper unit whose fills are not on
-        Polygon; arming there would file every row MAKER_CANCEL."""
-        assert mf.miss_forensics_armed(enabled=True, venue="predictfun") is False
-
-    def test_unknown_or_blank_venue_never_arms(self):
-        for venue in ("kalshi", "", None, "POLY"):
-            assert mf.miss_forensics_armed(enabled=True, venue=venue) is False
-
-    def test_venue_matching_tolerates_case_and_padding(self):
-        assert mf.miss_forensics_armed(enabled=True, venue=" Polymarket ") is True
-
     def test_config_default_is_on(self):
         from cryptobot import config
         assert config.MISS_FORENSICS_ENABLED is True

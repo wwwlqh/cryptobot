@@ -157,9 +157,7 @@ def entry_fee_usd(price: float, shares: float) -> float:
     """
     from cryptobot.execution.grade_fees import entry_fee_usd as _live_entry_fee
 
-    return _live_entry_fee(
-        venue="polymarket", entry_price=float(price), shares=float(shares)
-    )
+    return _live_entry_fee(entry_price=float(price), shares=float(shares))
 
 
 def flat_pnl_net(win: int | float, price: float) -> float:
