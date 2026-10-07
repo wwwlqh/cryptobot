@@ -78,9 +78,8 @@ try:
     V6_CONFIG = Path(_cfg.V6_CONFIG_PATH)
 except Exception:  # noqa: BLE001
     for _candidate in (
-        ROOT / "runtime" / "config" / "v2_step1last_live.json",
-        ROOT / "backtest" / "optimize_runs" / "v2_step1last_live.json",  # legacy-path-ok: pre-restructure checkouts
-        ROOT / "polymarket" / "live" / "config" / "v2_step1last_live.json",
+        ROOT / "runtime" / "config" / "twap_symmetric_live.json",
+        ROOT / "polymarket" / "live" / "config" / "twap_symmetric_live.json",
     ):
         V6_CONFIG = _candidate
         if _candidate.is_file():

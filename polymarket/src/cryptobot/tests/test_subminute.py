@@ -283,16 +283,16 @@ class TestLoadSleevesFlagGating:
         )
 
         by_label = {s.label: s for s in portfolio.sleeves}
-        assert len(by_label["subminute_5m"].checkpoint_offset_set) == 30
-        assert by_label["subminute_5m"].checkpoint_offset_set[0] == 270
+        assert len(by_label["subminute_5m"].checkpoint_offset_set) == 150
+        assert by_label["subminute_5m"].checkpoint_offset_set[0] == 150
         assert by_label["subminute_5m"].checkpoint_offset_set[-1] == 299
         # 15m grid ends inside the window (899 < 900).
         assert by_label["subminute_15m"].checkpoint_offset_set[-1] == 899
-        # MID bands/gates: (0.65, 0.85] and pred_edge >= 0.03.
-        assert by_label["subminute_5m"].ask_bucket_ranges == ((0.65, 0.85),)
-        assert by_label["subminute_5m"].threshold == pytest.approx(0.03)
-        assert by_label["subminute_15m"].ask_bucket_ranges == ((0.65, 0.85),)
-        assert by_label["subminute_15m"].threshold == pytest.approx(0.03)
+        # Ask band (0.55, 0.85] and pred_edge >= 0.10.
+        assert by_label["subminute_5m"].ask_bucket_ranges == ((0.55, 0.85),)
+        assert by_label["subminute_5m"].threshold == pytest.approx(0.10)
+        assert by_label["subminute_15m"].ask_bucket_ranges == ((0.55, 0.85),)
+        assert by_label["subminute_15m"].threshold == pytest.approx(0.10)
 
     def test_sol_in_scan_universe_only_when_subminute_enabled(self) -> None:
         """config.COINS gains SOL only under the sub-minute flag — flag-off

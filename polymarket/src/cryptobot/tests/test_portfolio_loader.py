@@ -149,45 +149,40 @@ def test_config_sha256_is_64_hex_chars() -> None:
 def test_run_id_recovered() -> None:
     # The loader echoes the json's run_id verbatim.
     portfolio = load_sleeves()
-    assert portfolio.run_id == "v2_midonly4_live_2026_07_22"
+    assert portfolio.run_id == "twap_pooled_fixed_all4_t150_live_2026_08_15"
 
 
 def test_v2_wallet_risk_fractions() -> None:
     portfolio = load_sleeves()
-    # Single shared exposure cap (1.0) applied per-wallet; DD halt 0.30
-    # (throttle removal + 1%/1% resize, operator-ordered 2026-07-31 —
-    # with the graduated brake gone the halt is the only drawdown guard).
-    # The trio (config.py SHARED_EXPOSURE_CAP, the artifact's
-    # concurrent_exposure_cap_fraction, and the box env) must all read 1.0.
+    # One shared exposure cap (1.0) applied per wallet; 40% drawdown halt.
     assert portfolio.shared_exposure_cap_fraction == pytest.approx(1.0)
-    assert portfolio.max_drawdown_halt_frac == pytest.approx(0.30)
+    assert portfolio.max_drawdown_halt_frac == pytest.approx(0.40)
     assert portfolio.exposure_cap_fraction_for("subminute_15m") == pytest.approx(1.0)
     assert portfolio.exposure_cap_fraction_for("subminute_5m") == pytest.approx(1.0)
 
 
 def test_v2_hgb_fields_populated_and_min_edge_inert() -> None:
-    """The deployed v2 HGB checkpoint sleeves expose the model-defining fields
-    (threshold / feature_groups / ask_bucket_ranges / book_consumption_max)
-    while the legacy `min_edge` gate is parked at -1.0 (inert)."""
+    """The live HGB sleeves expose their selection fields (threshold,
+    feature_groups, ask band, book consumption); ``min_edge`` is parked at -1.0."""
     portfolio = load_sleeves()
     by_label = {s.label: s for s in portfolio.sleeves}
 
     s5 = by_label["subminute_5m"]
     assert s5.signal_source == "hgb"
-    # v2 pred_edge gate 0.03; ask band 0.65-0.85; 11-set features.
-    assert s5.threshold == pytest.approx(0.03)
-    assert s5.feature_groups == "rf,price,identity,time"
-    assert s5.ask_bucket_ranges == ((0.65, 0.85),)
-    assert s5.book_consumption_max == pytest.approx(0.30)
+    # Edge gate 0.10; ask band 0.55-0.85; 11 features.
+    assert s5.threshold == pytest.approx(0.10)
+    assert s5.feature_groups == "price,identity,time,momentum"
+    assert s5.ask_bucket_ranges == ((0.55, 0.85),)
+    assert s5.book_consumption_max == pytest.approx(0.06)
     assert s5.side_filter == "both"
     # min_edge is parked inert at -1.0; HGB gating uses `threshold`.
     assert s5.min_edge == pytest.approx(-1.0)
 
     s15 = by_label["subminute_15m"]
     assert s15.signal_source == "hgb"
-    assert s15.threshold == pytest.approx(0.03)
-    assert s15.feature_groups == "rf,price,identity,time"
-    assert s15.ask_bucket_ranges == ((0.65, 0.85),)
+    assert s15.threshold == pytest.approx(0.10)
+    assert s15.feature_groups == "price,identity,time,momentum"
+    assert s15.ask_bucket_ranges == ((0.55, 0.85),)
     assert s15.book_consumption_max == pytest.approx(0.06)
     assert s15.side_filter == "both"
     assert s15.min_edge == pytest.approx(-1.0)
@@ -431,13 +426,13 @@ def test_u10_boot_smoke_v2() -> None:
     from cryptobot.db import init_db
     from cryptobot.observability.snapshot_builder import build_payload
 
-    # No env overrides → loader picks up v2_step1last_live.json by default.
+    # No env overrides: the loader picks up twap_symmetric_live.json.
     portfolio = load_sleeves()
-    assert portfolio.run_id == "v2_midonly4_live_2026_07_22"
+    assert portfolio.run_id == "twap_pooled_fixed_all4_t150_live_2026_08_15"
     assert portfolio.config_sha256, "config_sha256 must be set for drift-pinning"
     assert len(portfolio.wallet_groups) == 1
     assert portfolio.shared_exposure_cap_fraction == pytest.approx(1.0)
-    assert portfolio.max_drawdown_halt_frac == pytest.approx(0.30)
+    assert portfolio.max_drawdown_halt_frac == pytest.approx(0.40)
 
     conn = init_db(":memory:")
     try:
@@ -445,7 +440,7 @@ def test_u10_boot_smoke_v2() -> None:
         k = payload["kpis"]
         # One wallet_group → the dashboard renders the group rollup view.
         assert k["topology"] == "wallet_groups"
-        assert k["max_drawdown_halt_pct"] == 30.0
+        assert k["max_drawdown_halt_pct"] == 40.0
         assert len(k["wallets"]) == 2
         labels = sorted(w["id"] for w in k["wallets"])
         assert labels == ["subminute_15m", "subminute_5m"]

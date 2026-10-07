@@ -1325,9 +1325,8 @@ def test_bankroll_display_consumed_only_by_snapshot_payload():
 
 
 def test_v2_spec_emits_bands():
-    """live.v2.spec presents the deployed ask band(s) over the last-30s window,
-    DERIVED from the loaded sleeves — and drops the stale flat single-band
-    ask_lo/ask_hi/gate presentation."""
+    """live.v2.spec presents the deployed ask band(s), derived from the loaded
+    sleeves, and no longer emits the flat single-band ask_lo/ask_hi/gate."""
     from cryptobot.observability import snapshot_builder
 
     portfolio = load_sleeves()
@@ -1341,12 +1340,12 @@ def test_v2_spec_emits_bands():
     assert spec["poly_fee_theta"] == pytest.approx(config.POLY_FEE_THETA)
     assert spec["intervals"] == ["5m", "15m"]
     assert spec["signal_source"] == "hgb"
-    assert spec["features"] == "rf,price,identity,time (11-set)"
+    assert spec["features"] == "price,identity,time,momentum (11-set)"
     assert spec["one_per_market"] is True
     assert "first-fill-wins" in spec["selection"]
     ow = spec["offset_windows"]
-    assert ow["5m"].startswith("270") and ow["5m"].endswith("299s")
-    assert ow["15m"].startswith("870") and ow["15m"].endswith("899s")
+    assert ow["5m"].startswith("150") and ow["5m"].endswith("299s")
+    assert ow["15m"].startswith("750") and ow["15m"].endswith("899s")
 
     # Bands derived from the deployed sleeves (tracks the manifest, not
     # literals): the artifact carries the single MID band, so exactly one band
@@ -1362,8 +1361,8 @@ def test_v2_spec_emits_bands():
     assert (mid["ask_lo"], mid["ask_hi"]) == by_label["subminute_5m"].ask_bucket_ranges[0]
     assert mid["gate"] == pytest.approx(by_label["subminute_5m"].threshold)
 
-    # Code-verified numbers (v2_step1last_live.json manifest).
-    assert (mid["ask_lo"], mid["ask_hi"], mid["gate"]) == (0.65, 0.85, 0.03)
+    # Numbers from twap_symmetric_live.json.
+    assert (mid["ask_lo"], mid["ask_hi"], mid["gate"]) == (0.55, 0.85, 0.10)
 
 
 def test_v2_block_threads_portfolio_into_spec(db: sqlite3.Connection):

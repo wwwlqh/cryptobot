@@ -328,7 +328,7 @@ SHARED_EXPOSURE_CAP: float = float(os.environ.get(
 # fails closed.
 MAX_DRAWDOWN_HALT_FRAC: float = float(os.environ.get(
     "CRYPTOBOT_MAX_DD_HALT_FRAC",
-    "0.30",
+    "0.40",
 ))
 
 # UI threshold for amber warning on the exposure tile (R-NEW-18).
@@ -387,9 +387,8 @@ DB_PATH: Path = _path("CRYPTOBOT_DB_PATH", DATA_ROOT / "cryptobot.db")
 # its new home is the venue's live config dir, not the research tree.
 V6_CONFIG_PATH: Path = _resolve_artifact(
     "CRYPTOBOT_V6_CONFIG",
-    ("runtime", _REPO_ROOT / "runtime" / "config" / "v2_step1last_live.json"),
-    ("legacy", _REPO_ROOT / "backtest" / "optimize_runs" / "v2_step1last_live.json"),  # legacy-path-ok: pre-restructure checkouts
-    ("new", _REPO_ROOT / "polymarket" / "live" / "config" / "v2_step1last_live.json"),
+    ("runtime", _REPO_ROOT / "runtime" / "config" / "twap_symmetric_live.json"),
+    ("repo", _REPO_ROOT / "polymarket" / "live" / "config" / "twap_symmetric_live.json"),
 )
 # The TWAP model: one HistGradientBoosting classifier per interval, trained on
 # Chainlink 60-second TWAP settlement labels (polymarket/backtest/training/

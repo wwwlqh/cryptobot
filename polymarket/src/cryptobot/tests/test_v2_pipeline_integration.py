@@ -165,16 +165,16 @@ def test_prune_window_decider_noop_below_threshold() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_v2_decider_for_mid_reuses_global() -> None:
+def test_v2_decider_for_live_sleeves_uses_their_band() -> None:
     P._V2_WINDOW_DECIDERS.clear()
     sleeves = _load_v2_sleeves()
-    mid = P._v2_decider_for(sleeves["subminute_5m"])
-    # MID band/gate reuses the module-global decider (identity preserved).
-    assert mid is P._V2_WINDOW_DECIDER
-    assert (mid.ask_lo, mid.ask_hi) == (0.65, 0.85)
-    assert mid.gate == 0.03
-    # 5m and 15m MID sleeves share the one global decider (unchanged behavior).
-    assert P._v2_decider_for(sleeves["subminute_15m"]) is P._V2_WINDOW_DECIDER
+    d5 = P._v2_decider_for(sleeves["subminute_5m"])
+    # The live band differs from the default, so each sleeve gets its own.
+    assert d5 is not P._V2_WINDOW_DECIDER
+    assert (d5.ask_lo, d5.ask_hi) == (0.55, 0.85)
+    assert d5.gate == 0.10
+    assert P._v2_decider_for(sleeves["subminute_5m"]) is d5
+    assert P._v2_decider_for(sleeves["subminute_15m"]) is not d5
 
 
 def test_v2_decider_for_non_mid_band_mints_own_decider() -> None:

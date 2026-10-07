@@ -203,7 +203,7 @@ def test_combined_pending_sums_members(db: sqlite3.Connection) -> None:
 def test_dd_halt_fires_for_both_members(db: sqlite3.Connection) -> None:
     """Combined DD over MAX_DRAWDOWN_HALT_FRAC halts BOTH sleeves."""
     portfolio = load_sleeves()
-    assert portfolio.max_drawdown_halt_frac == pytest.approx(0.30)
+    assert portfolio.max_drawdown_halt_frac == pytest.approx(0.40)
     # 5m: +80 @ t1, -90 @ t3 ; 15m: +10 @ t2, -10 @ t4
     # merged: 100->180->190->100->90, peak 190, realized 90,
     # dd_peak_frac = (190-90)/190 = 0.526 >= 0.50.

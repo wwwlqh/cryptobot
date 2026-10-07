@@ -313,15 +313,12 @@ class TestConfigConstantsMatchBacktest:
         )
 
     def test_max_drawdown_halt_matches_live_config(self) -> None:
-        # 2026-07-31 throttle removal (operator-ordered): 0.30 peak-equity DD
-        # halt. The graduated brake is gone (floor 1.0) and both intervals size
-        # flat at 1%, so this halt is the ONLY drawdown guard; the deployed
-        # both-hold twin's worst-fold backtest maxDD is 26.6%. Must equal the
-        # deployed artifact's max_drawdown_halt_frac (loader drift-check).
+        # 40% peak-equity drawdown halt; must equal the live config's
+        # max_drawdown_halt_frac (the loader checks this at boot).
         import json
 
         best = json.loads(config.V6_CONFIG_PATH.read_text())
-        assert config.MAX_DRAWDOWN_HALT_FRAC == 0.30
+        assert config.MAX_DRAWDOWN_HALT_FRAC == 0.40
         assert config.MAX_DRAWDOWN_HALT_FRAC == float(best["max_drawdown_halt_frac"])
 
     def test_backtest_bankroll_pinned(self) -> None:

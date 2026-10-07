@@ -182,7 +182,7 @@ ARTIFACTS_DIR = _resolve_artifacts_dir()
 # tree into the live venue config on 2026-07-28 (it is a live artifact, not a
 # research output).
 LIVE_CONFIG_DIR = REPO_ROOT / "polymarket" / "live" / "config"
-LIVE_V6_CONFIG_PATH = LIVE_CONFIG_DIR / "v2_step1last_live.json"
+LIVE_V6_CONFIG_PATH = LIVE_CONFIG_DIR / "twap_symmetric_live.json"
 
 __all__ = [
     "legacy_first",
