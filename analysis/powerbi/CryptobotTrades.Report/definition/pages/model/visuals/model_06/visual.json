@@ -1,12 +1,12 @@
 {
-  "$schema": "https://developer.microsoft.com/json-schemas/fabric/item/report/definition/visualContainer/2.4.0/schema.json",
+  "$schema": "https://developer.microsoft.com/json-schemas/fabric/item/report/definition/visualContainer/2.12.0/schema.json",
   "name": "model_06",
   "position": {
     "x": 800,
     "y": 200,
     "z": 6,
-    "width": 456,
     "height": 236,
+    "width": 456,
     "tabOrder": 6
   },
   "visual": {
@@ -28,6 +28,7 @@
               },
               "queryRef": "trades.strategy",
               "nativeQueryRef": "strategy",
+              "active": true,
               "displayName": "Strategy"
             },
             {
@@ -43,6 +44,7 @@
               },
               "queryRef": "trades.window",
               "nativeQueryRef": "window",
+              "active": false,
               "displayName": "Window"
             }
           ]

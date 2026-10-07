@@ -242,7 +242,7 @@ def _migrate_db(conn: sqlite3.Connection) -> None:
     # resolution_sweep._decide_won_up which prefers it over strike_price
     # (decision-time spot). Legacy rows have NULL → sweep falls back to
     # strike_price for backward compatibility. See schema.sql for the
-    # column docstring + divergence #13 in AGENTS.md.
+    # column docstring.
     _add_column_if_missing(conn, "ledger", "window_open_spot", "REAL")
 
     # Portfolio-v2 pair metadata. Nullable for legacy V6 rows; populated for

@@ -1,12 +1,12 @@
 {
-  "$schema": "https://developer.microsoft.com/json-schemas/fabric/item/report/definition/visualContainer/2.4.0/schema.json",
+  "$schema": "https://developer.microsoft.com/json-schemas/fabric/item/report/definition/visualContainer/2.12.0/schema.json",
   "name": "model_05",
   "position": {
     "x": 24,
     "y": 200,
     "z": 5,
-    "width": 760,
     "height": 496,
+    "width": 760,
     "tabOrder": 5
   },
   "visual": {
@@ -28,6 +28,7 @@
               },
               "queryRef": "trades.Prob Bucket",
               "nativeQueryRef": "Prob Bucket",
+              "active": true,
               "displayName": "Model probability"
             }
           ]
@@ -97,22 +98,13 @@
             },
             "direction": "Ascending"
           }
-        ],
-        "isDefaultSort": false
+        ]
       }
     },
     "objects": {
       "markers": [
         {
-          "properties": {
-            "show": {
-              "expr": {
-                "Literal": {
-                  "Value": "true"
-                }
-              }
-            }
-          }
+          "properties": {}
         }
       ],
       "labels": [

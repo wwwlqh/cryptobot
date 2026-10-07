@@ -13,7 +13,7 @@ Public API:
     LUT_BUCKET_COUNT, LUT_BUCKET_EDGES, lut_p_bucket_indices(p) -> ndarray
     atomic_to_parquet(df, path, **kwargs) -> None
 
-Fee shape (audit_parity Gap #5, plan ref ~/.claude/plans/there-r-so-many-async-emerson.md):
+Fee shape (audit_parity Gap #5):
     Polymarket's actual taker fee for **crypto** markets is theta-style:
         fee_per_share = feeRate * fill_price * (1 - fill_price)
     with feeRate = 0.07 (peak ~1.75% at p=0.5, zero at p=0 or p=1). This is

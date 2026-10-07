@@ -13,8 +13,8 @@ After=cryptobot.service
 # guard — when this oneshot fires from the daily timer (04:00 UTC +
 # Persistent=true catch-up), Requires= would silently start cryptobot if
 # it were inactive, restarting a real-money bot the operator had
-# deliberately `systemctl stop`ped to inspect the DB / pause trading
-# (AGENTS.md). After= only ORDERS the checkpoint relative to the bot if
+# deliberately `systemctl stop`ped to inspect the DB / pause trading.
+# After= only ORDERS the checkpoint relative to the bot if
 # it happens to be running; it never starts it. wal_checkpoint(TRUNCATE)
 # is a safe no-op against a stopped DB and deploy/cron.daily.sh already  (legacy-path-ok: remote layout)
 # tolerates (and logs) a locked DB.

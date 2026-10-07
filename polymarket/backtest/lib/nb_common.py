@@ -10,8 +10,8 @@ live-snapshot loaders (``load_ledger`` / ``load_signals`` / ``boot_eras``),
 grading tables (``reliability_table`` / ``edge_bucket_table`` /
 ``population_table``), memory-bounded parquet I/O (``slug_index`` /
 ``parquet_frames``) and a re-export of the raw-L2 replay arms. It was written
-for ``polymarket/backtest/{5m,15m}/notebooks/`` — a tree planned in
-``docs/plans/RESTRUCTURE_PLAN_20260728.md`` §8 that was never created. The repo
+for ``polymarket/backtest/{5m,15m}/notebooks/`` — a planned tree that was
+never created. The repo
 has carried ZERO ``.ipynb`` files the entire time, so no caller ever appeared:
 an import census on 2026-08-03 found the only importer of this module was
 ``tests/test_raw_replay.py``, i.e. it was kept alive solely by a test of another

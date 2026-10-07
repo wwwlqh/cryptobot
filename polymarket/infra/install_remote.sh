@@ -603,7 +603,7 @@ fi
 # MODE SWITCH (operator-armed; lives in the SHARED env so it SURVIVES
 # deploys): CRYPTOBOT_PREDICTFUN_LIVE=1 in /etc/cryptobot.env flips the
 # generated file from the paper-DRY variant to the REAL-MONEY variant.
-# ⚠️ ARMING PREREQUISITE (predictfun/live/runbooks/PREDICTFUN_GO_LIVE_RUNBOOK.md): the staged
+# ⚠️ ARMING PREREQUISITE: the staged
 # validation CLI (cbot-predictfun-live-validation) must have passed
 # preflight/auth/build/reject/order on this box first — the submit wire was
 # implemented 2026-07-23 from docs and is only PROVEN by that protocol.

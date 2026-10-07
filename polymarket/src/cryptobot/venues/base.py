@@ -21,7 +21,7 @@ old dispatch site                            adapter member
 ``live_readiness.build_venue_balance_fetcher`` ``build_balance_fetcher()``
 ===========================================  ==========================================
 
-Deliberately NOT on the adapter (see docs/PATH_MAP.md §Phase-2):
+Deliberately NOT on the adapter:
 
 * **the default scan universe (``COINS``)** — and NOT for the reason this
   docstring used to give. There is no import cycle. The adapter packages are

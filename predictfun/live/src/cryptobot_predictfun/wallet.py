@@ -407,8 +407,7 @@ def read_wallet_balances(
 # ⚠️ NO RUNTIME CALLER — this is a MANUAL/OPERATOR surface, deliberately kept.
 # Nothing in the scanner, the settlement backfill or any scheduler job calls
 # `build_redeem_positions_calldata` / `redeem_won_position`; the only in-repo
-# users are the tests and the operator following
-# `predictfun/live/runbooks/PREDICTFUN_GO_LIVE_RUNBOOK.md` step 2.7 / §4.
+# users are the tests and manual operator redemption.
 # PF live is HALTED (2026-07-23), not dead, and NO superseding redeem path
 # exists for PF winnings — this is the only exit. Do not delete as dead code.
 # ---------------------------------------------------------------------------

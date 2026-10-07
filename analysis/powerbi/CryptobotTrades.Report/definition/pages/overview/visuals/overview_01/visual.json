@@ -1,12 +1,12 @@
 {
-  "$schema": "https://developer.microsoft.com/json-schemas/fabric/item/report/definition/visualContainer/2.4.0/schema.json",
+  "$schema": "https://developer.microsoft.com/json-schemas/fabric/item/report/definition/visualContainer/2.12.0/schema.json",
   "name": "overview_01",
   "position": {
     "x": 900,
     "y": 8,
     "z": 1,
-    "width": 170,
     "height": 74,
+    "width": 170,
     "tabOrder": 1
   },
   "visual": {
@@ -27,7 +27,8 @@
                 }
               },
               "queryRef": "trades.coin",
-              "nativeQueryRef": "coin"
+              "nativeQueryRef": "coin",
+              "active": true
             }
           ]
         }

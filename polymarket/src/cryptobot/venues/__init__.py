@@ -1,6 +1,6 @@
 """``cryptobot.venues`` — the seam between the shared engine and a trading venue.
 
-Phase 2 of the venue-tree restructure (see ``docs/PATH_MAP.md`` §Phase-2).
+Phase 2 of the venue-tree restructure.
 Before it, the engine dispatched with ``if config.VENUE == "predictfun"`` at
 eight sites and imported the venue modules (then ``cryptobot.predictfun.*`` /
 ``cryptobot.data.polymarket_*``) directly from ``main.py`` / ``pipeline.py`` /

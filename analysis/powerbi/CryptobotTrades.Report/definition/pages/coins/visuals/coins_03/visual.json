@@ -1,12 +1,12 @@
 {
-  "$schema": "https://developer.microsoft.com/json-schemas/fabric/item/report/definition/visualContainer/2.4.0/schema.json",
+  "$schema": "https://developer.microsoft.com/json-schemas/fabric/item/report/definition/visualContainer/2.12.0/schema.json",
   "name": "coins_03",
   "position": {
     "x": 24,
     "y": 444,
     "z": 3,
-    "width": 808,
     "height": 252,
+    "width": 808,
     "tabOrder": 3
   },
   "visual": {
@@ -28,6 +28,7 @@
               },
               "queryRef": "trades.bet_hour_utc",
               "nativeQueryRef": "bet_hour_utc",
+              "active": true,
               "displayName": "Hour (UTC)"
             }
           ]
@@ -67,8 +68,7 @@
             },
             "direction": "Ascending"
           }
-        ],
-        "isDefaultSort": false
+        ]
       }
     },
     "visualContainerObjects": {

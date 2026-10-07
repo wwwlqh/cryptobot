@@ -6,8 +6,7 @@ settlement label the WFO arbiter reads), plus three pmdata.dev pullers, one per
 product:
 
 * ``pmdata_download`` — the 1 Hz resampled book tree ``pmdata/poly_snapshot/``.
-  This is the module RECOVERY.md and AGENTS.md name as THE re-download path for
-  that tree, and ``training.pmdata_target.require_snapshot_dir()`` names it in
+  This is THE re-download path for that tree, and ``training.pmdata_target.require_snapshot_dir()`` names it in
   its FileNotFoundError. poly_snapshot/ was deleted 2026-07-31, so the research
   pool cannot be rebuilt until this has been re-run.
 * ``pmdata_raw_pull`` — the byte-exact ``poly_l2_raw/`` tick archive.

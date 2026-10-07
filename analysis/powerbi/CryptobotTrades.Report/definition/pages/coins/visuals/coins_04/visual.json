@@ -1,12 +1,12 @@
 {
-  "$schema": "https://developer.microsoft.com/json-schemas/fabric/item/report/definition/visualContainer/2.4.0/schema.json",
+  "$schema": "https://developer.microsoft.com/json-schemas/fabric/item/report/definition/visualContainer/2.12.0/schema.json",
   "name": "coins_04",
   "position": {
     "x": 848,
     "y": 444,
     "z": 4,
-    "width": 408,
     "height": 252,
+    "width": 408,
     "tabOrder": 4
   },
   "visual": {
@@ -28,6 +28,7 @@
               },
               "queryRef": "trades.side",
               "nativeQueryRef": "side",
+              "active": true,
               "displayName": "Bet direction"
             }
           ]

@@ -2065,7 +2065,6 @@ def test_overview_pnl_strip_lives_in_the_hero_card_and_nets_rebates_in():
     dead space the chart captions used to occupy."""
     dash = _REPO_ROOT / "polymarket" / "dashboard"
     overview = (dash / "pages-overview.jsx").read_text(encoding="utf-8")
-    readme = (dash / "README.md").read_text(encoding="utf-8")
     builder = (
         _REPO_ROOT / "polymarket" / "src" / "cryptobot" / "observability"
         / "snapshot_builder.py"
@@ -2125,8 +2124,6 @@ def test_overview_pnl_strip_lives_in_the_hero_card_and_nets_rebates_in():
     assert "load_capital_flows(\n            conn, _wallet_start_sql()\n        )" in builder
     assert '"pnl_rebate_usd": None,' in builder
 
-    # Payload doc lists the field.
-    assert "pnl_rebate_usd" in readme
 
 
 def test_overview_declutter_drops_captions_tape_and_counts_trades():
@@ -2870,12 +2867,6 @@ def test_single_venue_console_wiring_and_wallet_panel():
     assert "predictfunWallet(live)" not in config_page
     assert "StrategyFlagsPanel" not in config_page
 
-    # Dashboard-owned docs mention the venue dimension.
-    readme = (dash / "README.md").read_text(encoding="utf-8")
-    design = (dash / "README-DESIGN.md").read_text(encoding="utf-8")
-    assert "venue" in readme.lower()
-    assert "predict.fun" in readme.lower()
-    assert "venue" in design.lower()
 
 
 def test_pf_paper_merge_seam_is_gone():

@@ -1,170 +1,207 @@
 table trades
+	lineageTag: 39e17994-547e-471a-bcb9-0909bf4c0811
 
-	measure 'Trades' = COUNTROWS ( trades )
+	measure Trades = COUNTROWS ( trades )
 		formatString: #,0
+		lineageTag: ab5c6efe-18d7-46cc-852a-c10d70c9e6bf
 
 	measure 'Resolved Trades' = CALCULATE ( [Trades], trades[outcome] <> "Pending" )
 		formatString: #,0
+		lineageTag: 26c4cc81-2744-4726-b1d5-a86384886200
 
 	measure 'Net PnL' = SUM ( trades[pnl_usd] )
 		formatString: \$#,0.00;-\$#,0.00;\$0.00
+		lineageTag: 8edb05b9-caa3-4906-a12a-754fc06a63ee
 
 	measure 'Total Staked' = SUM ( trades[stake_usd] )
 		formatString: \$#,0
+		lineageTag: 88d001df-48c7-4dd1-81ef-fc4862efff70
 
 	measure 'ROI %' = DIVIDE ( [Net PnL], [Total Staked] )
 		formatString: 0.00%
+		lineageTag: 8c883ca2-e8e1-4ac3-a447-672ccc60734b
 
 	measure 'Win Rate %' = DIVIDE ( CALCULATE ( [Trades], trades[pnl_usd] > 0 ), [Resolved Trades] )
 		formatString: 0.0%
+		lineageTag: 74312464-8ecf-4122-ae2f-00a037e5cec6
 
 	measure 'Avg Win' = CALCULATE ( AVERAGE ( trades[pnl_usd] ), trades[pnl_usd] > 0 )
 		formatString: \$#,0.00;-\$#,0.00;\$0.00
+		lineageTag: 54071e09-46bb-4d46-b523-f93a28823462
 
 	measure 'Avg Loss' = CALCULATE ( AVERAGE ( trades[pnl_usd] ), trades[pnl_usd] < 0 )
 		formatString: \$#,0.00;-\$#,0.00;\$0.00
+		lineageTag: b1661034-0a15-4a5d-9d80-9afea4b99c9c
 
 	measure 'Model Accuracy %' = CALCULATE ( AVERAGE ( trades[model_correct] ), NOT ISBLANK ( trades[model_prob] ) )
 		formatString: 0.0%
+		lineageTag: 748f6a17-3b54-4393-8a71-8293bffba085
 
 	measure 'Avg Model Prob %' = AVERAGE ( trades[model_prob] )
 		formatString: 0.0%
+		lineageTag: 04a126cc-fb93-4c85-8dd4-1e259bc1833a
 
 	measure 'Avg Price Paid %' = CALCULATE ( AVERAGE ( trades[market_price] ), NOT ISBLANK ( trades[model_prob] ) )
 		formatString: 0.0%
+		lineageTag: daac1c22-838e-4036-a096-f0e2ee07ce0c
 
 	measure 'Accuracy vs Price (pts)' = ( [Model Accuracy %] - [Avg Price Paid %] ) * 100
 		formatString: +0.0;-0.0
+		lineageTag: 44b62ac9-fdb0-4b22-8e68-0df3579f47b4
 
 	measure 'Cumulative PnL' = VAR _upTo = MAX ( trades[bet_date] ) RETURN CALCULATE ( [Net PnL], trades[bet_date] <= _upTo, REMOVEFILTERS ( trades[bet_date], trades[bet_time_utc], trades[trade_id] ) )
 		formatString: \$#,0.00;-\$#,0.00;\$0.00
+		lineageTag: 09504806-e8c7-4775-9d0d-d86f3658b73b
 
 	measure 'Max Drawdown' = MIN ( trades[drawdown_usd] )
 		formatString: \$#,0.00;-\$#,0.00;\$0.00
+		lineageTag: 0c32b957-c22e-4517-8a5d-d4880acd96ac
 
 	column trade_id
 		dataType: int64
 		formatString: 0
+		lineageTag: c0439706-ec6d-4740-98f3-1e3546cffe21
 		summarizeBy: none
 		sourceColumn: trade_id
 
 	column bet_time_utc
 		dataType: dateTime
 		formatString: yyyy-mm-dd hh:nn
+		lineageTag: cd34495e-574d-447a-90b2-307c9bb4671a
 		summarizeBy: none
 		sourceColumn: bet_time_utc
 
 	column bet_date
 		dataType: dateTime
 		formatString: yyyy-mm-dd
+		lineageTag: 9eee5e13-a152-48df-b58d-01e848bfd013
 		summarizeBy: none
 		sourceColumn: bet_date
 
 	column bet_hour_utc
 		dataType: int64
 		formatString: 0
+		lineageTag: 45ef6103-b95d-490c-8490-3dd0c48590c9
 		summarizeBy: none
 		sourceColumn: bet_hour_utc
 
 	column coin
 		dataType: string
+		lineageTag: 366ea8bf-187a-4545-b230-1aaad66f867e
 		summarizeBy: none
 		sourceColumn: coin
 
 	column strategy
 		dataType: string
+		lineageTag: d2d7304e-8ed8-4b34-b63d-c8db8d8a4187
 		summarizeBy: none
 		sourceColumn: strategy
 
 	column window
 		dataType: string
+		lineageTag: 34a98a03-b520-4df8-8cc3-266a272b7fcf
 		summarizeBy: none
 		sourceColumn: window
 
 	column side
 		dataType: string
+		lineageTag: e6d39d46-0384-42d2-93ab-c0d861919184
 		summarizeBy: none
 		sourceColumn: side
 
 	column model_prob
 		dataType: double
 		formatString: 0.0%
+		lineageTag: 07c725d8-f104-4db6-8801-8d1640722011
 		summarizeBy: none
 		sourceColumn: model_prob
 
 	column market_price
 		dataType: double
 		formatString: 0.0%
+		lineageTag: 217b67c1-ff3f-4333-a6fb-a0314f897dec
 		summarizeBy: none
 		sourceColumn: market_price
 
 	column model_edge
 		dataType: double
 		formatString: 0.0%
+		lineageTag: 0e01961c-55d3-4e19-a073-21eb4aca7962
 		summarizeBy: none
 		sourceColumn: model_edge
 
 	column fill_price
 		dataType: double
 		formatString: 0.000
+		lineageTag: 628bdf70-b75e-4398-b348-eb7ffb36b1ad
 		summarizeBy: none
 		sourceColumn: fill_price
 
 	column stake_usd
 		dataType: double
 		formatString: \$#,0.00
+		lineageTag: 2aa3e23d-d40e-48a8-81a0-210d129f2475
 		summarizeBy: none
 		sourceColumn: stake_usd
 
 	column is_top_up
 		dataType: int64
 		formatString: 0
+		lineageTag: 1639ce0e-7e3a-4aac-a4d1-9944543b1d58
 		summarizeBy: none
 		sourceColumn: is_top_up
 
 	column outcome
 		dataType: string
+		lineageTag: 6c4d3010-0283-4c19-b2cd-347e0df5ced0
 		summarizeBy: none
 		sourceColumn: outcome
 
 	column market_went_up
 		dataType: int64
 		formatString: 0
+		lineageTag: bdd4e6a9-ba05-4db4-adc0-16b9637c3510
 		summarizeBy: none
 		sourceColumn: market_went_up
 
 	column model_correct
 		dataType: int64
 		formatString: 0
+		lineageTag: 23d9de65-c906-46dd-8437-78e42b217890
 		summarizeBy: none
 		sourceColumn: model_correct
 
 	column pnl_usd
 		dataType: double
 		formatString: \$#,0.00;-\$#,0.00
+		lineageTag: 51c76326-deba-48e5-aa18-347150360fef
 		summarizeBy: none
 		sourceColumn: pnl_usd
 
 	column seconds_into_window
 		dataType: int64
 		formatString: 0
+		lineageTag: 4021151f-6c96-4025-b807-7ccba008856e
 		summarizeBy: none
 		sourceColumn: seconds_into_window
 
 	column cum_pnl_usd
 		dataType: double
 		formatString: \$#,0.00;-\$#,0.00
+		lineageTag: deed0c89-85d1-4cf9-94c1-ae5740cdf31f
 		summarizeBy: none
 		sourceColumn: cum_pnl_usd
 
 	column drawdown_usd
 		dataType: double
 		formatString: \$#,0.00;-\$#,0.00
+		lineageTag: 559384be-7809-4a27-978a-6b2d2a874f9e
 		summarizeBy: none
 		sourceColumn: drawdown_usd
 
 	column 'Prob Bucket' = SWITCH ( TRUE (), ISBLANK ( trades[model_prob] ), BLANK (), trades[model_prob] < 0.7, "60-70%", trades[model_prob] < 0.8, "70-80%", trades[model_prob] < 0.9, "80-90%", "90-100%" )
 		dataType: string
+		lineageTag: 3c964fe9-8a55-4df1-b386-cd422077b889
 		summarizeBy: none
 
 	partition trades = m
@@ -176,3 +213,4 @@ table trades
 				    Typed = Table.TransformColumnTypes(Promoted, {{"trade_id", Int64.Type}, {"bet_time_utc", type datetime}, {"bet_date", type date}, {"bet_hour_utc", Int64.Type}, {"coin", type text}, {"strategy", type text}, {"window", type text}, {"side", type text}, {"model_prob", type number}, {"market_price", type number}, {"model_edge", type number}, {"fill_price", type number}, {"stake_usd", type number}, {"is_top_up", Int64.Type}, {"outcome", type text}, {"market_went_up", Int64.Type}, {"model_correct", Int64.Type}, {"pnl_usd", type number}, {"seconds_into_window", Int64.Type}, {"cum_pnl_usd", type number}, {"drawdown_usd", type number}}, "en-US")
 				in
 				    Typed
+

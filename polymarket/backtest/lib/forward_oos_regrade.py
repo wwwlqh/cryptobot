@@ -12,7 +12,7 @@ WORKFLOW (repeat each week -- grade NON-OVERLAPPING slices so the weeks stay
 independent; the live DB retains only SIGNALS_RETENTION_DAYS=7, so consecutive
 full-DB pulls overlap ~6 days):
   1. Pull a fresh signal-log export from EC2 -> data/server_snapshot/cb_export_<date>.db
-     (pull_live_db.sh deleted 2026-08-04 — pull manually per RECOVERY.md; keep each dated snapshot so you know the prior --until).
+     (copy the live SQLite DB with `sqlite3 .backup`; keep each dated snapshot so you know the prior --until).
   2. Grade ONLY the new slice since the previous run's --until:
        python -m polymarket.backtest.lib.forward_oos_regrade --signal-db .../cb_export_<date>.db \
            --since '<previous --until>' --until '<this snapshot MAX(created_at)>'

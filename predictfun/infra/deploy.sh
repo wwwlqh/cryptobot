@@ -12,8 +12,7 @@
 #
 # ⚠️ SINGLE-KEY-CONSUMER RULE: predict.fun allows ~240 requests/min per API key.
 # Two boxes scanning with the SAME key is ~480/min AND two processes trading the
-# same wallet. STOP the Ireland predict.fun units BEFORE arming this box (see
-# predictfun/live/runbooks/PREDICTFUN_GO_LIVE_RUNBOOK.md).
+# same wallet. STOP any other predict.fun units BEFORE arming this box.
 #
 # This is a thin wrapper: everything real lives in polymarket/infra/deploy.sh
 # (the ONE deploy driver — staging, test gate, tarball, remote install). It only

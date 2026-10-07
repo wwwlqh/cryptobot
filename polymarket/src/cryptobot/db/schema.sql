@@ -1,6 +1,6 @@
 -- cryptobot live-scanner schema. Ledger (R17) + R-NEW additions per the
--- shipped 2026-05-17 live-scanner+dashboard plan; ongoing schema changes
--- are tracked under docs/plans/2026-05-24-001-feat-per-strategy-live-deploy-plan.md §U1.
+-- shipped 2026-05-17 live-scanner+dashboard plan. Later columns are added
+-- idempotently by db/connection.py.
 
 -- =========================================================================
 -- ledger: one row per PENDING bet attempt; promoted to WIN/LOSS/CANCELLED

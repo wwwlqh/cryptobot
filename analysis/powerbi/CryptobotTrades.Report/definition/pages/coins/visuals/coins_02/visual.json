@@ -1,12 +1,12 @@
 {
-  "$schema": "https://developer.microsoft.com/json-schemas/fabric/item/report/definition/visualContainer/2.4.0/schema.json",
+  "$schema": "https://developer.microsoft.com/json-schemas/fabric/item/report/definition/visualContainer/2.12.0/schema.json",
   "name": "coins_02",
   "position": {
     "x": 24,
     "y": 92,
     "z": 2,
-    "width": 1232,
     "height": 336,
+    "width": 1232,
     "tabOrder": 2
   },
   "visual": {
@@ -167,8 +167,7 @@
             },
             "direction": "Descending"
           }
-        ],
-        "isDefaultSort": false
+        ]
       }
     },
     "objects": {

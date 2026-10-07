@@ -1,1 +1,3 @@
 expression DataFile = "C:\Users\leowq\Desktop\crypto-price-prediction-bot\analysis\data\trades.csv" meta [IsParameterQuery=true, Type="Text", IsParameterQueryRequired=true]
+	lineageTag: c86de323-ac65-4788-87fb-2fc872cebb7e
+

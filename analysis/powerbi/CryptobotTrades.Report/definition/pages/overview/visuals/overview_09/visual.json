@@ -1,12 +1,12 @@
 {
-  "$schema": "https://developer.microsoft.com/json-schemas/fabric/item/report/definition/visualContainer/2.4.0/schema.json",
+  "$schema": "https://developer.microsoft.com/json-schemas/fabric/item/report/definition/visualContainer/2.12.0/schema.json",
   "name": "overview_09",
   "position": {
     "x": 840,
     "y": 200,
     "z": 9,
-    "width": 416,
     "height": 240,
+    "width": 416,
     "tabOrder": 9
   },
   "visual": {
@@ -28,6 +28,7 @@
               },
               "queryRef": "trades.coin",
               "nativeQueryRef": "coin",
+              "active": true,
               "displayName": "Coin"
             }
           ]
@@ -67,8 +68,7 @@
             },
             "direction": "Descending"
           }
-        ],
-        "isDefaultSort": false
+        ]
       }
     },
     "objects": {

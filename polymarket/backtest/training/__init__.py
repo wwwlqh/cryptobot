@@ -5,7 +5,7 @@ consolidation, so ``build_pool.build_grid_pool`` and
 ``checkpoint._build_pool_for_grid`` now raise FileNotFoundError at entry via
 ``pmdata_target.require_snapshot_dir()``. Re-download it with
 ``python -m polymarket.backtest.fetch.pmdata_download`` before any pool rebuild;
-see SOURCES.md and RECOVERY.md.
+see SOURCES.md.
 
 Modules here rebuild the option-3 pool, train/export checkpoint_v1, and retain
 the substrate the sub-minute pipeline needs for reruns — named, not adjectival:
