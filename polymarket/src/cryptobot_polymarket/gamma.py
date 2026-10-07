@@ -1,15 +1,12 @@
-"""Polymarket Gamma API adapter — active market discovery + feeRateBps cache.
+"""Polymarket Gamma API adapter: market discovery and the fee-rate cache.
 
 Endpoint: ``https://gamma-api.polymarket.com``
 
-Security trust boundary (per plan): first-party httpx only, no
-third-party ``polymarket*`` PyPI dependency. CI lints `pyproject.toml`
-to enforce.
+Uses httpx directly, with no third-party ``polymarket*`` package.
 
-`fetch_active_market(coin, interval, window_start_ts)` returns the
-market metadata (`condition_id`, `yes_token_id`, `no_token_id`,
-`fee_rate_bps`). On miss → cached → fetched. fee_rate_bps cache has
-a 6h TTL.
+``fetch_active_market(coin, interval, window_start_ts)`` returns the market
+metadata (``condition_id``, ``yes_token_id``, ``no_token_id``,
+``fee_rate_bps``), from cache when possible. The fee-rate cache has a 6h TTL.
 """
 
 from __future__ import annotations
@@ -27,18 +24,12 @@ import httpx
 logger = logging.getLogger(__name__)
 
 
-# Phase 2: the market/settlement contract (FeeUnknown, the RESOLUTION_*
-# vocabulary, PolymarketResolution, DECISIVE_EPSILON) moved to core
-# (cryptobot.venues.types). FeeUnknown especially MUST be one class object:
-# the pipeline gates with isinstance() venue-agnostically, and predict.fun
-# returns the same sentinel. Re-exported so this module's surface is
-# unchanged; only the FEE_UNKNOWN *instance* is per-venue.
-#
-# These names are IMPORTED, never re-defined here. Phase 2 originally left the
-# old local literals in place below the import, which shadowed all seven of them
-# — the imports were dead and the two copies could drift, so a producer here and
-# a consumer in core could disagree about the same status string with nothing to
-# catch it. Values were proven identical before the duplicates were deleted.
+# The shared market and settlement types (FeeUnknown, the RESOLUTION_* names,
+# PolymarketResolution, DECISIVE_EPSILON) live in cryptobot.venues.types and
+# are re-exported here. They are imported, never redefined: FeeUnknown must be
+# a single class because the pipeline checks it with isinstance(), and one
+# definition keeps producer and consumer agreeing on every status string. Only
+# the FEE_UNKNOWN instance is per venue.
 from cryptobot.venues.types import (  # noqa: F401  re-export
     DECISIVE_EPSILON,
     RESOLUTION_BAD_PAYLOAD,
@@ -79,15 +70,13 @@ def _decode_jsonish(value):
 
 
 # ---------------------------------------------------------------------------
-# A2 latency: in-process per-window market cache.
+# Per-window market cache.
 #
-# A resolved market's IDENTITY (condition_id / token ids / window bounds) is
-# immutable for the lifetime of its window, but fetch_active_market was hit
-# once per qualifying cell per tick — re-resolving the same slug over Gamma
-# dozens-to-hundreds of times per window (worse still at sub-minute
-# checkpoint cadence). Cache SUCCESSFUL resolutions until window_end + a
-# grace; never cache None/FeeUnknown (market may simply not be listed yet —
-# the per-tick retry is the desired behavior).
+# A market's identity (condition_id, token ids, window bounds) never changes
+# during its window, but every qualifying cell looks it up every tick. Cache
+# successful lookups until window_end plus a grace period. Never cache
+# None/FeeUnknown: the market may not be listed yet, and retrying each tick is
+# what we want.
 # ---------------------------------------------------------------------------
 import threading as _threading
 
@@ -206,35 +195,32 @@ def fetch_active_market(
     timeout: float = 3.0,
     now_ts: float | None = None,
 ) -> Optional[PolyMarket] | FeeUnknown:
-    """Resolve the Polymarket *-updown-* market for (coin, interval, window).
+    """Find the Polymarket up/down market for (coin, interval, window).
 
-    Direct slug GET (replaces the previous active-list scan that paginated
-    /markets?active=true&closed=false and filtered client-side — verified
-    2026-05-17 that strategy returns zero updown markets at any offset
-    because the global active list is sorted by volume and the short-window
-    crypto product falls well below the per-page cap).
+    Fetches the market directly by slug. (The global active-markets list is
+    sorted by volume, so paging through it never reaches these short-window
+    markets.)
 
-    Slug convention (confirmed against the live Gamma API):
+    Slug format (as used by the Gamma API):
         ``{coin.lower()}-updown-{interval_min}m-{window_start_ts}``
-    where ``window_start_ts`` is the unix-epoch START of the market window
-    (= the backtest's ``slug_ts``). endDate on the returned market equals
-    ``window_start_ts + interval_min*60`` exactly.
+    where ``window_start_ts`` is the epoch start of the market window (the
+    backtest's ``slug_ts``). The returned market's endDate is exactly
+    ``window_start_ts + interval_min*60``.
 
     Returns:
-      - ``PolyMarket`` on success
-      - ``FEE_UNKNOWN`` sentinel if the market is found but feeRateBps is
-        absent AND no cache + no default is in play (review #52)
-      - ``None`` if the market doesn't exist yet, HTTP fails, or the
-        endDate doesn't match the expected window
+
+      - ``PolyMarket`` on success;
+      - the ``FEE_UNKNOWN`` sentinel if the market exists but has no feeRateBps
+        and there is no cached or default value;
+      - ``None`` if the market does not exist yet, the request fails, or the
+        endDate does not match the expected window.
     """
     if now_ts is None:
         now_ts = time.time()
     window_end_ts = window_start_ts + interval_min * 60
 
-    # A2 latency: market identity is immutable per (coin, interval, window) —
-    # serve repeats from the in-process cache instead of re-resolving the
-    # same slug over Gamma every tick. Only SUCCESSFUL resolutions are
-    # cached; None/FeeUnknown keep the per-tick retry semantics.
+    # Serve repeat lookups from the per-window cache. Only successful lookups
+    # are cached; None/FeeUnknown are retried every tick.
     cached_market = _market_cache_get(coin, interval_min, window_start_ts)
     if cached_market is not None:
         return cached_market
@@ -336,11 +322,10 @@ def fetch_active_market(
         )
         return None
 
-    # Fee resolution. Verified 2026-05-17: every *-updown-* market exposes
-    # feeRateBps=null on Gamma. The actual P&L math uses POLY_FEE_THETA via
-    # the theta-shape formula regardless of this value, so fall back to
-    # the configured default (config.POLY_DEFAULT_FEE_RATE_BPS) and cache it
-    # — R9's fail-closed presence check is satisfied, backtest parity holds.
+    # Every up/down market returns feeRateBps=null on Gamma. PnL math uses
+    # POLY_FEE_THETA regardless, so fall back to
+    # config.POLY_DEFAULT_FEE_RATE_BPS and cache it; that satisfies the
+    # fee-presence check.
     fee_raw = m.get("feeRateBps")
     if fee_raw is None:
         cached = _get_fee_cached(conn, yes_token, now_ts)

@@ -1,38 +1,32 @@
-"""7-gate stack with first-failure short-circuit.
+"""Pre-trade gate stack; the first failing gate decides the skip reason.
 
-Order (carry-forward of brainstorm gate stack plus R-NEW additions):
+Order:
 
-  1. disk         — disk_free_mb >= MIN_DISK_FREE_MB (R39)
-  2. freshness    — spot quote age <= SPOT_STALENESS_S (R8)
-  3. fee          — fee_rate_bps known + > 0 (R9 fail-closed)
-  3b. threshold   — hgb: realized_edge(==pred_edge) >= sleeve.threshold
-                    (inert when sleeve.threshold is None)
-  4. edge         — sleeve.min_edge <= realized_edge <= sleeve.max_edge (D7 order)
-  4b. topup_edge_floor — is_topup only: realized_edge >= TOPUP_EDGE_FLOOR
-                    (2026-07-23 incident; inert for entries)
-  5. partial_ret_z — chunk-CV z bound (inert when both bounds None)
-  6. capital      — bet_size >= MIN_BET_USD (R13 + R-NEW-8 partial-fill case)
-  6b. book_consumption — exp044 hgb: bet_size <= book_depth * book_consumption_max
-                    (inert when sleeve.book_consumption_max is None)
-  7. exposure     — pending + bet_size <= wallet cap (R-NEW-5)
-  8. group_exposure — LIVE-only per-group cap (D-LIVE-2 / D-LIVE-4)
-  9. slot_full    — slot_filled_usd < target_usd (R-NEW-10)
+  1. disk             disk_free_mb >= MIN_DISK_FREE_MB
+  2. freshness        spot quote age <= SPOT_STALENESS_S
+  3. fee              fee_rate_bps known and > 0
+  3b. threshold       pred_edge >= sleeve.threshold (if set)
+  4. edge             sleeve.min_edge <= realized_edge <= sleeve.max_edge
+  4b. topup_edge_floor  top-ups only: realized_edge >= TOPUP_EDGE_FLOOR
+  5. partial_ret_z    optional z bounds (off when both are None)
+  6. capital          bet_size >= MIN_BET_USD
+  6b. book_consumption  bet_size <= book_depth * book_consumption_max (if set)
+  7. exposure         pending + bet_size <= wallet cap
+  8. group_exposure   live only: per-group cap
+  9. slot_full        slot_filled_usd < target_usd
 
-Reason strings match the dashboard vocabulary verbatim per R-NEW-13:
-  SKIP:disk_low / SKIP:stale_spot / SKIP:stale_book / SKIP:fee_unknown /
-  SKIP:edge_below_threshold / SKIP:edge_below_floor / SKIP:edge_above_ceiling /
-  SKIP:topup_edge_below_floor /
-  SKIP:insufficient_capital / SKIP:book_consumption_cap / SKIP:exposure_cap /
-  SKIP:slot_full / SKIP:insufficient_depth /
-  SKIP:fee_band / SKIP:fill_band / SKIP:lut_missing / SKIP:not_entry_minute
+Reason strings match the dashboard's labels exactly, e.g. SKIP:disk_low,
+SKIP:stale_spot, SKIP:stale_book, SKIP:fee_unknown, SKIP:edge_below_threshold,
+SKIP:edge_below_floor, SKIP:edge_above_ceiling, SKIP:topup_edge_below_floor,
+SKIP:insufficient_capital, SKIP:book_consumption_cap, SKIP:exposure_cap,
+SKIP:slot_full, SKIP:insufficient_depth, SKIP:fill_band.
 
-D7 invariant: the edge gate evaluates ``realized_edge = fee_adjusted_edge
-- sleeve.slippage_haircut`` — haircut subtracted BEFORE the
-``min_edge <= edge <= max_edge`` band check. Same order as backtest.
+The edge gate checks ``realized_edge = fee_adjusted_edge -
+sleeve.slippage_haircut``: the haircut is subtracted before the ``min_edge <=
+edge <= max_edge`` check, in the same order as the backtest.
 
-Current live cap denominator: ``wallet_realized_capital * exposure_cap_fraction``.
-This matches dry-run bet sizing, which scales from current realized capital
-instead of a fixed $100 notional.
+The exposure cap is ``wallet_realized_capital * exposure_cap_fraction``,
+scaling with current capital like the bet size does.
 """
 
 from __future__ import annotations
@@ -66,20 +60,18 @@ class GateInput:
     # disk + book
     disk_free_mb: float
     book_top_ask_age_s: float
-    # Total ask-side notional ($) at decision time — sum(price*size) across all
-    # ask levels of the side being bought. Drives the exp044 book_consumption
-    # gate; None on legacy lut|rf|blend ticks (gate inert there).
+    # Total ask-side notional ($) at decision time, sum(price * size) over the
+    # ask levels of the side being bought. Used by the book_consumption gate;
+    # None disables it.
     book_total_ask_depth_usd: Optional[float] = None
     is_topup: bool = False
     exposure_cap_fraction: float = config.SHARED_EXPOSURE_CAP
-    # U4 of the all_4 deploy plan: chunk-CV v6 sleeves may set
-    # partial_ret_z_floor/ceiling. None on the sleeve = gate inert.
-    # None on the input z (when the sleeve sets a bound) = emit
+    # Optional sleeve bounds on partial_ret_z. With no bound on the sleeve the
+    # gate is off; with a bound but no z here it emits
     # partial_ret_z_unavailable.
     partial_ret_z_1h: Optional[float] = None
-    # Per-strategy LIVE deploy group exposure (D-LIVE-2 / D-LIVE-4 / D-LIVE-14).
-    # All optional; when group_cap_usd is None the group_exposure gate is a
-    # no-op (legacy DRY-only paths, ungrouped wallets, test fixtures).
+    # Group exposure inputs. All optional; with group_cap_usd None the
+    # group_exposure gate does nothing (DRY paths, ungrouped wallets, tests).
     mode: str = "DRY"
     group_cap_usd: Optional[float] = None
     group_pending_usd: float = 0.0
@@ -88,10 +80,10 @@ class GateInput:
     # this to cash plus already-funded LIVE pending exposure.
     live_cap_basis_usd: Optional[float] = None
     all_group_caps_sum_usd: float = 0.0
-    # 2026-07-05 backtest-exposure mode (WalletGroup.cap_tracks_equity). When
-    # True, the group's concurrent-exposure ceiling = live equity (cash + funded
-    # pending) instead of the static cap_usd / D-LIVE-4 shrink — so it grows with
-    # the account, matching the backtest. Default False = fixed-cap behavior.
+    # When True (WalletGroup.cap_tracks_equity), the group's exposure ceiling
+    # is live equity (cash plus funded pending) instead of the static cap_usd,
+    # so it grows with the account as in the backtest. False keeps the fixed
+    # cap.
     group_cap_tracks_equity: bool = False
 
 
@@ -120,7 +112,7 @@ def _gate_freshness(inp: GateInput) -> Optional[str]:
 
 
 def _gate_fee(inp: GateInput) -> Optional[str]:
-    # R9 fail-closed. Unknown / NaN / <=0 fee → refuse to bet.
+    # Unknown, NaN or non-positive fee: refuse.
     fee = inp.fee_rate_bps
     if fee is None:
         return "fee_unknown"
@@ -134,11 +126,11 @@ def _gate_fee(inp: GateInput) -> Optional[str]:
 
 
 def _gate_threshold(inp: GateInput) -> Optional[str]:
-    """exp044 HGB threshold gate: ``pred_edge >= sleeve.threshold``.
+    """Threshold gate: ``pred_edge >= sleeve.threshold``.
 
-    Inert for non-hgb sleeves (``threshold`` is None there). For hgb sleeves
-    the score's ``realized_edge`` == ``pred_edge`` (slippage_haircut == 0.0),
-    so this reproduces the backtest's ``test["pred_edge"] >= threshold`` filter.
+    Off when the sleeve has no threshold. For HGB sleeves ``realized_edge``
+    equals ``pred_edge`` (no haircut), so this is the backtest's ``pred_edge >=
+    threshold`` filter.
     """
     thr = getattr(inp.sleeve, "threshold", None)
     if thr is None:
@@ -149,8 +141,8 @@ def _gate_threshold(inp: GateInput) -> Optional[str]:
 
 
 def _gate_edge(inp: GateInput) -> Optional[str]:
-    # Band check: AE8 (edge_above_ceiling) + min_edge floor. D7 order: edge
-    # is already haircut-adjusted before this gate runs.
+    # Band check: edge ceiling and min_edge floor. The edge already includes
+    # the haircut.
     sleeve = inp.sleeve
     if inp.realized_edge < sleeve.min_edge:
         return "edge_below_floor"
@@ -163,15 +155,13 @@ def _gate_edge(inp: GateInput) -> Optional[str]:
 
 
 def _gate_topup_edge_floor(inp: GateInput) -> Optional[str]:
-    """Top-up-only edge floor (config.TOPUP_EDGE_FLOOR, 2026-07-23 incident).
+    """Edge floor for top-ups (config.TOPUP_EDGE_FLOOR).
 
-    A top-up re-prices this tick's edge, and one placed while that recomputed
-    edge sits under the floor contradicts the sizing logic's own claim (live
-    id7: a scale-in top-up filled at realized_edge -0.0119 — the ceiling-only
-    cap could never stop it). Inert for entries (``is_topup`` False) — the
-    sleeve min_edge/threshold gates own those. Strict ``<``, so an edge of
-    exactly the floor passes; the 0.0 default blocks only NEGATIVE-edge
-    top-ups. Venue-independent by construction (no venue input).
+    A top-up re-prices its edge, and placing one whose recomputed edge is below
+    the floor contradicts the sizing logic; the ceiling check alone cannot stop
+    a negative-edge top-up. First entries are not affected (the sleeve min_edge
+    and threshold gates handle those). Strict ``<``, so an edge exactly at the
+    floor passes; the 0.0 default only blocks negative-edge top-ups.
     """
     if not inp.is_topup:
         return None
@@ -181,8 +171,9 @@ def _gate_topup_edge_floor(inp: GateInput) -> Optional[str]:
 
 
 def _gate_partial_ret_z(inp: GateInput) -> Optional[str]:
-    """U4: chunk-CV `partial_ret_z_floor` / `partial_ret_z_ceiling` gate.
-    Inert when both bounds are None on the sleeve."""
+    """Optional ``partial_ret_z_floor`` / ``partial_ret_z_ceiling`` gate; off
+    when both are None on the sleeve.
+    """
     sleeve = inp.sleeve
     floor = getattr(sleeve, "partial_ret_z_floor", None)
     ceiling = getattr(sleeve, "partial_ret_z_ceiling", None)
@@ -199,20 +190,20 @@ def _gate_partial_ret_z(inp: GateInput) -> Optional[str]:
 
 
 def _gate_capital(inp: GateInput) -> Optional[str]:
-    # R-NEW-8: walker returns None on insufficient depth → bet_size=0.
-    # Treat any proposed bet < MIN_BET_USD as insufficient_capital.
+    # The walker returns None when depth is insufficient, giving bet_size=0;
+    # any bet below MIN_BET_USD is insufficient_capital.
     if inp.proposed_bet_size < config.MIN_BET_USD:
         return "insufficient_capital"
     return None
 
 
 def _gate_book_consumption(inp: GateInput) -> Optional[str]:
-    """exp044 per-tick book-consumption cap: bet notional <= depth * frac.
+    """Book-consumption cap: bet notional <= depth * frac.
 
-    Inert for non-hgb sleeves (``book_consumption_max`` is None there). For
-    hgb sleeves the proposed bet may not consume more than ``frac`` of the
-    total ask-side depth on this tick. A missing / non-positive depth means we
-    cannot size against the book — fail closed with ``insufficient_depth``.
+    Off when the sleeve has no ``book_consumption_max``. Otherwise the bet may
+    not take more than ``frac`` of the total ask-side depth at this tick.
+    Missing or non-positive depth means the bet cannot be sized against the
+    book, so fail with ``insufficient_depth``.
     """
     frac = getattr(inp.sleeve, "book_consumption_max", None)
     if frac is None:
@@ -235,8 +226,8 @@ def _gate_exposure(inp: GateInput) -> Optional[str]:
 
 
 def _gate_slot_full(inp: GateInput) -> Optional[str]:
-    # R-NEW-10 + AE-NEW-7. Compare with relative tolerance so float dust
-    # doesn't keep the slot perpetually 0.001 away from full.
+    # Relative tolerance so float dust cannot leave a slot permanently a
+    # fraction of a cent from full.
     target = inp.slot_target_usd
     if target <= 0:
         return None
@@ -246,16 +237,15 @@ def _gate_slot_full(inp: GateInput) -> Optional[str]:
 
 
 def _gate_group_exposure(inp: GateInput) -> Optional[str]:
-    """LIVE-only group cap (D-LIVE-2 / D-LIVE-4 / D-LIVE-14).
+    """Live-only group cap.
 
-    DRY rows skip this gate — the parity shadow never consumes real-money
-    headroom. Ungrouped wallets (group_cap_usd None) also skip.
+    DRY rows skip this gate, since a dry run uses no real money. Ungrouped
+    wallets (group_cap_usd None) skip it too.
 
-    Effective cap shrinks proportionally when the live cap basis drops below
-    SUM(all_group_caps): each group's share of the available basis is
-    `cap_usd / SUM(all_group_caps) x live_cap_basis`. In live routing, the
-    basis includes cash plus already-funded LIVE pending exposure; legacy
-    callers fall back to raw live funder balance.
+    The cap shrinks proportionally when the live cap basis falls below the sum
+    of all group caps: each group gets ``cap_usd / SUM(all_group_caps) *
+    live_cap_basis``. The basis is cash plus already-funded live pending
+    exposure, falling back to the raw funder balance for older callers.
     """
     if inp.mode != "LIVE":
         return None
@@ -269,14 +259,14 @@ def _gate_group_exposure(inp: GateInput) -> Optional[str]:
         else inp.live_wallet_balance_usd
     )
     if inp.group_cap_tracks_equity:
-        # Backtest-exposure mode: ceiling = live equity (grows with the account);
-        # no D-LIVE-4 shrink. static_cap is only the fallback if the balance fetch
-        # failed — and funder_balance_unknown already blocks that tick.
+        # Equity-tracking mode: the ceiling is live equity, with no
+        # proportional shrink. static_cap is only a fallback if the balance
+        # fetch failed, and funder_balance_unknown already blocks that tick.
         effective_cap = max(0.0, float(live_basis)) if live_basis is not None else static_cap
     else:
         effective_cap = static_cap
-        # NOTE: a cap_tracks_equity group sets all_group_caps_sum_usd to 0
-        # (funder floor retired), so this shrink stays inert for it by design.
+        # A cap_tracks_equity group contributes 0 to all_group_caps_sum_usd, so
+        # this shrink never applies to it.
         if live_basis is not None and inp.all_group_caps_sum_usd > 0:
             share = static_cap / float(inp.all_group_caps_sum_usd)
             scaled = max(0.0, float(live_basis)) * share

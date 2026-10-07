@@ -1,59 +1,55 @@
-"""WS book-mirror STALL WATCHDOG — the gray-zone detector for a connected but
-silent subscription (operator order, 2026-08-06).
+"""WS book-mirror stall watchdog: detects a subscription that is connected but
+has stopped updating one token.
 
-Why this exists
----------------
-The entry path reads books WS-mirror-first. The mirror's freshness cap was
-lifted on the live box (``CRYPTOBOT_BOOK_WS_MAX_AGE_MS`` pinned to 600000 in
-``polymarket/infra/install_remote.sh``) because on the ``*-updown-*`` books a
-large snapshot age is market QUIETNESS, not feed lag — a real ladder can legally
-hold for minutes, and capping age just spent REST round-trips to re-learn the
-same book. Two of the three failure modes were already covered:
+Why
+---
+The entry path reads books from the WS mirror first, and the live deploy sets
+no freshness cap (``CRYPTOBOT_BOOK_WS_MAX_AGE_MS=600000`` in
+``polymarket/infra/install_remote.sh``): on up/down books a large snapshot age
+usually means a quiet market, not a lagging feed, and capping it only spent
+REST calls re-reading the same book. Two failure modes are already handled:
 
-  * connection death → ``_clear_cache`` wipes the mirror, ``get`` serves None;
-  * a rolled-off window's token → evicted by ``note_tokens`` (2026-07-25).
+  * the connection dies: ``_clear_cache`` empties the mirror and ``get``
+    serves None;
+  * a window's token rolls off: ``note_tokens`` evicts it.
 
-The residual, explicitly accepted, is the gray zone in between: the socket stays
-CONNECTED (recv-liveness is re-stamped by pings and by other tokens' frames) but
-updates for ONE subscribed token silently stop. The mirror cannot tell that book
-from a quiet one, so it would price a dead ladder until the window rolls.
+What remains is a socket that stays connected (pings and other tokens' frames
+keep it marked live) while updates for one token stop. The mirror cannot tell
+that book from a quiet one and would keep pricing it until the window ends.
 
-The detector must not give back the ~0ms hot path, so it is out-of-band: a
-daemon-side scheduler job that cross-checks only SUSPECT tokens against REST,
-never the tick.
+The check must not slow the hot path, so it runs as a separate scheduler job
+that checks only suspect tokens against REST.
 
-Shape
------
-Every ``CRYPTOBOT_BOOK_WS_WATCHDOG_INTERVAL_S`` (default 5s), on a
-scheduler-pool thread:
+How
+---
+Every ``CRYPTOBOT_BOOK_WS_WATCHDOG_INTERVAL_S`` (default 5s), on a scheduler
+thread:
 
-  1. take the mirror's serving set and compute each snapshot's VENUE-clock age;
-  2. keep tokens older than ``STALL_SUSPECT_MS`` (default 5000) that are not
-     suppressed by a recent verify (see below), oldest first, at most
+  1. take the mirror's cached books and each one's venue-clock age;
+  2. keep tokens older than ``STALL_SUSPECT_MS`` (default 5000) that were not
+     recently verified (see below), oldest first, at most
      ``MAX_TOKENS_PER_PASS`` (default 4);
-  3. ONE batch REST book fetch for that set (one rate-limit token regardless of
-     count — ``fetch_books_batch``);
-  4. compare top-of-book: price EXACT, size within ``SIZE_REL_TOL``
-     (``venues.shadow_book.top_of_book_matches``, shared so the watchdog and the
-     shadow comparator read snapshots the same way);
-  5. MATCH → stamp "verified at now"; MISMATCH → evict from the mirror + count +
-     log WARNING. The mirror re-populates the token on its next full ``book``
-     frame.
+  3. fetch them in one batch REST call (``fetch_books_batch``, one
+     rate-limit token);
+  4. compare top of book: price exactly, size within ``SIZE_REL_TOL``
+     (``venues.shadow_book.top_of_book_matches``, shared with the shadow
+     comparator);
+  5. match: mark verified now. Mismatch: evict from the mirror, count, and
+     log a WARNING. The mirror rebuilds the token from its next full
+     ``book`` frame.
 
-Verify TTL — a quiet-but-correct book must not be re-fetched every 5s, or the
-watchdog just re-creates the REST cost it was meant to avoid. A verified token
-is re-checked only once ``VERIFY_TTL_MS`` (default 30000) has passed OR new ws
-activity has landed since the verify (a newer snapshot ts) and the book has gone
-quiet again.
+Verify TTL: a quiet but correct book must not be re-fetched every 5s, or the
+watchdog recreates the REST cost it is meant to avoid. A verified token is
+re-checked only after ``VERIFY_TTL_MS`` (default 30000), or once it has updated
+since the check and gone quiet again.
 
-Fail-open everywhere. A REST error/timeout (``None`` return), a token the venue
-omitted, a mirror without the watchdog API, or ANY exception in a pass is a
-silent skip: the watchdog never evicts on a failed verify and never raises into
-the scheduler. It places no orders, gates nothing, and touches no DB.
+Fails open: a REST error or timeout (``None``), a token missing from the
+response, a mirror without the watchdog methods, or any exception in a pass is
+skipped silently. It never evicts on a failed check, never raises into the
+scheduler, places no orders, gates nothing and writes nothing to the database.
 
-REST budget, steady state: at most ONE POST /books per pass = 12/min at the
-default 5s cadence, covering at most 4 tokens — bounded and independent of how
-many books are quiet.
+REST cost: at most one ``POST /books`` per pass (12 per minute at 5s), covering
+at most 4 tokens, however many books are quiet.
 """
 
 from __future__ import annotations

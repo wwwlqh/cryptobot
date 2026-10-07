@@ -1,25 +1,21 @@
-"""Periodic CLOB ↔ chain ↔ ledger wallet reconciliation.
+"""Periodic CLOB / chain / ledger wallet reconciliation.
 
-Per the 2026-05-24-001 per-strategy LIVE deploy plan §U7 / D-LIVE-9:
+  * ``WalletReconciler.sample(conn)`` records the live funder's CLOB pUSD
+    balance, open orders and open positions, optionally checks the balance
+    against the on-chain pUSD ERC20 balance over Polygon RPC, and writes it
+    all to ``wallet_reconciliation_runs`` plus per-record rows in
+    ``wallet_reconciliation_records``.
+  * A CLOB-vs-chain difference above ``LIVE_BALANCE_TOLERANCE_USD`` is a
+    warning in the run's ``warnings_json``, never a halt; it shows on the
+    dashboard's reconciliation card.
+  * Each open CLOB position is matched to live PENDING ledger rows by
+    (token_id, side, size). Mismatches become ``orphan_clob`` or
+    ``orphan_ledger`` records, highlighted on the wallet card.
+  * Every successful run appends a ``bankroll_peak`` row for the
+    peak-equity chart and the drawdown halt.
 
-  * `WalletReconciler.sample(conn)` snapshots the live funder's CLOB pUSD
-    balance + open orders + open positions, optionally cross-checks
-    against the on-chain pUSD ERC20 balance via Polygon RPC, and writes
-    everything into `wallet_reconciliation_runs` + per-record rows in
-    `wallet_reconciliation_records`.
-  * Disagreements (CLOB-vs-chain delta > `LIVE_BALANCE_TOLERANCE_USD`)
-    surface as warnings on the run's `warnings_json` — NEVER a halt.
-    Operator sees the warning on the dashboard's reconciliation card and
-    decides whether to investigate.
-  * Each open CLOB position is matched against LIVE PENDING ledger rows
-    by (token_id, side, size). Mismatches surface as `orphan_clob` or
-    `orphan_ledger` records that the dashboard's wallet card highlights.
-  * A `bankroll_peak` row is appended on every successful run so the
-    dashboard's peak-equity chart + the drawdown halt have a fresh snapshot.
-
-The Polygon RPC client is optional and injected by the caller. When
-absent (Phase 1 boot path or CI), `chain_balance_usd` is left NULL and
-the CLOB-only path still produces a useful audit row.
+The Polygon RPC client is optional. Without it ``chain_balance_usd`` stays NULL
+and the CLOB-only run is still a useful audit row.
 """
 
 from __future__ import annotations
@@ -102,23 +98,21 @@ class ReconciliationRun:
 
 
 class WalletReconciler:
-    """Snapshot the live funder's CLOB + chain state and write a run row.
+    """Record the live funder's CLOB and chain state as a run row.
 
-    Phase 2 (this unit) ships the class; Phase 2's
-    `scheduler/wallet_recon.py` wires `sample(conn)` to an APScheduler job
-    that fires every `WALLET_SNAPSHOT_INTERVAL_MINUTES` (default 10).
+    A scheduler job calls ``sample(conn)`` every
+    ``WALLET_SNAPSHOT_INTERVAL_MINUTES`` (default 10).
 
-    Constructor injects three dependencies so tests can substitute stubs:
+    Dependencies are injected so tests can stub them:
 
-      * `order_client` — required. Must expose `check_balance()`,
-        `_client.get_open_orders()` (delegated through), and either
-        `_client.get_open_positions()` or an equivalent helper.
-      * `chain_balance_fetcher` — optional callable `() -> float | None`
-        that returns the on-chain pUSD balance for `funder_address`. When
-        None, chain reconciliation is skipped and the run still produces
-        a useful CLOB-only audit row.
-      * `funder_address` — the deposit wallet whose state we're sampling.
-        Pulled from `Config.poly_funder` in production.
+      * ``order_client``: required. Must provide ``check_balance()``,
+        ``_client.get_open_orders()`` and either
+        ``_client.get_open_positions()`` or an equivalent.
+      * ``chain_balance_fetcher``: optional ``() -> float | None`` returning the
+        on-chain pUSD balance of ``funder_address``. Without it the chain check
+        is skipped.
+      * ``funder_address``: the deposit wallet being sampled
+        (``Config.poly_funder`` in production).
     """
 
     def __init__(
@@ -141,16 +135,14 @@ class WalletReconciler:
     # ---- public entry point ---------------------------------------------
 
     def sample(self, conn: sqlite3.Connection) -> ReconciliationRun:
-        """One-shot snapshot. Always writes a run row, even when CLOB is
-        unreachable — the row's `source_status` carries the failure mode.
+        """Take one snapshot. Always writes a run row, even if the CLOB is
+        unreachable (``source_status`` records why).
 
-        Reliability finding #1 (REL-06/REL-08): the scheduler job that
-        wraps this in `db_write_lock` previously held the lock through
-        every CLOB HTTP call (up to 30s per call x 3 calls = 90s),
-        blocking `_lut_reload_job` and `_on_job_missed` writes for the
-        entire window. `fetch_external_state` does the network work
-        with no DB access; `persist_run` does only DB writes. Callers
-        wrap only `persist_run` in the lock."""
+        ``fetch_external_state`` does the network calls (up to 30s each)
+        without touching the database, and ``persist_run`` only writes. Callers
+        hold ``db_write_lock`` around ``persist_run`` alone, so other jobs are
+        not blocked during the HTTP calls.
+        """
         fetched = self.fetch_external_state()
         return self.persist_run(conn, fetched)
 
@@ -265,10 +257,9 @@ class WalletReconciler:
         )
 
     def _fetch_clob_positions(self) -> Optional[list[dict[str, Any]]]:
-        """Best-effort open-positions fetch. The CLOB exposes positions via
-        the Data API; the OrderClient may or may not surface a helper. Phase
-        2 ships the lookup as best-effort — Phase 3 (U13) can extend the
-        OrderClient with a first-class positions method if needed."""
+        """Best-effort open-positions fetch. Positions come from the Data API,
+        and the OrderClient may or may not expose a helper for it.
+        """
         return self._fetch_clob_list(
             ("get_positions", "open_positions", "list_positions")
         )
@@ -302,7 +293,7 @@ class WalletReconciler:
 
         partial = clob_balance is None or clob_orders is None or clob_positions is None
 
-        # Drift check (D-LIVE-9) — best-effort, warn but don't halt.
+        # Balance drift check: warn, never halt.
         if (
             clob_balance is not None
             and chain_balance is not None

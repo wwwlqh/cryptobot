@@ -1,46 +1,31 @@
-"""Polymarket CLOB ask/bid snapshot via REST.
+"""Polymarket CLOB order books over REST.
 
 Endpoint: ``https://clob.polymarket.com/book?token_id=<id>``
 
-Stores the full asks/bids sorted ascending PLUS ``total_ask_depth_usd``,
-the dollar depth of the whole ask book — needed by the exp044
-``book_consumption_max`` gate for parity with the backtest's full-book
-``up_depth_l2``. ``walk_book._sorted_asks`` re-sorts defensively downstream,
-but this adapter pre-sorts so logs are easier to read.
+Keeps the full asks and bids, sorted ascending, plus ``total_ask_depth_usd``
+(dollar depth of the whole ask side), which the ``book_consumption_max`` gate
+needs to match the backtest's full-book depth. ``walk_book._sorted_asks``
+re-sorts anyway; sorting here makes logs easier to read.
 
-Book freshness is NOT observable on this path (audit w19oxqf24 #12)
-------------------------------------------------------------------
-The ``/book`` REST payload carries no usable server-side liveness signal: we
-parse only ``asks`` and ``bids`` (price/size levels). There is no sequence
-number and no content hash we trust, so ``BookSnapshot.fetched_at_ts`` is set
-to the CALLER's ``now_ts`` — the LOCAL fetch time, not when the book itself
-last changed on the venue. Consequently the downstream gates.py
-``book_top_ask_age_s = now_ts - fetched_at_ts`` is effectively always ~0 and
-the ``BOOK_STALENESS_S`` gate is a NO-OP for the REST path: a stale-but-
-populated Polymarket book cannot be detected here.
+Book age cannot be observed on this path
+----------------------------------------
+The ``/book`` response has no usable liveness signal (no sequence number, no
+trusted hash), so ``BookSnapshot.fetched_at_ts`` is our local fetch time,
+``book_top_ask_age_s`` is always ~0, and ``BOOK_STALENESS_S`` cannot catch a
+stale REST book.
 
-We deliberately do NOT stamp ``fetched_at_ts`` from any first-seen / unchanged-
-book heuristic. Unlike a frozen spot price (which is unambiguously a dead
-feed — see ``data.binance`` audit #2), an order book that is byte-for-byte
-unchanged across fetches is NORMAL for a quiet/illiquid 15m crypto market and
-is NOT evidence of staleness; faking an age off "unchanged contents" would trip
-``BOOK_STALENESS_S`` on perfectly live books and suppress legitimate bets. The
-honest fix is to document the gap so the false sense of protection is removed
-at the source. Real book-liveness detection requires the WebSocket book feed
-(deferred below), which exposes monotonic update sequencing. TODO(audit #12):
-wire book staleness off the WS sequence/timestamp once that feed lands.
+An unchanged book is not evidence of staleness either: quiet markets often
+return the same book on every fetch, so deriving an age from "unchanged
+contents" would block bets on perfectly live books. Real book age comes from
+the WebSocket mirror (``ws_mirror``), which carries venue timestamps.
 
-Rate-limit defense (per plan):
-  - per-IP token bucket (12 req/s, 12-token burst) on the single-token path
-  - A2 latency: the orchestrator now collects every qualifying cell's token
-    ids and issues ONE ``POST /books`` batch round trip per tick
-    (``fetch_books_batch``) — one request and one rate-limit token
-    regardless of book count. The per-token ``fetch_top_book`` GET remains
-    as the fallback path. (A previous docstring here claimed a 167ms
-    inter-call stagger — that was never implemented; calls were plain
-    sequential blocking GETs.)
+Rate limiting:
 
-WebSocket book feed is deferred (per "Deferred for later").
+  - a per-IP token bucket (12 req/s, burst 12) on the single-token GET;
+  - the tick collects every token it needs and makes one ``POST /books``
+    batch call (``fetch_books_batch``), one request and one rate-limit token
+    however many books; the per-token ``fetch_top_book`` GET is the
+    fallback.
 """
 
 from __future__ import annotations
@@ -50,11 +35,9 @@ import time
 
 import httpx
 
-# Phase 2: the book DTO + rate limiter are the SHARED venue contract and now
-# live in core (cryptobot.venues.types) — core's pipeline/scale_in/held_position_pass
-# and the predict.fun adapter all need them, and defining them here made both
-# depend on this package. Re-exported so this module's public surface is
-# unchanged and there is still exactly ONE BookSnapshot class object.
+# The book DTO and rate limiter are shared venue types in
+# cryptobot.venues.types; re-exported here so there is still exactly one
+# BookSnapshot class.
 from cryptobot.venues.types import BookSnapshot, TokenBucket  # noqa: F401
 
 logger = logging.getLogger(__name__)
@@ -101,15 +84,12 @@ def fetch_top_book(
     bucket: TokenBucket | None = None,
     now_ts: float | None = None,
 ) -> BookSnapshot | None:
-    """Return the full sorted ask + bid snapshot for a token.
+    """Return the full sorted ask and bid snapshot for a token.
 
-    Returns None on rate-limit, HTTP error, or empty book.
+    Returns None on rate limit, HTTP error or an empty book.
 
-    NOTE (audit w19oxqf24 #12): ``BookSnapshot.fetched_at_ts`` is stamped with
-    ``now_ts`` — the LOCAL fetch time, not a book-liveness timestamp. The
-    ``/book`` payload exposes no trustworthy server sequence/hash, so the
-    downstream ``book_top_ask_age_s`` gate cannot detect a stale-but-populated
-    book on this REST path (it always sees age ~0). See the module docstring.
+    ``BookSnapshot.fetched_at_ts`` is ``now_ts``, the local fetch time, so a
+    stale REST book cannot be detected from its age (see the module docstring).
     """
     bucket = bucket or _default_bucket
     if not bucket.take(1):
@@ -180,22 +160,19 @@ def fetch_books_batch(
     bucket: TokenBucket | None = None,
     now_ts: float | None = None,
 ) -> dict[str, BookSnapshot] | None:
-    """A2 latency: fetch EVERY token's book in ONE ``POST /books`` round trip.
+    """Fetch every token's book in one ``POST /books`` call.
 
-    Wire format verified against py_clob_client_v2 1.0.1
-    (``get_order_books`` → ``POST {CLOB_BASE}/books`` with body
-    ``[{"token_id": <id>}, ...]``; response items carry ``asset_id`` +
-    ``asks``/``bids`` level lists). We issue the POST first-party on the
-    persistent httpx client — same trust boundary as ``fetch_top_book`` —
-    so the read path stays off the signing client.
+    Same wire format as py_clob_client_v2's ``get_order_books`` (body
+    ``[{"token_id": <id>}, ...]``; each response item has ``asset_id`` and
+    ``asks``/``bids``). Sent on our own persistent httpx client, so reads stay
+    off the signing client.
 
-    Returns ``{token_id: BookSnapshot}`` for tokens the venue returned with
-    a non-empty ask book (absent/empty tokens are simply missing — same
-    semantics as ``fetch_top_book`` returning None for them). Returns
-    ``None`` on transport/HTTP/parse error so the caller can fall back to
+    Returns ``{token_id: BookSnapshot}`` for tokens with a non-empty ask side
+    (others are just missing, as if ``fetch_top_book`` had returned None), or
+    ``None`` on a transport, HTTP or parse error so the caller can fall back to
     per-token GETs.
 
-    One batch consumes ONE rate-limit token regardless of book count.
+    One batch uses one rate-limit token however many books it covers.
     """
     ids = [str(t) for t in token_ids if t]
     if not ids:

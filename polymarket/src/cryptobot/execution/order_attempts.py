@@ -1,36 +1,31 @@
-"""Durable LIVE order-attempt reservation (D-LIVE-28).
+"""Durable reservation of live order attempts.
 
-Per the 2026-05-24-001 per-strategy LIVE deploy plan §U5 / §U6:
-
-A LIVE order is NEVER submitted to Polymarket until the bot has durably
-written a local `live_order_attempts` row carrying a unique
-`client_order_id`. The CLOB call happens OUTSIDE the SQLite write
-transaction so a crash between the SUBMITTING write and the network
-return leaves a recoverable artifact for the reconciler (U7).
+A live order is never sent to Polymarket until a ``live_order_attempts`` row
+with a unique ``client_order_id`` has been written. The CLOB call happens
+outside the SQLite transaction, so a crash between the SUBMITTING write and the
+network reply leaves a row the reconciler can recover.
 
 Lifecycle:
 
-  1. `reserve_live_order_attempt(conn, signal, wallet_group)` — INSERT row
-     with `status='SUBMITTING'`, `client_order_id=uuid4().hex`,
-     `ledger_id=NULL`. The active-slot partial unique index prevents two
-     concurrent attempts on the same slot — a parallel writer surfaces
-     as an `IntegrityError`.
+  1. ``reserve_live_order_attempt(conn, signal, wallet_group)``: insert a
+     row with ``status='SUBMITTING'``, ``client_order_id=uuid4().hex`` and
+     ``ledger_id=NULL``. The active-slot partial unique index stops two
+     concurrent attempts on one slot (the second gets ``IntegrityError``).
 
-  2. `mark_attempt_submitted(conn, attempt_id, live_order_id)` — after the
-     CLOB accepts the order. Carries the CLOB-side `order_id` forward.
+  2. ``mark_attempt_submitted(conn, attempt_id, live_order_id)``: the CLOB
+     accepted the order; store its ``order_id``.
 
-  3. `link_attempt_to_ledger(conn, attempt_id, ledger_id)` — after
-     `record_bet` writes the LIVE row. Status transitions to `LINKED` and
-     the active-slot reservation is released (LINKED is outside the
-     partial index predicate).
+  3. ``link_attempt_to_ledger(conn, attempt_id, ledger_id)``: ``record_bet``
+     wrote the ledger row. Status becomes ``LINKED``, which falls outside the
+     partial index, releasing the slot.
 
-  4. `mark_attempt_failed(conn, attempt_id, error_kind, error)` — terminal
-     failure path (auth, insufficient_funds, market_closed). Also releases
-     the active-slot reservation.
+  4. ``mark_attempt_failed(conn, attempt_id, error_kind, error)``: terminal
+     failure (auth, insufficient_funds, market_closed). Also releases the
+     slot.
 
-The group-cap gate (D-LIVE-14) counts `SUBMITTING` + `SUBMITTED` rows
-where `ledger_id IS NULL` toward pending group exposure, so a reserved
-attempt blocks duplicate slot submission across ticks.
+The group-cap gate counts ``SUBMITTING`` + ``SUBMITTED`` rows with ``ledger_id
+IS NULL`` as pending exposure, so a reserved attempt blocks a duplicate order
+on the same slot in a later tick.
 """
 
 from __future__ import annotations
@@ -66,27 +61,21 @@ ACTIVE_STATUSES: frozenset[str] = frozenset({SUBMITTING, SUBMITTED})
 
 
 # ---------------------------------------------------------------------------
-# Placement epoch — the "something was reserved/placed" invalidation signal.
+# Placement epoch: bumped on every reservation.
 #
-# Read by `execution.pipeline._FastCommitStage` (clause 1): ANY reservation in
-# this process invalidates every cached commit-stage preamble, because a
-# SUBMITTING row with `ledger_id IS NULL` counts toward group pending exposure
-# (`capital.get_group_state`) while the OTHER invalidation signal —
-# `capital.ledger_version` — aggregates the `ledger` table only, so it does not
-# move until the bet's own `record_bet` lands one venue round trip later, and
-# never at all when the POST fails.
+# ``execution.pipeline._FastCommitStage`` caches commit-stage state and must
+# drop it when anything is reserved. A SUBMITTING row with ``ledger_id IS
+# NULL`` already counts toward group pending exposure
+# (``capital.get_group_state``), but ``capital.ledger_version`` only watches
+# the ``ledger`` table, which does not change until ``record_bet`` lands one
+# round trip later, or never if the POST fails.
 #
-# It lives HERE, in the leaf module every reservation funnels through, and is
-# bumped by `reserve_live_order_attempt` itself, so a new reservation site
-# cannot forget it. That is not hypothetical: the T3 scale-in top-up
-# (`execution.scale_in`) reserves without going through pipeline.py and cannot
-# import it (pipeline -> held_position_pass -> scale_in is already a chain), so a bump
-# written at each CALL SITE left exactly one path consuming group-cap pending
-# while every cached commit-stage view still said it had not.
+# It lives here, in the module every reservation goes through, and
+# ``reserve_live_order_attempt`` bumps it itself, so a new caller cannot forget
+# to.
 #
-# `itertools.count` instead of `+= 1` because `next()` on it is atomic in
-# CPython: a lost read-modify-write update would be a MISSED invalidation,
-# which is the one failure mode this counter exists to prevent.
+# ``itertools.count`` rather than ``+= 1`` because ``next()`` on it is atomic
+# in CPython; a lost update would be a missed invalidation.
 # ---------------------------------------------------------------------------
 
 
@@ -155,12 +144,11 @@ def make_client_order_id() -> str:
 
 
 def _signal_payload(signal: "BetSignal") -> str:
-    """Serialize a BetSignal to JSON for crash-recovery.
+    """Serialize a BetSignal to JSON for crash recovery.
 
-    Stored on the attempt row so the reconciler (U7) can reconstruct the
-    bet's intent when the process crashed between CLOB submit and ledger
-    write. We use `dataclasses.asdict` for a stable representation;
-    Optional fields are preserved as JSON `null`.
+    Stored on the attempt row so the reconciler can rebuild the bet if the
+    process crashed between the CLOB submit and the ledger write. Uses
+    ``dataclasses.asdict``; Optional fields become JSON ``null``.
     """
     try:
         return json.dumps(asdict(signal), sort_keys=True, default=str)
@@ -389,11 +377,11 @@ def get_attempt(conn: sqlite3.Connection, attempt_id: int) -> Optional[LiveOrder
 def get_attempt_signal_json(
     conn: sqlite3.Connection, attempt_id: int
 ) -> Optional[str]:
-    """Return the raw `signal_json` persisted on the attempt row, or None.
+    """Return the ``signal_json`` stored on the attempt row, or None.
 
-    The reconciler (U7 / audit P0 #2) deserializes this back into a
-    BetSignal to reconstruct the LIVE ledger row when the process crashed
-    between the CLOB fill and `record_bet`."""
+    The reconciler turns it back into a BetSignal to rebuild the live ledger
+    row after a crash between the fill and ``record_bet``.
+    """
     row = conn.execute(
         "SELECT signal_json FROM live_order_attempts WHERE id=?",
         (attempt_id,),
@@ -407,9 +395,9 @@ def get_attempt_signal_json(
 def stale_active_attempts(
     conn: sqlite3.Connection, *, older_than_seconds: int
 ) -> list[LiveOrderAttempt]:
-    """Return SUBMITTING/SUBMITTED rows older than `older_than_seconds`
-    with `ledger_id IS NULL`. Reconciler (U7) feeds these to a CLOB
-    lookup-by-client-order-id or by-funder/token recovery query."""
+    """Return SUBMITTING/SUBMITTED rows older than ``older_than_seconds`` with
+    ``ledger_id IS NULL``, for the reconciler to look up on the CLOB.
+    """
     rows = conn.execute(
         f"""
         SELECT id, created_at, updated_at, wallet_id, wallet_group, mode, coin, sleeve,
