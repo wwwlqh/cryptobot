@@ -1,20 +1,20 @@
 """Edge-preserving order book walker.
 
-Direct port of hightempbot/execution/order.py:142-294 — algorithm and
-break-condition semantics preserved verbatim. The only cryptobot-specific
-change is the call site default for ``max_walk_price`` — see R-NEW-6:
-strictly add an absolute 5 cents to the anchor price (NOT 5%).
+The cap is an absolute amount added to the anchor price (5 cents by default,
+not 5%).
 
-The walker is consulted by:
-  - the initial-fill path (anchor = scanner-time top_ask)
-  - the add-on top-up path (anchor = slot's first-fill entry_top_price —
-    the sticky cap pattern from R-NEW-9)
+Used for:
 
-Returns ``None`` on any of:
-  - no asks
-  - non-finite/negative input
-  - no fill that satisfies the edge floor reaches ``min_bet_usd``
-  - ``max_walk_price`` is set but the book has no finite top to anchor against
+  - first entries (anchor = top ask at decision time);
+  - top-ups (anchor = the slot's first-fill price, so the cap does not drift
+    with the book).
+
+Returns ``None`` when:
+
+  - there are no asks;
+  - an input is non-finite or negative;
+  - no fill that keeps the edge floor reaches ``min_bet_usd``;
+  - ``max_walk_price`` is set but the book has no finite top to anchor to.
 """
 
 from __future__ import annotations
@@ -102,24 +102,22 @@ def walk_book_edge_preserving(
     walk_anchor_price: float | None = None,
     return_levels: bool = False,
 ) -> Optional[WalkResult]:
-    """Walk asks up to ``target_usd`` while preserving ``min_edge``.
+    """Walk asks up to ``target_usd`` while keeping ``min_edge``.
 
-    Two independent break conditions, whichever fires first wins:
-      1. **Edge floor:** the hypothetical post-consume VWAP edge drops below
-         ``min_edge`` — accept the smaller fill at tighter edge rather than
-         over-pay for depth the signal can't support.
-      2. **Price-walk cap:** the level's price strictly exceeds
-         ``walk_anchor_price + max_walk_price`` (or, when no anchor is
-         supplied, the cheapest finite ask in the book + ``max_walk_price``).
-         A level priced *exactly* at the cap is still consumable.
+    Two stopping conditions; whichever comes first wins:
 
-    The ``walk_anchor_price`` argument is how top-ups stick the cap to the
-    first-fill anchor across book drift (per R-NEW-9). Without it the cap
-    drifts with each tick's fresh top, silently violating the operator's
-    "5-cent leash from where I decided" intent.
+      1. Edge floor: the VWAP edge after taking the next level would fall below
+         ``min_edge``. Take the smaller fill at the better edge rather than pay
+         for depth the signal does not support.
+      2. Price cap: the level's price is above ``walk_anchor_price +
+         max_walk_price`` (or, with no anchor, the cheapest ask +
+         ``max_walk_price``). A level exactly at the cap can still be taken.
 
-    Returns ``(filled_usd, filled_shares, filled_vwap, limit_price, realized_edge)``
-    by default, or appends ``fill_levels`` when ``return_levels=True``.
+    ``walk_anchor_price`` lets top-ups keep the cap at the first fill's anchor
+    as the book moves; without it the cap would follow each tick's top ask.
+
+    Returns ``(filled_usd, filled_shares, filled_vwap, limit_price,
+    realized_edge)``, plus ``fill_levels`` when ``return_levels=True``.
     """
     # NaN / non-finite inputs poison comparisons (NaN < x is always False),
     # which would let the walker eat an arbitrarily bad book while still

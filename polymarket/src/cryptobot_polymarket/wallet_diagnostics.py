@@ -1,19 +1,17 @@
 """Polymarket wallet smoke checks.
 
-Per the 2026-05-24-001 per-strategy LIVE deploy plan §U11a:
-
   python -m cryptobot_polymarket.wallet_diagnostics --probe-clob
   python -m cryptobot_polymarket.wallet_diagnostics --probe-chain
 
-`--probe-clob` instantiates OrderClient against the live POLY_* creds
-and prints the funder's pUSD balance. `--probe-chain` reads the same
-balance via Polygon RPC (when `POLYGON_RPC_URL` is set; otherwise
-prints `chain_balance=skipped`).
+``--probe-clob`` builds an OrderClient from the POLY_* credentials and prints
+the funder's pUSD balance. ``--probe-chain`` reads the same balance over
+Polygon RPC (with ``POLYGON_RPC_URL`` set; otherwise prints
+``chain_balance=skipped``).
 
 Exit codes:
-  0 — probe succeeded
-  1 — CLOB or chain unreachable
-  2 — credential / config error (caught by the boot gate)
+  0  probe succeeded
+  1  CLOB or chain unreachable
+  2  credential or config error
 """
 
 from __future__ import annotations

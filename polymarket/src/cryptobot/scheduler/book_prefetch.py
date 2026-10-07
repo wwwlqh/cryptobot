@@ -1,24 +1,19 @@
-"""A8 latency: order-book prefetch-ahead thread.
+"""Order-book prefetch thread.
 
-The decision path pays one inline batch ``POST /books`` round-trip (~30-50ms)
-in ``pipeline._resolve_net_cells`` pass 2. The token set it needs is stable
-within a resolution window (YES/NO ids per active market), so a background
-thread can re-fetch the batch for the PREVIOUS tick's token set ``lead_ms``
-before each second boundary and let the tick read the snapshots from a local
-cache instead.
+The tick otherwise makes one inline ``POST /books`` call (~30-50ms) in
+``pipeline._resolve_net_cells``. The token set is stable within a window, so a
+background thread re-fetches the previous tick's tokens ``lead_ms`` before each
+second boundary and the tick reads them from cache.
 
-Freshness contract: a cached snapshot is served only when it is younger than
-``max_age_ms`` at decision time (``BookSnapshot.fetched_at_ts`` is the LOCAL
-fetch wall-clock). With the default lead 150ms / max-age 700ms the tick scores
-books at most ~lead_ms older than the inline fetch would have produced —
-comparable to that fetch's own in-flight time. Tokens missing from the cache
-(first tick of a window, prefetch failure, staleness) fall through to the
-inline batch exactly as today, so the kill switch and the failure mode are
-both "the legacy behavior".
+A cached book is only used if younger than ``max_age_ms`` at decision time
+(``BookSnapshot.fetched_at_ts`` is the local fetch time). With the defaults
+(lead 150ms, max age 700ms) the tick sees books at most ~lead_ms older than an
+inline fetch would return. Missing tokens (first tick of a window, failed or
+stale prefetch) fall back to the inline fetch, which is also what turning this
+off does.
 
-The thread is a daemon (same lifecycle as ``spot_prefetch.SpotPrefetcher``)
-and is best-effort: any exception marks that boundary's prefetch missed and
-the tick pays the inline fetch.
+The thread is a daemon (like ``spot_prefetch.SpotPrefetcher``) and best-effort:
+an exception just means the tick fetches inline.
 """
 
 from __future__ import annotations

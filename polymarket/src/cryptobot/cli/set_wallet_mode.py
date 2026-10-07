@@ -1,20 +1,17 @@
-"""Scripted DRY/LIVE wallet mode flip with audit-event logging.
-
-Per the 2026-05-24-001 per-strategy LIVE deploy plan §U4 / §U11a:
+"""Switch a wallet between DRY and LIVE from the shell, with an audit event.
 
   python -m cryptobot.cli.set_wallet_mode \\
-      --wallet exp044_5m --target LIVE --reason "smoke test"
+      --wallet subminute_5m --target LIVE --reason "smoke test"
 
-Mirrors the dashboard POST /api/v2/wallet/<id>/mode payload but is
-addressable from SSH on the deploy host. The `--force` flag bypasses the
-DRY → LIVE rate-limit cooldown (D-LIVE-19) — defense-in-depth makes
-this CLI-only; the dashboard endpoint does NOT accept a force field.
+Same effect as the dashboard's POST /api/v2/wallet/<id>/mode, but usable over
+SSH. ``--force`` skips the DRY -> LIVE cooldown; only this CLI accepts it, the
+dashboard endpoint does not.
 
 Exit codes:
-  0  — flip applied (or no-op when target == current)
-  1  — guard raised (readiness stale, operator stopped, etc.)
-  2  — concurrent mutation (someone else flipped while we ran)
-  3  — argument / DB / validation error
+  0  switched (or no-op when already in the target mode)
+  1  blocked by a guard (readiness stale, operator stopped, ...)
+  2  concurrent change (someone else switched it meanwhile)
+  3  argument, database or validation error
 """
 
 from __future__ import annotations

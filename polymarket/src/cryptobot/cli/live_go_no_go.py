@@ -1,21 +1,18 @@
 """Pre-flip readiness checklist.
 
-Per the 2026-05-24-001 per-strategy LIVE deploy plan §U11a / §U9:
-
   python -m cryptobot.cli.live_go_no_go --offline
 
-Manual-operator-only: no script or scheduler invokes this CLI.
+Run by hand only; nothing schedules it.
 
-`--offline` reads the LATEST `live_readiness_reports` row without
-calling the CLOB, so the readiness card can be inspected before the
-bot is up. Without `--offline`, the CLI invokes
-`evaluate_readiness(conn, config, order_client)` and persists a fresh
+``--offline`` reads the latest ``live_readiness_reports`` row without calling
+the CLOB, so readiness can be checked before the bot is running. Without it the
+CLI runs ``evaluate_readiness(conn, config, order_client)`` and stores a new
 row.
 
 Exit codes:
-  0 — READY
-  1 — NOT_READY (or no readiness rows in offline mode)
-  2 — internal error
+  0  READY
+  1  NOT_READY (or no readiness rows in offline mode)
+  2  internal error
 """
 
 from __future__ import annotations
@@ -70,20 +67,11 @@ def _print_report(payload: dict) -> None:
 
 def _run_online(argv) -> int:
     """Evaluate readiness against live CLOB + ledger. Persists a row."""
-    # This CLI is the POLYMARKET live go/no-go: it constructs a real OrderClient
-    # and distinguishes ClobClientUnavailable (offline gates only) from
-    # ValueError (exit 2), which VenueAdapter.build_order_client deliberately
-    # does not — that one is fail-soft-to-None for the scanner's boot. So this
-    # is a direct venue import, recorded in tools/importcheck.py's allowlist
-    # rather than routed through the registry. Phase 3 candidate: move the whole
-    # CLI into cryptobot_polymarket.
-    #
-    # FUNCTION-SCOPE, not module-scope (panel verdict D4-3): --offline exists
-    # precisely so the readiness row can be read with no venue plumbing at all
-    # — the operator can run it before the bot is up — and
-    # a module-scope venue import made even importing this CLI impossible
-    # without the Polymarket package. The online path is the only path that
-    # needs it.
+    # Imported here rather than at module level so ``--offline`` works without
+    # the Polymarket package. This CLI builds a real OrderClient directly
+    # (instead of through VenueAdapter.build_order_client) because it must tell
+    # ClobClientUnavailable (offline checks only) apart from ValueError (exit
+    # 2).
     from cryptobot_polymarket.walker import ClobClientUnavailable, OrderClient
 
     cfg = get_config()

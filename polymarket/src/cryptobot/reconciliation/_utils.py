@@ -29,11 +29,7 @@ def _effective_fill(
 
 @dataclass(frozen=True)
 class SettlementBackfillSummary:
-    """Row-loop counters + PnL totals for one settlement backfill run.
-
-    Shared by the venue backfill twins (polymarket / predictfun) — each keeps a
-    back-compat alias name for its callers.
-    """
+    """Row counters and PnL totals for one settlement backfill run."""
 
     scanned: int
     updated: int
@@ -56,25 +52,21 @@ def run_settlement_backfill(
     stage: str,
     dry_run: bool = False,
 ) -> SettlementBackfillSummary:
-    """Shared settle/regrade row loop for the venue backfill twins.
+    """Shared settle/regrade loop for settlement backfills.
 
-    Selects ledger rows matching ``where_sql`` (each twin supplies its own
-    venue/outcome predicate), re-resolves every row via
+    Selects ledger rows matching ``where_sql``, re-resolves each via
     ``resolution_fetch(coin, interval_min, window_start_ts)`` and books
-    WIN/LOSS with the calibrated venue-dispatched grade formula
-    (``execution.grade_fees.graded_cash_pnl`` — the SAME function the
-    resolution sweep books through, so a backfilled row and a sweep-settled
-    row on the same venue grade byte-identically; 2026-07-23 calibrated fee
-    grading). A row whose fetch is not decisively RESOLVED is left untouched
-    and counted ``unresolved`` — a PENDING row is NEVER mis-settled on an
-    ambiguous payload. Rows with no usable fill/size are counted ``skipped``.
-    When not ``dry_run`` and rows changed, the UPDATE batch plus a
-    ``pipeline_health`` OK row (under ``stage``) commit atomically.
+    WIN/LOSS with ``execution.grade_fees.graded_cash_pnl``, the same function
+    the resolution sweep uses, so a backfilled row and a sweep-settled row
+    grade identically. A row whose market is not decisively RESOLVED is left
+    alone and counted ``unresolved`` (a PENDING row is never settled on an
+    ambiguous payload); rows with no usable fill or size are counted
+    ``skipped``. Unless ``dry_run``, the UPDATEs and a ``pipeline_health`` OK
+    row (under ``stage``) commit together.
 
-    Era caution: these twins are REGRADE tools by design (their WHERE
-    predicates target WIN/LOSS rows too). Running one across pre-2026-07-23
-    rows re-books them under the calibrated convention — intend that before
-    crossing the era boundary (backtest/optimize_runs/FEE_CALIBRATION_20260723.md).
+    These are regrade tools: callers' WHERE clauses can select WIN/LOSS rows
+    too, which are then re-booked with the calibrated fee. Make sure that is
+    intended for older rows.
     """
     from cryptobot.venues.types import RESOLUTION_RESOLVED
     from cryptobot.execution.grade_fees import graded_cash_pnl

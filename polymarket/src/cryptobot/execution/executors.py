@@ -1,13 +1,8 @@
-"""Process-wide worker pools shared by the engine and the venue adapters.
+"""Process-wide worker pools shared by the engine and the venue adapter.
 
-``_clob_executor`` was defined at module scope in ``execution/walker.py``, and
-BOTH the Polymarket order client and the core pipeline's Pass-1 cold-cell Gamma
-fan-out submitted to it. Phase 2 moved the walker into ``cryptobot_polymarket``,
-which would have made core import a venue package for a thread pool — so the
-pool itself lives here now and the walker imports it.
-
-It is still ONE pool with the same size and thread-name prefix, so concurrency
-behavior is unchanged; only its address moved.
+``_clob_executor`` is used by both the Polymarket order client and the
+pipeline's parallel market lookups. It lives here so the core package does not
+have to import the venue package to reach it.
 """
 
 from __future__ import annotations

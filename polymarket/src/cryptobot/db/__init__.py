@@ -1,9 +1,9 @@
-"""SQLite persistence layer for the live scanner.
+"""SQLite persistence for the live scanner.
 
-`connection.py` exposes `get_connection()` (raw WAL-mode connection),
-`init_db()` (apply schema + idempotent migrations), and
-`backfill_wallet_groups()` (portfolio-dependent one-shot UPDATE that runs
-after `load_sleeves()` per D-LIVE-15).
+``connection.py`` provides ``get_connection()`` (a WAL-mode connection),
+``init_db()`` (schema plus additive migrations) and
+``backfill_wallet_groups()`` (a one-off UPDATE that needs the loaded portfolio,
+so it runs after ``load_sleeves()``).
 """
 
 from cryptobot.db.connection import (

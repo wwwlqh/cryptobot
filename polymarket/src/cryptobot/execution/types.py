@@ -1,14 +1,7 @@
-"""Shared execution-layer dataclasses.
+"""Shared execution-layer types.
 
-Per the 2026-05-24-001 per-strategy LIVE deploy plan §U5 / D-LIVE-23:
-
-  * `OrderResult` is the only new type here. It captures the outcome of a
-    single `OrderClient.place_gtc_limit_order` call — order_id (CLOB),
-    realized fill VWAP, filled size, terminal/retryable error_kind.
-  * `BetSignal` is **NOT** redefined in this module. The walker imports
-    `cryptobot.execution.ledger.BetSignal` directly because that dataclass
-    is already wired into 10+ existing call sites; introducing a second
-    type would collide on every record_bet call.
+``OrderResult`` is the result of one ``OrderClient.place_gtc_limit_order``
+call. ``BetSignal`` lives in ``cryptobot.execution.ledger``.
 """
 
 from __future__ import annotations
@@ -19,19 +12,18 @@ from typing import Optional
 
 @dataclass(frozen=True)
 class OrderResult:
-    """Outcome of a `OrderClient.place_gtc_limit_order` invocation.
+    """Result of ``OrderClient.place_gtc_limit_order``.
 
-    `success=True` indicates the CLOB accepted the order. The realized fill
-    (`filled_size_tokens` × `filled_price_vwap`) is populated when the CLOB
-    response carries actual trade metadata; otherwise the `filled_*` fields
-    stay `None` until `reconcile_open_orders` back-fills the matched fill on
-    a later tick.
+    ``success=True`` means the CLOB accepted the order. The fill
+    (``filled_size_tokens`` x ``filled_price_vwap``) is set when the response
+    carries trade data; otherwise the ``filled_*`` fields stay ``None`` until
+    ``reconcile_open_orders`` fills them in.
 
-    On failure, `success=False` and `error_kind` carries the coarse retry
-    bucket from `_classify_clob_error`: 'auth', 'insufficient_funds',
-    'market_closed', 'invalid_amount', 'venue_unavailable', 'post_only',
-    'no_liquidity', 'network', 'unknown'. The pipeline reads `error_kind`
-    to decide between SKIP-and-move-on vs retry-on-next-tick.
+    On failure ``success=False`` and ``error_kind`` is the retry bucket from
+    ``_classify_clob_error``: 'auth', 'insufficient_funds', 'market_closed',
+    'invalid_amount', 'venue_unavailable', 'post_only', 'no_liquidity',
+    'network', 'unknown'. The pipeline uses it to decide between skipping and
+    retrying on a later tick.
     """
 
     # Success / failure summary
@@ -50,11 +42,10 @@ class OrderResult:
     limit_price: Optional[float] = None
     fill_ts: Optional[str] = None
 
-    # A0 latency instrumentation — wall-clock ms the OrderClient spent in
-    # `create_market_order` (local EIP-712 signing + any market-info
-    # cache-miss GETs) vs the `post_order` round trip. None on failure
-    # paths that never reached the corresponding step. The pipeline
-    # accumulates these into TickResult for the stage='latency' trace.
+    # Milliseconds spent in ``create_market_order`` (local EIP-712 signing plus
+    # any market-info cache-miss GETs) and in the ``post_order`` round trip.
+    # None on failure paths that never reached that step. The pipeline adds
+    # these to TickResult for the latency trace.
     sign_ms: Optional[float] = None
     post_ms: Optional[float] = None
 

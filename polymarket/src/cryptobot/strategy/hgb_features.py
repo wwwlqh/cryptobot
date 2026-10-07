@@ -1,40 +1,32 @@
-"""Live HGB feature builder — the per-tick multi-feature contract.
+"""Live feature builder for the HGB models.
 
-This is the SOURCE-OF-TRUTH PORT of the backtest's per-row feature derivation
-(`polymarket/backtest/training/modeling.py::_side_rows`). Runtime code
-must NOT import the research module; the derivations are reproduced here exactly
-so a live tick produces a feature vector that byte-matches the row the backtest
-trained/served on. A silent divergence here destroys the exp044 edge, so the
-parity test (`tests/test_hgb_features.py`) compares this builder against the
-independent backtest `_side_rows` function on real decision-table rows.
+Reproduces the backtest's per-row feature derivation
+(``polymarket/backtest/training/modeling.py::_side_rows``) without importing
+it, so a live tick builds exactly the feature vector the model was trained on.
+``tests/test_hgb_features.py`` compares this builder with ``_side_rows``.
 
-Ported verbatim from the backtest (do not re-derive elsewhere):
-  - COIN_MAP / INTERVAL_MAP             (ev lines ~49-50)
-  - FEATURE_GROUPS / FEATURE_COLUMNS    (ev lines ~52-82)
-  - _feature_columns                    (ev lines ~125-139)
+Shared with the backtest (do not redefine elsewhere): COIN_MAP, INTERVAL_MAP,
+FEATURE_GROUPS, FEATURE_COLUMNS and ``_feature_columns``.
 
-Per-row feature math reproduced from `_side_rows` (ev lines ~205-266):
-  - model_p_side = model_p_up if Up else 1 - model_p_up
-        model_p_up is the LIVE RF predict_proba(partial_ret_z_1h), never the LUT
-        hit_rate. (Backtest column model_p_v1 == that same RF probability.)
-  - other_ask: if not finite -> 1 - ask                 (ev:216 fallback)
-  - rf_edge = model_p_side - ask - theta*ask*(1-ask)    (ev:248, _fee at ev:142)
-  - book_spread = ask + other_ask - 1.0                 (ev:249)
-  - log_depth = log1p(max(0, depth))                    (ev:250)
-  - depth_imbalance = log1p(max(0,depth)) - log1p(max(0,other_depth))  (ev:251)
-  - partial_ret_z_side = (+1 if Up else -1) * partial_ret_z_1h  (ev:252-253)
-  - abs_partial_ret_z = |partial_ret_z_1h|              (ev:254)
-  - coin_id = COIN_MAP[coin.lower()] ; interval_min = INTERVAL_MAP[interval]
+Per-row features:
+
+  - model_p_side = model_p_up for Up, else 1 - model_p_up
+  - other_ask: 1 - ask when not finite
+  - rf_edge = model_p_side - ask - theta*ask*(1-ask)
+  - book_spread = ask + other_ask - 1.0
+  - log_depth = log1p(max(0, depth))
+  - depth_imbalance = log1p(max(0, depth)) - log1p(max(0, other_depth))
+  - partial_ret_z_side = (+1 if Up else -1) * partial_ret_z_1h
+  - abs_partial_ret_z = |partial_ret_z_1h|
+  - coin_id = COIN_MAP[coin.lower()]; interval_min = INTERVAL_MAP[interval]
   - side_up = 1 if Up else 0
-  - entry_minute = int entry minute
-  - hour_utc / dow_utc: from window_start_ts (the window-open boundary entry_ts),
-        NOT now_ts.                                     (ev:187-188)
+  - entry_minute (may be fractional: offset_sec / 60)
+  - hour_utc / dow_utc from window_start_ts, not now_ts
 
-exp044 does NOT use the depth group (log_depth/depth_imbalance) — they are
-supported but unused. The "cross" group (p_mean_entry / p_std_entry /
-target_vs_entry_mean / consensus_for_side) needs a tick-wide cross-coin
-aggregation that is not computable from a single cell, so requesting any cross
-feature raises NotImplementedError (fail-closed).
+The TWAP model uses the price, identity, time and momentum groups. The "cross"
+group (p_mean_entry, p_std_entry, target_vs_entry_mean, consensus_for_side)
+needs an aggregate across coins that one cell cannot compute, so requesting it
+raises NotImplementedError.
 """
 
 from __future__ import annotations
@@ -204,9 +196,9 @@ def build_feature_vector(
     rf_edge = model_p_side - a - _fee(a)
     book_spread = a + oa - 1.0
 
-    # --- depth features (ev:250-251): NaN-safe log1p(clip(lower=0)) ----------
-    # depth/other_depth default to NaN; log1p(NaN) -> NaN, matching _side_rows
-    # which keeps NaN for missing depth. exp044 does not request these columns.
+    # --- depth features: NaN-safe log1p(clip(lower=0))
+    # ------------------------- Missing depth stays NaN, as in _side_rows. The
+    # TWAP model does not use these.
     def _log_depth(d: float) -> float:
         dv = float(d)
         if not math.isfinite(dv):
@@ -221,12 +213,9 @@ def build_feature_vector(
     coin_id = float(COIN_MAP[coin_l])
     interval_min_v = float(int(interval_min))
     side_up = 1.0 if is_up else 0.0
-    # 2026-07-05 parity fix: do NOT re-quantize to int. Baseline (minute) sleeves
-    # pass an integer entry_minute (float(4)==4.0, unchanged); the sub-minute
-    # checkpoint sleeves pass a FRACTIONAL minute (offset_sec/60, e.g. 4.833) that
-    # the backtest's training.checkpoint feeds raw (checkpoint_sec/60.0).
-    # The prior float(int(entry_minute)) collapsed every checkpoint in a minute to
-    # one value and diverged from the model this vector is scored against.
+    # Keep entry_minute as given. Sub-minute sleeves pass a fractional minute
+    # (offset_sec / 60, e.g. 4.833), as training does; truncating to an int
+    # would give every second in a minute the same value.
     entry_minute_v = float(entry_minute)
 
     # hour_utc / dow_utc derive from window_start_ts (window-open boundary
@@ -257,10 +246,9 @@ def build_feature_vector(
     out: list[float] = []
     for col in requested:
         v = values[col]
-        # Required-input guard: any non-finite value in a REQUESTED column means
-        # the caller should skip. depth columns may legitimately be NaN, but
-        # exp044 never requests them; if a config does request depth and it is
-        # missing, skipping is the safe (fail-closed) choice.
+        # Any non-finite value in a requested column means the caller should
+        # skip. Depth may be NaN, but a config that requests depth and lacks it
+        # is skipped too (fail closed).
         if not math.isfinite(v):
             return None
         out.append(float(v))

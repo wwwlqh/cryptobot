@@ -1,21 +1,14 @@
-"""Polymarket signature-type / funder validation.
+"""Polymarket signature-type and funder validation.
 
-Lifted out of ``execution/walker.py`` (now ``cryptobot_polymarket.walker``) in
-Phase 2. It validates fields of ``cryptobot.runtime_secrets.Config``
-(``POLY_SIGNATURE_TYPE`` / ``POLY_FUNDER``), and core's live-readiness gate
-calls it on EVERY venue — so it stayed with the config it validates rather than
-travelling into the venue package and forcing core to import it.
-
-``cryptobot_polymarket.walker`` re-exports both names, so its own public surface
-and ``__all__`` are unchanged.
+Validates ``POLY_SIGNATURE_TYPE`` / ``POLY_FUNDER`` from
+``cryptobot.runtime_secrets.Config``. The live-readiness gate calls it, so it
+lives next to the config it checks; ``cryptobot_polymarket.walker`` re-exports
+both names.
 """
 
 from __future__ import annotations
 
-# D-LIVE-7: Polymarket V2 signature topology labels. The literal map is
-# copied verbatim from hightempbot/execution/walker.py:46 so error messages
-# remain identical across the two bots — the operator's mental model and
-# any incident search log indexing carry over.
+# Polymarket V2 signature types, used in error messages.
 _SIGNATURE_TYPE_LABELS: dict[int, str] = {
     0: "EOA",
     1: "POLY_PROXY",
@@ -27,15 +20,13 @@ _SIGNATURE_TYPE_LABELS: dict[int, str] = {
 def _validate_wallet_config(
     signature_type: int | None, funder: str | None
 ) -> tuple[int, str]:
-    """Normalize Polymarket wallet topology and fail closed on impossible config.
+    """Normalize the Polymarket wallet setup and fail closed on an impossible
+    one.
 
-    Returns the normalized (signature_type, funder) tuple after asserting:
+    Returns the normalized (signature_type, funder) after checking that:
 
-      * `signature_type` is one of the four known values.
-      * SIG=3 (POLY_1271 deposit wallet) requires a non-empty `POLY_FUNDER`.
-
-    Copied verbatim (sans imports) from hightempbot/execution/walker.py:97 so
-    the failure modes — and any operator-side fix runbooks — stay identical.
+      * ``signature_type`` is one of the four known values;
+      * type 3 (POLY_1271 deposit wallet) has a non-empty ``POLY_FUNDER``.
     """
     sig_type = int(signature_type or 0)
     funder = (funder or "").strip()

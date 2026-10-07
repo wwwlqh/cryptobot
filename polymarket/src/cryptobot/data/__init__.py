@@ -1,7 +1,6 @@
-"""Venue-agnostic live data adapters. Today: Binance spot (`binance.py`).
+"""Venue-independent live data adapters (Binance spot in ``binance.py``).
 
-Each adapter exposes a single `fetch_*` function that returns typed
-results. All HTTP boundaries are mockable via httpx.MockTransport so the
-test suite doesn't hit the network. Venue-specific feeds (Polymarket
-Gamma / CLOB, predict.fun) live in their venue package, not here.
+Each adapter exposes a ``fetch_*`` function returning typed results. HTTP calls
+can be mocked with httpx.MockTransport, so tests never touch the network.
+Polymarket's own feeds (Gamma, CLOB) live in ``cryptobot_polymarket``.
 """

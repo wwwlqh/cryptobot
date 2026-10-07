@@ -1,26 +1,21 @@
 """Backfill settled ledger rows to cash-sized realized PnL.
 
-This repairs rows written by the old per-share math where ``pnl_net`` was
-``unit_pnl * bet_size``. Correct realized PnL treats ``bet_size`` as cash
-spent, converts it to shares via the actual fill/VWAP, and still applies the
-Polymarket theta fee on winning shares.
+Repairs rows written by the old per-share math, where ``pnl_net`` was
+``unit_pnl * bet_size``. Correct PnL treats ``bet_size`` as cash spent,
+converts it to shares through the actual fill or VWAP, and applies the theta
+fee on winning shares.
 
-ERA GUARD (2026-07-23): this tool re-books the PRE-calibration convention
-(win-only fee via ``parity.cash_pnl``) by design — it exists to repair the
-2026-05-era per-share rows. Do NOT run it over rows graded after the
-calibrated fee grading deploy (``execution.grade_fees``): it would strip
-their loss-side/venue-dispatched entry fees. Bound any run with an id/ts
-predicate on the pre-calibration cohort.
+This re-books the pre-calibration convention (fee on wins only, via
+``parity.cash_pnl``). Do not run it over rows graded with
+``execution.grade_fees``: it would remove their fees on losses. Restrict any
+run to the old rows with an id or timestamp condition.
 
-SCOPE — magnitude only, NOT direction. When ``won_up`` is NULL, ``_infer_won_up``
-reconstructs the direction that is *self-consistent with the stored outcome*
-(WIN -> the bet's side, LOSS -> the opposite). The recomputed ``pnl`` therefore
-always preserves the existing WIN/LOSS — this backfill re-scales magnitude only
-and can NEVER flip a row whose original ``outcome`` was graded wrong (e.g. a row
-settled from a biased strike before the divergence-#13 fix, or from a Pyth
-fallback). To re-grade direction, run ``backfill_polymarket_settlement`` FIRST
-(it re-derives won_up/outcome from Gamma's finalized result), THEN run this
-script to re-scale the corrected rows to cash PnL.
+It fixes magnitude only, not direction. When ``won_up`` is NULL,
+``_infer_won_up`` picks the direction consistent with the stored outcome (WIN
+-> the bet's side, LOSS -> the other), so the existing WIN/LOSS is always kept
+and a wrongly graded row is never flipped. To fix direction, run
+``backfill_polymarket_settlement`` first (it re-derives won_up and outcome from
+Gamma's final result), then this script.
 """
 
 from __future__ import annotations

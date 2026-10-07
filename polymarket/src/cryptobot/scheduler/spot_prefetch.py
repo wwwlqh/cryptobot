@@ -1,26 +1,18 @@
-"""A7 latency: spot prefetch-ahead thread.
+"""Spot prefetch thread.
 
-The scanner tick pays a ~50-100ms inline spot GET at the top of every
-network-active tick (``deps.fetch_spots`` at ``pipeline.run_scanner_tick``).
-The spot adapter (`data.binance`) caches one batch per
-``now_ts // tick_seconds`` bucket behind a lock, and accepts an explicit
-``now_ts`` — so a background thread can populate the EXACT bucket the
-upcoming tick will read, turning the tick's fetch into a zero-network cache
-hit.
+The tick otherwise makes a ~50-100ms spot fetch at the start of every tick. The
+spot adapter (``data.binance``) caches one batch per time bucket and accepts an
+explicit ``now_ts``, so a background thread can fill exactly the bucket the
+next tick will read.
 
-Timing: the thread wakes ``lead_ms`` before each wall-clock second boundary
-and fetches with ``now_ts = next_boundary``. With the A6 boundary-aligned
-scheduler the tick then fires at the boundary and reads the cached batch.
-The scored spot is at most ``lead_ms`` older than the inline fetch would
-have produced — comparable to the in-flight time of the inline GET itself —
-and the freshness stamp (`publish_time`) still ages normally, so the
-stale_spot gate semantics are unchanged.
+The thread wakes ``lead_ms`` before each second boundary and fetches with
+``now_ts = next_boundary``; the second-aligned tick then reads the cached
+batch. The spot is at most ``lead_ms`` older than an inline fetch would return,
+and its ``publish_time`` ages normally, so stale_spot works as before.
 
-Failure containment: a prefetch failure marks the bucket failed in the
-adapter cache exactly as an inline failure would (same function, same
-arguments); the tick then behaves as it does today on a spot outage. The
-thread is a daemon and is stopped via ``stop()`` on shutdown, but an
-un-stopped thread cannot keep the process alive.
+A failed prefetch marks the bucket failed in the adapter cache, exactly like a
+failed inline fetch, and the tick behaves as during any spot outage. The thread
+is a daemon, stopped with ``stop()`` at shutdown.
 """
 
 from __future__ import annotations

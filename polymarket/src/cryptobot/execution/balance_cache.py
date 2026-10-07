@@ -1,27 +1,23 @@
-"""A3 latency: cached CLOB funder balance for the tick hot path.
+"""Cached CLOB funder balance for the tick.
 
-``_load_live_context`` previously called ``order_client.check_balance()`` on
-EVERY LIVE tick — a synchronous CLOB round trip inside the 1Hz tick body.
-Since the fail-closed fix (funder_balance_unknown), a slow or failed inline
-call ALSO suppressed trading for the tick. This cache decouples the two:
+Without this, every live tick would call ``order_client.check_balance()``, a
+network round trip inside the 1 Hz tick, and a slow or failed call would also
+block trading for that tick (funder_balance_unknown). Instead:
 
-  * the 60s live-readiness scheduler job (main.py) already fetches the CLOB
-    balance for ``live_readiness_reports`` — it now ALSO stores that value
-    here (``store()``, zero extra network);
-  * the tick reads the cached value via ``TickDeps.live_balance_fetcher``
-    (zero network in steady state);
-  * fail-closed semantics are preserved:
-      - never populated (boot before the first readiness fire) → ONE
-        synchronous prime attempt so the first LIVE tick isn't spuriously
-        skipped; on failure → None → SKIP:funder_balance_unknown;
-      - value older than ``hard_staleness_s`` (readiness refresher dead) →
-        None → SKIP:funder_balance_unknown, same as a failed inline fetch.
+  * the 60s live-readiness job (main.py) already fetches the CLOB balance and
+    also stores it here (``store()``, no extra network call);
+  * the tick reads the cached value through ``TickDeps.live_balance_fetcher``;
+  * it still fails closed:
+      - never populated (before the first readiness run): one synchronous
+        fetch so the first live tick is not skipped; if that fails, None and
+        SKIP:funder_balance_unknown;
+      - older than ``hard_staleness_s`` (readiness job stopped): None and
+        SKIP:funder_balance_unknown.
 
-Staleness bound rationale: the funder-balance gate is a coarse
-wallet-drained/misconfigured floor check (group caps ± tolerance), not
-per-order accounting — within-tick exposure is tracked separately by the
-pipeline's pending/group deltas. A ≤5-minute-old balance is safe for that
-purpose; anything older fails closed.
+The funder-balance gate is a coarse "wallet drained or misconfigured" check
+against the group caps, not per-order accounting (the pipeline tracks in-tick
+exposure separately), so a balance up to 5 minutes old is fine; anything older
+fails closed.
 """
 
 from __future__ import annotations

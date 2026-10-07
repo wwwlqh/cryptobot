@@ -1,14 +1,14 @@
-"""Operator CLI for cryptobot live controls.
+"""Operator CLI for live controls.
 
-This is the shell-side counterpart to the dashboard operator controls. It
-uses the same execution primitives for global state and per-wallet transfer
-requests, so audit rows and transfer safety checks stay centralized.
+The shell counterpart to the dashboard's operator controls. It uses the same
+functions for global state and transfers, so audit rows and transfer checks are
+identical either way.
 
 Examples:
     python -m cryptobot.cli.operator status
     python -m cryptobot.cli.operator stop --reason "manual halt"
     python -m cryptobot.cli.operator start --reason "resume"
-    python -m cryptobot.cli.operator transfer-preview --amount 5 --source-wallet-id exp044_5m
+    python -m cryptobot.cli.operator transfer-preview --amount 5 --source-wallet-id subminute_5m
     python -m cryptobot.cli.operator transfer-submit --idempotency-key <key> --i-have-read-the-preview
     python -m cryptobot.cli.operator record-flow --kind deposit --amount 91.65 --at "2026-07-26 06:10:00"
     python -m cryptobot.cli.operator list-flows
@@ -131,9 +131,10 @@ def _cmd_status(args: argparse.Namespace) -> int:
 
 
 def _cmd_set_wallet_mode(args: argparse.Namespace) -> int:
-    """Flip one sleeve wallet between DRY and LIVE through the audited
-    ``operator_control.set_wallet_mode`` path (DRY is always allowed;
-    LIVE runs the readiness guard + flip rate limit)."""
+    """Switch one wallet between DRY and LIVE through the audited
+    ``operator_control.set_wallet_mode`` (DRY is always allowed; LIVE runs
+    the readiness guard and the flip rate limit).
+    """
     from cryptobot.execution.operator_control import (
         OperatorControlError,
         RateLimitError,

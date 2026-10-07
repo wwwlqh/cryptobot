@@ -1,9 +1,8 @@
-"""Strategy scoring layer: sleeve loading + feature build + edge computation.
+"""Strategy layer: sleeve loading, features and scoring.
 
-`portfolio_loader.load_sleeves()` returns the sleeves configured in the live
-artifact; `partial_ret` computes `partial_ret_z_1h`; `score.score_cell_hgb()`
-serves the checkpoint model and picks the best-edge side. The LUT lookup that
-used to sit between them was retired with the pair sleeves on 2026-07-31.
+``portfolio_loader.load_sleeves()`` reads the sleeves from the strategy config;
+``partial_ret`` computes the spot features; ``score.score_cell_twap()`` serves
+the TWAP model and picks the higher-edge side.
 """
 
 from cryptobot.strategy.portfolio_loader import Sleeve, V6Portfolio, load_sleeves

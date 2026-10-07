@@ -1,14 +1,13 @@
-"""Regrade settled ledger rows against Polymarket's finalized outcome.
+"""Regrade settled ledger rows against Polymarket's final outcome.
 
-The backtest's ``won_up_polymarket`` label comes from Gamma's finalized
-``outcomePrices`` for markets that Polymarket settled from Chainlink Data
-Streams. This backfill repairs legacy live rows that were settled from the
-now-deleted oracle-spot fallback path (``resolution_source='pyth_fallback'``)
-so the ledger uses the same settlement label family.
+The backtest label ``won_up_polymarket`` comes from Gamma's final
+``outcomePrices`` (Polymarket settles from Chainlink Data Streams). This
+repairs old live rows settled by the removed oracle-spot fallback
+(``resolution_source='pyth_fallback'``) so the ledger uses the same label.
 
-The row loop / UPDATE / pipeline_health bookkeeping is shared with the
-predict.fun twin via :func:`cryptobot.reconciliation._utils.run_settlement_backfill`;
-only the WHERE predicate and the resolution fetcher are venue-specific.
+The row loop, UPDATE and pipeline_health bookkeeping are in
+:func:`cryptobot.reconciliation._utils.run_settlement_backfill`; this module
+supplies the WHERE clause and the resolution fetcher.
 """
 
 from __future__ import annotations

@@ -1,13 +1,8 @@
-"""Polygon pUSD balance fetcher for the live-readiness on-chain gate.
+"""Polygon pUSD balance fetcher for the live-readiness on-chain check.
 
-Lifted verbatim from ``cryptobot/execution/live_readiness.py`` in Phase 2. Only
-its ADDRESS changed: it is the Polymarket half of what was
-``build_venue_balance_fetcher``, and it is now reached through
-``VenueAdapter.build_balance_fetcher``.
-
-The generic JSON-RPC reader (``read_erc20_balance``) and the address validator
-stay in core — they are not venue-specific, and the predict.fun collateral
-fetcher uses them too.
+Reached through ``VenueAdapter.build_balance_fetcher``. The generic JSON-RPC
+reader (``read_erc20_balance``) and the address validator live in core, since
+they are not Polymarket-specific.
 """
 
 from __future__ import annotations

@@ -10,8 +10,8 @@ from __future__ import annotations
 import numpy as np
 
 
-# Published Polymarket crypto peak taker fee. 2026-08-05: 0.072 -> 0.07
-# (operator correction). Pinned == config.POLY_FEE_THETA == sweep_lib's.
+# Polymarket's published peak taker fee for crypto. Must equal
+# config.POLY_FEE_THETA and sweep_lib's.
 POLY_FEE_THETA = 0.07
 INITIAL_CAPITAL = 100.0
 CONCURRENT_EXPOSURE_CAP = 0.50
@@ -30,14 +30,11 @@ def unit_pnl(
     won_up: bool | int,
     slippage_haircut: float = 0.0,
 ) -> float:
-    """Scalar per-share PnL. Accepts YES/NO and Up/Down side names.
+    """Per-share PnL for a scalar fill. Accepts YES/NO and Up/Down side names.
 
-    Effective fill is clipped to ``[1e-6, 0.999]`` to match the exp044 backtest
-    settlement (``polymarket.backtest.training.modeling._cash_pnl_vector`` uses
-    ``np.clip(ask, 1e-6, 0.999)``). The lower bound matters only for sub-grid
-    fills (< 1e-6) that the walker never produces live; it removes the former
-    ``effective <= 0 -> NaN`` divergence (alignment finding #3). Keep this clip
-    byte-identical to ``polymarket.backtest.engine.sweep_lib.unit_pnl``.
+    The effective fill is clipped to ``[1e-6, 0.999]``, as in the backtest's
+    settlement (``modeling._cash_pnl_vector``). Keep this identical to
+    ``polymarket.backtest.engine.sweep_lib.unit_pnl``.
     """
     effective = min(max(float(fill_price) + float(slippage_haircut), 1e-6), 0.999)
     won_side = (str(side).upper() in ("YES", "UP")) == bool(won_up)
@@ -53,12 +50,12 @@ def cash_pnl(
     stake_usd: float,
     slippage_haircut: float = 0.0,
 ) -> float:
-    """Dollar P&L for a cash-sized bet.
+    """Dollar PnL for a cash-sized bet.
 
-    ``unit_pnl`` is per share. Runtime ``bet_size`` is filled USD, so shares
-    bought are ``stake_usd / effective_fill``. ``effective`` is clipped to
-    ``[1e-6, 0.999]`` to match the exp044 backtest settlement and keep this
-    byte-identical to ``polymarket.backtest.engine.sweep_lib.cash_pnl``.
+    ``unit_pnl`` is per share and ``bet_size`` is USD, so shares bought =
+    ``stake_usd / effective_fill``. The effective fill is clipped to ``[1e-6,
+    0.999]``; keep this identical to
+    ``polymarket.backtest.engine.sweep_lib.cash_pnl``.
     """
     effective = min(max(float(fill_price) + float(slippage_haircut), 1e-6), 0.999)
     return unit_pnl(side, fill_price, won_up, slippage_haircut) * (

@@ -1,29 +1,24 @@
-"""Sub-minute fill-rate circuit breaker.
+"""Fill-rate circuit breaker for sub-minute orders.
 
-The sub-minute checkpoint add-on (step5+step1last port — see
-backtest/optimize_runs/checkpoint_grid_combo_wfo/checkpoint_grid_combo_digest.md)
-is deployed WITHOUT a prior shadow probe, so this module is the safety net
-that lets reality assert itself cheaply:
+  * Every live sub-minute order's requested and realized fill is recorded in
+    ``subminute_fills`` (``record_subminute_fill``).
+  * The breaker (``evaluate_breaker``) trips when the rolling fill rate is
+    low (stale quotes coming back unfilled after Polymarket's 250ms taker
+    delay) or realized EV on settled sub-minute bets is clearly negative.
+    A tripped breaker blocks further sub-minute orders.
 
-  * every LIVE sub-minute order's requested vs realized fill is recorded in
-    ``subminute_fills`` (`record_subminute_fill`);
-  * the BREAKER (`evaluate_breaker`) trips when the rolling fill rate is
-    low (ghost/stale quotes returning unfilled through Polymarket's 250ms
-    taker delay) OR realized EV over settled sub-minute bets is clearly
-    negative — and a tripped breaker blocks every further sub-minute
-    placement while the baseline 60s sleeves keep running untouched;
-
-Everything here is read/derive-from-DB — no in-memory state that a process
-restart could clear, and no network. Callers wrap every entry point in
-try/except so a bug here can never slow or crash the live tick (the
-fail-closed default on ANY internal error is "block sub-minute placement").
+Everything is derived from the database (no in-memory state a restart could
+lose, and no network). Callers wrap every entry point in try/except so a bug
+here cannot slow or crash the tick; any internal error blocks sub-minute orders
+(fail closed).
 
 Operator controls:
-  * env ``CRYPTOBOT_SUBMINUTE_KILL=1`` — hard kill-switch, checked before
-    every placement, wins over everything.
-  * env ``CRYPTOBOT_SUBMINUTE_BREAKER_RESET=<ISO-8601 UTC>`` — after
-    investigating a trip, only orders created AFTER this timestamp feed the
-    breaker window (re-arms the ramp without deleting history).
+
+  * ``CRYPTOBOT_SUBMINUTE_KILL=1``: hard kill switch, checked before every
+    order, overrides everything.
+  * ``CRYPTOBOT_SUBMINUTE_BREAKER_RESET=<ISO-8601 UTC>``: after investigating
+    a trip, only orders created after this time count toward the breaker
+    (history is kept).
 """
 
 from __future__ import annotations
@@ -64,25 +59,19 @@ def record_subminute_fill(
     attempt: int = 1,
     trigger_src: str = "tick",
 ) -> None:
-    """Persist one LIVE sub-minute order's requested-vs-realized fill.
+    """Store one live sub-minute order's requested and realized fill.
 
-    ``outcome`` is the placement-level result ('accepted' / 'rejected' /
-    'error'); realized fill columns may be NULL when the CLOB response
-    carried no fill metadata (the U7 reconciler back-fills the ledger, but
-    THIS row keeps the placement-time snapshot the breaker reads). The
-    caller commits.
+    ``outcome`` is the placement result ('accepted', 'rejected', 'error').
+    Realized fill columns may be NULL when the CLOB response had no fill data;
+    the reconciler later fixes the ledger row, but this row keeps the
+    placement-time view the breaker reads. The caller commits.
 
-    ``attempt`` is 1 for the first FAK and 2 for the v2 one-shot post-reject
-    retry (operator 2026-07-09) — the breaker's fill-rate/EV arms treat both
-    the same (each is a real requested-vs-realized order); the column only lets
-    telemetry split first-vs-retry fills.
+    ``attempt`` is 1 for the first FAK and 2+ for retries after a reject; the
+    breaker treats them alike, and the column lets telemetry separate them.
 
-    ``trigger_src`` is the trigger rung that produced this placement (operator
-    2026-07-30): 'tick' for the 1Hz boundary-aligned scanner — the default, and
-    what every legacy row is — 'fast_sweep' for the sub-second sweep job and
-    'fast_event' for a WS book-update push. Purely descriptive: the breaker's
-    arms are src-blind (each row is a real requested-vs-realized order), the
-    column exists so fast-vs-tick realized c/$ is separable downstream.
+    ``trigger_src`` says what triggered the order: 'tick' (the 1 Hz scanner,
+    also the default for old rows), 'fast_sweep' (the sub-second sweep job) or
+    'fast_event' (a WS book update). Descriptive only; the breaker ignores it.
     """
     conn.execute(
         """
@@ -130,19 +119,15 @@ class BreakerState:
 
 
 def _reset_clause() -> tuple[str, tuple]:
-    """WHERE-fragment applying the operator breaker-reset horizon.
+    """WHERE fragment applying the breaker-reset time.
 
-    Review finding (major): the docs instruct the T-separated ISO form
-    ("2026-07-03T00:00:00") but rows are stored space-separated
-    ("2026-07-03 00:00:00"); a raw lexicographic compare would wrongly
-    exclude every same-day row from the breaker window, EV arm, ramp
-    counting, AND the rung-1 hard cap ('T' sorts after ' '). Normalize in
-    Python via datetime.fromisoformat → space form so both documented
-    spellings are equivalent. An UNPARSEABLE reset is ignored (full
-    history) — that is the fail-SAFE direction: the breaker/cap then see
-    every historical order rather than none (an SQL-side datetime(?)
-    normalization would instead yield `created_at > NULL` ≡ empty
-    history, silently disarming the breaker).
+    Rows are stored as "2026-07-03 00:00:00" but the reset may be given in ISO
+    form ("2026-07-03T00:00:00"); a raw string compare would drop every row
+    from that day ('T' sorts after ' '). So the reset is parsed with
+    datetime.fromisoformat and rewritten in the space form. An unparseable
+    reset is ignored, so the breaker sees the full history; that is the safe
+    direction (normalizing in SQL would instead give ``created_at > NULL``,
+    which matches nothing and disarms the breaker).
     """
     reset = config.SUBMINUTE_BREAKER_RESET
     if not reset:
@@ -177,10 +162,10 @@ def evaluate_breaker(conn: sqlite3.Connection) -> BreakerState:
             fil = sum(float(r["filled_usd"] or 0.0) for r in rows)
             fill_rate = (fil / req) if req > 0 else None
 
-        # Realized-EV arm: settled LIVE sub-minute ledger rows (offset_sec is
-        # only ever written by the sub-minute path). mode='LIVE' is REQUIRED:
-        # DRY paper bets fill at the observed book by construction and would
-        # both mask a ghost-fill reality and advance the ramp on fake fills.
+        # Realized-EV check: settled live sub-minute ledger rows (only the
+        # sub-minute path writes offset_sec). mode='LIVE' is required: DRY bets
+        # "fill" at the observed book by construction and would hide
+        # stale-quote misses.
         bet_clause, bet_params = _reset_clause()
         settled = conn.execute(
             "SELECT COALESCE(SUM(pnl_net), 0.0) AS pnl, "

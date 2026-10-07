@@ -1,15 +1,8 @@
-"""Venue-agnostic WS-vs-REST book shadow comparator.
+"""Venue-independent WS-vs-REST book comparator.
 
-Lifted verbatim out of core's ``cryptobot/data/clob_ws_mirror.py`` (now
-``cryptobot_polymarket.ws_mirror``) in the Phase-2 venue split. It was already
-venue-agnostic in fact if not in address: it only drives the injected mirror's
-``note_tokens``/``start``/``stop``/``get`` and reads duck-typed snapshot attrs
-(``top_ask``, ``total_ask_depth_usd``), which is exactly why the predict.fun
-mirror re-exported the Polymarket class instead of forking it. Keeping it here
-means neither venue package has to import the other for it.
-
-Behavior is unchanged, including the shared ``"book WS shadow divergence"`` log
-prefix (no per-venue tag) — both venues emitted that same line before.
+Drives the injected mirror only through ``note_tokens``/``start``/``stop``/
+``get`` and reads snapshot attributes by name (``top_ask``,
+``total_ask_depth_usd``), so it works with any venue's mirror.
 """
 
 from __future__ import annotations
@@ -21,16 +14,14 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Top-of-book comparison (shared with the WS mirror stall watchdog, 2026-08-06)
+# Top-of-book comparison (shared with the WS stall watchdog)
 # ---------------------------------------------------------------------------
-# ⚠️ This is a DIFFERENT question from ShadowBookComparator's, which is why it
-# is a sibling function rather than a refactor of `observe`: the comparator asks
-# "are WS and REST close enough that flipping the mirror authoritative is safe?"
-# — one price TICK of slack on top_ask plus a relative tolerance on WHOLE-BOOK
-# dollar depth, sampled on the decision path. The watchdog asks "is this ladder
-# still the venue's ladder at all?", where one tick of drift on a quiet book is
-# already the answer, so price must match EXACTLY. Only the snapshot-reading is
-# genuinely shared, and it lives here so neither venue package owns it.
+# A different question from ShadowBookComparator's. The comparator asks whether
+# WS and REST agree closely enough to trust the mirror: one price tick of slack
+# on top_ask plus a relative tolerance on whole-book depth. The watchdog asks
+# whether a ladder is still the venue's ladder at all, where any price drift on
+# a quiet book is already the answer, so price must match exactly. Only reading
+# the snapshot is shared.
 
 
 def top_of_book(snap) -> tuple:

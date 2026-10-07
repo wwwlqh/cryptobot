@@ -1,21 +1,17 @@
-"""Resolution price fetch + sanity-bounded settlement.
+"""Oracle-price settlement with sanity bounds (legacy and test path).
 
-Brainstorm R20: Chainlink Polygon RPC is the oracle source. The plan's U7a
-adds:
-  - per-coin sanity bounds (config.RESOLUTION_PRICE_BOUNDS)
-  - max-deviation guard against last-known live spot
-    (config.MAX_RESOLUTION_PRICE_MOVE_PCT) — out-of-bounds or
-    excessive-deviation prices fail with `ResolutionError("rejected")`
-    and the calling sweep marks the row CANCELLED (pnl_net=0)
+  - per-coin bounds (config.RESOLUTION_PRICE_BOUNDS);
+  - a maximum deviation from the last known live spot
+    (config.MAX_RESOLUTION_PRICE_MOVE_PCT).
 
-The actual Chainlink RPC client is a pluggable
-``Callable[[str, int], Optional[float]]`` so tests can stub it without
-touching the network. The default factory returns ``None`` (treated as
-upstream-down) — a real Chainlink client lands in a follow-up unit.
+A price outside either raises ``ResolutionError("rejected")`` and the sweep
+marks the row CANCELLED (pnl_net=0).
 
-Live settlement does NOT come through here: ``main._build_sweep_job`` wires
-Gamma's final ``outcomePrices`` and supplies no oracle fetcher at all. This
-module is the legacy/test path only.
+The price source is a pluggable ``Callable[[str, int], Optional[float]]`` so
+tests can stub it; the default returns ``None`` (treated as upstream down).
+
+Live settlement does not use this module: ``main._build_sweep_job`` settles
+from Gamma's final ``outcomePrices`` and wires no price fetcher.
 """
 
 from __future__ import annotations

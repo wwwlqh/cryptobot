@@ -40,13 +40,12 @@ logger = logging.getLogger(__name__)
 _MAX_QUEUE = 4096
 _REQUOTE_QUEUE: "queue.Queue[_PendingRequote]" = queue.Queue(maxsize=_MAX_QUEUE)
 
-# Minimum age before a queued reject is re-quoted — we want the book "a moment
-# after" the reject, not the same instant. Realized age is bounded by this
-# delay + the drain cadence and MUST stay far below the last-30s entry window:
-# at the original 60s drain cadence the realized age was p50≈32s (2026-07-11
-# EC2 snapshot), so ``requote_ask`` captured the near-terminal book — i.e. the
-# market OUTCOME, not post-reject fillability. ``requote_age_ms`` records the
-# TRUE age; treat rows with large ages as outcome-contaminated.
+# Wait at least this long before re-reading the book after a reject; we want
+# the book a moment later, not at the same instant. The real delay is this plus
+# the drain cadence and must stay far below the 30-second entry window,
+# otherwise ``requote_ask`` captures the near-final book (the outcome) rather
+# than whether the order could have filled. ``requote_age_ms`` records the
+# actual delay; treat rows with large ages with caution.
 _REREAD_DELAY_S = 1.0
 
 BookFetch = Callable[..., object]  # (token_id, *, now_ts) -> BookSnapshot|None

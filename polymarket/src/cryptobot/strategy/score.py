@@ -1,21 +1,17 @@
-"""Glue: per (coin, sleeve, checkpoint-second) compute (model_p, side, edge).
+"""Score one cell (coin, sleeve, second): model probability, side and edge.
 
-Pipeline per cell (``score_cell_hgb``):
-  1. compute partial_ret_z_1h (PartialRetEngine.current_z) at the FRACTIONAL
-     minute ``offset_sec / 60``
-  2. checkpoint RF.predict_proba slice → model_p_v1
-  3. build the 11-set feature row per executable side and serve the
-     per-interval checkpoint HGB → model_prob
-  4. compute the fee-adjusted pred_edge from the side-specific ask
-  5. side = the higher-edge side, matching the backtest's _dedupe_best_side
-  6. selected edge minus `sleeve.slippage_haircut` (D7 ordering)
+``score_cell_twap``:
 
-2026-07-31 (exp044 phase 2): the legacy lut|rf|blend scorers
-(``score_probability`` / ``score_pair_edges`` / ``score_cell``) went with the
-pair-sleeve subsystem and the decision_table/LUT chain. This module no longer
-imports ``lut_lookup`` at all; ``ScoreResult``'s ``lut_*`` fields survive only
-because they are ``signals``/``ledger`` DB columns, and the checkpoint path
-always writes the -1/None/0 sentinels.
+  1. compute the TWAP z-score (PartialRetEngine.current_z_from_open) at the
+     fractional minute ``offset_sec / 60``;
+  2. build the feature row for each tradable side and get the interval
+     model's probability;
+  3. compute the fee-adjusted edge from that side's ask;
+  4. pick the higher-edge side, as the backtest's _dedupe_best_side does;
+  5. subtract ``sleeve.slippage_haircut`` from the chosen edge.
+
+``ScoreResult``'s ``lut_*`` fields are always -1/None/0; they remain because
+``signals`` and ``ledger`` still have those columns.
 """
 
 from __future__ import annotations
@@ -42,8 +38,8 @@ class ScoreResult:
     side: str            # "YES" or "NO"
     edge: float          # fee-adjusted edge minus slippage_haircut (D7)
     realized_edge: float  # alias for clarity downstream
-    # Retired-LUT sentinels (-1 / None / 0). Kept because `signals` and
-    # `ledger` carry them as columns; the checkpoint scorer never populates them.
+    # Unused placeholders (-1 / None / 0), kept because ``signals`` and
+    # ``ledger`` have these columns.
     lut_p_bucket: int
     lut_hit_rate: Optional[float]
     lut_n_cum: int

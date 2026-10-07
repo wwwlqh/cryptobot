@@ -1,26 +1,20 @@
-"""Process-wide config singleton for live-execution credentials.
+"""Process-wide config singleton for live-trading credentials.
 
-Cryptobot's per-strategy LIVE deploy plan §U2 (2026-05-24-001) introduces real
-Polymarket credentials and on-chain endpoints. Loading them every tick (the
-default `BaseSettings()` shape) wastes I/O and exposes the bot to torn-write
-bugs during operator `.env` edits, so `get_config()` caches the first
-successful construction in a process-wide singleton.
+Holds Polymarket credentials and on-chain endpoints. ``get_config()`` caches
+the first successful load, so a tick never re-reads ``.env`` (and never sees a
+half-written file while the operator edits it).
 
-Mirrors `hightempbot/runtime_config.py` to keep the operator's mental model
-consistent across the two bots, with cryptobot-specific tweaks:
+  * ``dashboard_user`` / ``dashboard_pass`` back the dashboard's cookie
+    auth. A short or empty password with any LIVE wallet blocks boot.
+  * ``_validate_relayer_url`` checks RELAYER_URL against known prefixes. A
+    mismatch logs CRITICAL but boot continues, since Polymarket may publish a
+    new endpoint.
 
-  * `dashboard_user`/`dashboard_pass` are sized for cryptobot's hand-rolled
-    cookie auth (D-LIVE-13). A short or empty pass with any LIVE wallet in
-    `wallet_mode_state` blocks boot.
-  * `_validate_relayer_url` enforces the D-LIVE-27 prefix check at first
-    construction — mismatched RELAYER_URL emits a CRITICAL log but still
-    allows boot, since Polymarket may publish a replacement endpoint.
+Secrets are ``SecretStr``, so ``repr(cfg)`` never shows them; call
+``.get_secret_value()`` to read one.
 
-Secrets are wrapped in `SecretStr` so `repr(cfg)` never leaks. Code that
-needs the raw value must call `.get_secret_value()` explicitly.
-
-Test mode: tests call `set_config(SimpleConfig(...))` to inject a stub before
-any caller hits `get_config()`. `set_config(None)` forces a fresh read.
+Tests call ``set_config(SimpleConfig(...))`` to inject a stub before anything
+calls ``get_config()``; ``set_config(None)`` forces a fresh load.
 """
 
 from __future__ import annotations
@@ -37,10 +31,9 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 logger = logging.getLogger(__name__)
 
 
-# D-LIVE-27: known-good RELAYER_URL prefixes. Mismatch → CRITICAL log + Telegram
-# alert; still allowed to boot. Polymarket may publish a regional or
-# replacement endpoint we don't know about, and a fail-closed gate would brick
-# the operator's deploy on a Polymarket-side rename.
+# Known-good RELAYER_URL prefixes. A mismatch sends a CRITICAL log and Telegram
+# alert but does not block boot: Polymarket may publish a regional or
+# replacement endpoint, and failing closed would stop the bot over a rename.
 _KNOWN_RELAYER_PREFIXES: tuple[str, ...] = (
     "https://relayer-v2.polymarket.com",
     "https://relayer.polymarket.com",
@@ -51,10 +44,8 @@ _KNOWN_RELAYER_HOSTS: frozenset[str] = frozenset(
 
 
 class Config(BaseSettings):
-    """Pydantic settings model loaded from `.env` + process env vars.
-
-    Field naming follows the hightempbot port verbatim so the operator's
-    env vars carry over unchanged (POLY_*, NOTIFY_*, LIVE_*).
+    """Settings loaded from ``.env`` and the process environment (POLY_*,
+    NOTIFY_*, LIVE_* names).
     """
 
     model_config = SettingsConfigDict(
@@ -62,10 +53,9 @@ class Config(BaseSettings):
         env_file_encoding="utf-8",
         extra="ignore",
         case_sensitive=False,
-        # Audit w19oxqf24 (P2): dashboard_user/dashboard_pass carry a
-        # validation_alias (CRYPTOBOT_DASHBOARD_* with DASHBOARD_* fallback) so
-        # they bind to the same env var the auth path reads. populate_by_name
-        # keeps them settable by their Python field name too (kwargs / tests).
+        # dashboard_user / dashboard_pass bind to CRYPTOBOT_DASHBOARD_* (with
+        # DASHBOARD_* as a fallback), the same variables the auth code reads.
+        # populate_by_name lets tests set them by field name too.
         populate_by_name=True,
     )
 
@@ -105,19 +95,13 @@ class Config(BaseSettings):
     dry_run: bool = Field(default=True)
     initial_bankroll: float = Field(default=100.0)
 
-    # ---- Dashboard cookie auth (D-LIVE-13 / D-LIVE-26) -------------------
-    # Used by the SSE server's do_POST router for mode-flip / operator-
-    # control / transfer endpoints. Empty pass + any LIVE wallet → boot
-    # refuses (asserted by the boot gate, not here, to keep the Config
-    # construction side-effect free for tests).
-    # Audit w19oxqf24 (P2): the AUTH path (main.py boot gate + sse_server login
-    # handler) reads CRYPTOBOT_DASHBOARD_PASS directly via os.environ. These
-    # pydantic fields previously bound to the un-prefixed DASHBOARD_PASS /
-    # DASHBOARD_USER (no env_prefix, case-insensitive), so an operator who set
-    # the password as the root .env.example documented (DASHBOARD_PASS=) set a
-    # value with ZERO effect on auth. Bind to the SAME prefixed env vars the
-    # auth path uses so the documented config and the live check agree. The
-    # un-prefixed names are kept as secondary aliases for backward compat.
+    # ---- Dashboard cookie auth -------------------------------------------
+    # Used by the dashboard's POST endpoints (wallet mode, operator controls,
+    # transfers). An empty password with any LIVE wallet stops boot; the boot
+    # check enforces that, keeping Config construction side-effect free. These
+    # bind to the same CRYPTOBOT_DASHBOARD_* variables that main.py and the
+    # login handler read, so setting the documented variable always takes
+    # effect; the unprefixed names remain as fallbacks.
     dashboard_user: str = Field(
         default="admin",
         validation_alias=AliasChoices("CRYPTOBOT_DASHBOARD_USER", "DASHBOARD_USER"),
@@ -135,11 +119,10 @@ class Config(BaseSettings):
     notify_telegram_chat_id: str = Field(default="")
 
     def relayer_url_is_known(self) -> bool:
-        """D-LIVE-27: True iff `relayer_url` points at a known-good host.
+        """True if ``relayer_url`` starts with a known-good prefix.
 
-        Callers (boot path) log a CRITICAL warning when this returns False;
-        boot is NOT refused because a replacement endpoint may legitimately
-        appear before this list is updated.
+        The boot path logs CRITICAL when this is False but still boots, since a
+        legitimate new endpoint may appear before this list is updated.
         """
         try:
             parsed = urlsplit((self.relayer_url or "").strip())
@@ -158,7 +141,7 @@ class Config(BaseSettings):
         return (parsed.hostname or "").lower() in _KNOWN_RELAYER_HOSTS
 
 
-# --- Process-wide Config singleton (mirrors hightempbot/runtime_config.py) -
+# --- Process-wide Config singleton -------------------------------------
 
 _cfg_singleton: Config | None = None
 _cfg_lock = threading.Lock()
