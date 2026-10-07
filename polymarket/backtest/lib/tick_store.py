@@ -107,20 +107,6 @@ class TickStore:
             ).fetchone()
         return row is not None
 
-    def list_slugs(self) -> set[str]:
-        with self._lock:
-            rows = self._conn.execute("SELECT slug FROM ticks").fetchall()
-        return {row[0] for row in rows}
-
-    def slug_rows(self) -> dict[str, int]:
-        """``{slug: n_rows}`` — the cheap census, one index scan, no blob reads.
-
-        Its migration-skip caller went 2026-08-01; the live one is
-        ``lib/nb_common``'s substrate summary.
-        """
-        with self._lock:
-            rows = self._conn.execute("SELECT slug, n_rows FROM ticks").fetchall()
-        return {slug: int(n) for slug, n in rows}
 
     def count(self) -> int:
         with self._lock:

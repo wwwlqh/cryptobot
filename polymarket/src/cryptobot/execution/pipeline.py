@@ -225,10 +225,6 @@ def _v2_prune_window_decider(now_ts: int) -> None:
             dec._first_limit = {
                 k: v for k, v in dec._first_limit.items() if k[2] >= cutoff
             }
-        if len(dec._place_ranks) > _V2_DECIDER_PRUNE_ABOVE:
-            dec._place_ranks = {
-                k: v for k, v in dec._place_ranks.items() if k[2] >= cutoff
-            }
     if len(_V2_MARKET_FILLED) > _V2_DECIDER_PRUNE_ABOVE:
         _V2_MARKET_FILLED = {k for k in _V2_MARKET_FILLED if k[2] >= cutoff}
 
@@ -696,22 +692,6 @@ def _finite_float_or_none(value: Optional[float]) -> Optional[float]:
     if not math.isfinite(value_f):
         return None
     return value_f
-
-
-def _ask_from_books(
-    side: Optional[str],
-    yes_book: Optional[BookSnapshot],
-    no_book: Optional[BookSnapshot],
-) -> tuple[Optional[BookSnapshot], Optional[float]]:
-    if side == "YES":
-        book = yes_book
-    elif side == "NO":
-        book = no_book
-    else:
-        return None, None
-    if book is None:
-        return None, None
-    return book, _finite_float_or_none(book.top_ask)
 
 
 def _score_cell_for(
@@ -3015,21 +2995,6 @@ def _record_latency_trace(conn, tick: TickResult) -> None:
         conn.commit()
     except Exception:  # noqa: BLE001 — observability must never fail the tick
         logger.warning("latency trace write failed", exc_info=True)
-
-
-def _book_depth_usd(book: Optional[BookSnapshot]) -> float:
-    if book is None:
-        return 0.0
-    depth = float(getattr(book, "total_ask_depth_usd", 0.0) or 0.0)
-    if depth > 0.0:
-        return depth
-    total = 0.0
-    for level in getattr(book, "asks", ()) or ():
-        try:
-            total += float(level["price"]) * float(level["size"])
-        except (KeyError, TypeError, ValueError):
-            continue
-    return total
 
 
 def _resolve_net_cells(

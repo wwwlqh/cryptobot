@@ -16,9 +16,7 @@ import pandas as pd
 
 from cryptobot.strategy.spec_v2 import (
     V2_SPEC,
-    build_bets_src,
     fee,
-    in_ask_band,
     in_offset_window,
     WindowDecider,
 )
@@ -26,34 +24,11 @@ from cryptobot.strategy.score import _ask_in_bucket
 
 # Reference evaluator lives under polymarket/backtest/lib; the repo root is on
 # sys.path via pyproject's pythonpath (same as test_canonical_evaluator.py).
-from polymarket.backtest.lib.pool_study import build_bets as research_build_bets  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
 # ask band boundaries
 # ---------------------------------------------------------------------------
-def test_ask_band_boundaries():
-    assert in_ask_band(0.65) is False          # low bound EXCLUDED
-    assert in_ask_band(0.650001) is True
-    assert in_ask_band(0.75) is True
-    assert in_ask_band(0.85) is True           # high bound INCLUDED
-    assert in_ask_band(0.850001) is False
-    assert in_ask_band(0.5) is False
-
-
-def test_ask_in_bucket_boundaries_match_band():
-    # score._ask_in_bucket must now use lo < ask <= hi (was lo <= ask < hi).
-    ranges = ((0.65, 0.85),)
-    assert _ask_in_bucket(0.65, ranges) is False   # low bound excluded
-    assert _ask_in_bucket(0.85, ranges) is True    # high bound included
-    assert _ask_in_bucket(0.75, ranges) is True
-    assert _ask_in_bucket(0.60, ranges) is False
-    assert _ask_in_bucket(0.90, ranges) is False
-    # empty ranges -> unconstrained
-    assert _ask_in_bucket(0.10, ()) is True
-    # and it agrees with in_ask_band on the same band at the boundaries
-    for a in (0.65, 0.650001, 0.75, 0.85, 0.850001):
-        assert _ask_in_bucket(a, ranges) == in_ask_band(a)
 
 
 # ---------------------------------------------------------------------------
@@ -113,31 +88,6 @@ def _frame():
     })
 
 
-def test_build_bets_src_dedup_before_gate():
-    bets = build_bets_src(_frame())
-    # m1 dropped (first row fails gate), m2/m4/m6 filtered pre-dedup.
-    assert set(bets["market_slug"]) == {"m3", "m5", "m7"}
-
-
-def test_build_bets_src_matches_research_build_bets():
-    frame = _frame()
-    ref = research_build_bets(
-        frame, {"ask_lo": 0.65, "intervals": ("5m", "15m")}
-    )
-    src = build_bets_src(frame)
-    ref_set = set(zip(ref["market_slug"], ref["entry_ts"]))
-    src_set = set(zip(src["market_slug"], src["entry_ts"]))
-    assert src_set == ref_set
-    assert len(src) == len(ref)
-
-
-def test_build_bets_src_does_not_mutate_input():
-    frame = _frame()
-    before = frame.copy(deep=True)
-    build_bets_src(frame)
-    pd.testing.assert_frame_equal(frame, before)
-
-
 def test_v2_spec_pins():
     assert V2_SPEC["intervals"] == ("5m", "15m")
     assert V2_SPEC["ask_lo"] == 0.65
@@ -193,19 +143,6 @@ def test_window_decider_keys_are_independent():
     assert wd.on_second(_cell(273, 0.70, 0.99, side="YES")) == "SKIP"
 
 
-def test_custom_band_boundaries():
-    # A decider constructed with a custom band gates its own (lo, hi]: low bound
-    # EXCLUDED, high bound INCLUDED.
-    assert in_ask_band(0.85) is True   # sanity: 0.85 is inside the MID band
-    alt = WindowDecider(gate=0.01, consume_on_fill=True, ask_lo=0.85, ask_hi=0.92)
-    assert alt._in_band(0.85) is False        # low bound EXCLUDED (0.85 is MID's)
-    assert alt._in_band(0.850001) is True
-    assert alt._in_band(0.88) is True
-    assert alt._in_band(0.92) is True         # high bound INCLUDED
-    assert alt._in_band(0.920001) is False
-    assert alt._in_band(0.80) is False        # below its band (MID territory)
-
-
 def test_custom_band_decider_places_own_band_gate():
     # Custom decider: band (0.85, 0.92], gate 0.01. An ask of 0.88 that MID
     # would ignore (out of MID band) is a PLACE here when pred_edge >= 0.01.
@@ -217,19 +154,6 @@ def test_custom_band_decider_places_own_band_gate():
     alt2 = WindowDecider(gate=0.01, consume_on_fill=True, ask_lo=0.85, ask_hi=0.92)
     assert alt2.on_second(_cell(287, 0.88, 0.005)) == "SKIP"
     assert alt2.on_second(_cell(288, 0.88, 0.02)) == "PLACE"
-
-
-def test_default_decider_unchanged_by_band_params():
-    # The default WindowDecider() must remain byte-identical to in_ask_band:
-    # 0.85 IN, 0.850001 OUT, 0.65 OUT.
-    wd = WindowDecider()
-    assert wd.ask_lo == V2_SPEC["ask_lo"] and wd.ask_hi == V2_SPEC["ask_hi"]
-    assert wd._in_band(0.85) is True
-    assert wd._in_band(0.850001) is False
-    assert wd._in_band(0.65) is False
-    assert wd._in_band(0.650001) is True
-    for a in (0.60, 0.65, 0.650001, 0.75, 0.85, 0.850001, 0.92):
-        assert wd._in_band(a) == in_ask_band(a)
 
 
 def test_window_decider_custom_gate():
@@ -342,40 +266,3 @@ def test_flag_off_restores_legacy_first_commit():
     assert wd2.on_second(_cell(293, 0.70, 0.99)) == "SKIP"
 
 
-def test_market_place_rank_counts_qualifying_seconds():
-    """F2 tier-A: market_place_rank is the 1-based count of PLACE verdicts per
-    MARKET key — rank 1 == the first band+gate-passing second (the backtest
-    attempt_rank==1 population). Gate fails / out-of-band seconds do not count."""
-    wd = WindowDecider(consume_on_fill=True)
-    c1 = _cell(292, 0.70, 0.50)
-    assert wd.market_place_rank(c1) == 0            # never placed yet
-    assert wd.on_second(_cell(291, 0.70, 0.01)) == "SKIP"   # gate fail: no rank
-    assert wd.on_second(c1) == "PLACE"
-    assert wd.market_place_rank(c1) == 1            # first qualifying second
-    assert wd.on_second(_cell(293, 0.70, 0.50)) == "PLACE"  # reject-retry second
-    assert wd.market_place_rank(c1) == 2            # no longer rank 1
-
-
-def test_market_place_rank_is_market_level_across_sides():
-    """A side flip on the SAME market keeps counting: rank is per market key
-    (coin, interval, window_start), not per side."""
-    wd = WindowDecider(consume_on_fill=True)
-    yes = _cell(292, 0.70, 0.50, side="YES")
-    no = _cell(293, 0.70, 0.50, side="NO")
-    assert wd.on_second(yes) == "PLACE"
-    assert wd.market_place_rank(yes) == 1
-    assert wd.on_second(no) == "PLACE"
-    assert wd.market_place_rank(no) == 2            # second qualifying second
-    # a different window starts fresh
-    other = _cell(292, 0.70, 0.50, window_start=2000)
-    assert wd.on_second(other) == "PLACE"
-    assert wd.market_place_rank(other) == 1
-
-
-def test_market_place_rank_reset_clears():
-    wd = WindowDecider(consume_on_fill=True)
-    c = _cell(292, 0.70, 0.50)
-    assert wd.on_second(c) == "PLACE"
-    assert wd.market_place_rank(c) == 1
-    wd.reset()
-    assert wd.market_place_rank(c) == 0

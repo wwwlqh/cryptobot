@@ -1,4 +1,4 @@
-﻿"""U12 SSE POST endpoints + PostRouter tests.
+"""U12 SSE POST endpoints + PostRouter tests.
 
 Exercises the dashboard mutation surface end-to-end at the router
 level (no HTTP needed):

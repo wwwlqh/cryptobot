@@ -1,4 +1,4 @@
-﻿"""U4 capital snapshot tests.
+"""U4 capital snapshot tests.
 
 INITIAL_BANKROLL defaults to $100 as the starting capital anchor. D14 pin:
 drawdown denominator is INITIAL_BANKROLL (constant), NOT realized_capital.

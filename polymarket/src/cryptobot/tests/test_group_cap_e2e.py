@@ -1,4 +1,4 @@
-﻿"""U15b E2E: two LIVE wallets in the same group share the cap.
+"""U15b E2E: two LIVE wallets in the same group share the cap.
 
 Drives the full `run_scanner_tick` against a portfolio where both
 `v6_5m` and `pairs_5m` are LIVE. After `v6_5m` consumes most of the

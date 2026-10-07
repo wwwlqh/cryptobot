@@ -33,18 +33,6 @@ def test_round_trip_preserves_list_columns(tmp_path: Path) -> None:
     pd.testing.assert_frame_equal(_frame(), out)
 
 
-def test_has_slug_list_slugs_and_missing(tmp_path: Path) -> None:
-    with open_store(tmp_path / "t.db") as store:
-        store.write_ticks("a", _frame())
-        store.write_ticks("b", _frame(1))
-        assert store.has_slug("a") and not store.has_slug("zz")
-        assert store.list_slugs() == {"a", "b"}
-        assert store.slug_rows() == {"a": 2, "b": 2}
-        assert store.count() == 2
-        with pytest.raises(KeyError):
-            store.read_ticks("zz")
-
-
 def test_concurrent_writers_are_serialized(tmp_path: Path) -> None:
     with open_store(tmp_path / "t.db") as store:
         with ThreadPoolExecutor(max_workers=8) as pool:

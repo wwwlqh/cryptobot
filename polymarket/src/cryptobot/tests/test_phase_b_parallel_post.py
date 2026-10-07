@@ -49,7 +49,6 @@ def _stub_scorer(monkeypatch):
     install_fake_scorer(monkeypatch)
 
 
-
 def _fresh_db() -> sqlite3.Connection:
     return init_db(":memory:")
 

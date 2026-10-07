@@ -11,7 +11,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from polymarket.backtest.engine.sweep_lib import POLY_FEE_THETA, edge, pnl_per_bet
+from polymarket.backtest.engine.sweep_lib import POLY_FEE_THETA, edge
 
 
 def test_theta_constant_is_crypto_rate():
@@ -33,17 +33,6 @@ def test_fee_peaks_at_half():
     expected_edge_without_fee = 0.5 - 0.5
     expected_fee = POLY_FEE_THETA * 0.5 * 0.5
     assert e_half[0] == pytest.approx(expected_edge_without_fee - expected_fee)
-
-
-def test_pnl_per_bet_no_fee_on_loss():
-    fill = np.array([0.5])
-    # Up loses (won_up=0): pnl = -fill, NO fee deduction
-    pls_lose = pnl_per_bet("Up", fill, np.array([0]))
-    assert pls_lose[0] == pytest.approx(-0.5)
-    # Up wins (won_up=1): pnl = (1-fill) - theta*fill*(1-fill)
-    pls_win = pnl_per_bet("Up", fill, np.array([1]))
-    expected = 0.5 - POLY_FEE_THETA * 0.5 * 0.5
-    assert pls_win[0] == pytest.approx(expected)
 
 
 def test_edge_monotonic_in_model_p():

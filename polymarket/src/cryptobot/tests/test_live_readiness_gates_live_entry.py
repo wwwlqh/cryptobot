@@ -1,4 +1,4 @@
-﻿"""U15b E2E: stale readiness â†’ no LIVE entries even with operator=LIVE.
+"""U15b E2E: stale readiness â†’ no LIVE entries even with operator=LIVE.
 
 Verifies the pipeline's pre-gate readiness check at the wallet level.
 The plan's D-LIVE-5 + D-LIVE-20 combo says: even when the global

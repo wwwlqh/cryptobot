@@ -1,4 +1,4 @@
-﻿"""HTTP-level auth tests for the SSE server's /api/v2 surface.
+"""HTTP-level auth tests for the SSE server's /api/v2 surface.
 
 The router-level tests in `test_sse_endpoints.py` cover dispatch + body
 shape. This file fires real HTTP requests against a temporary server so

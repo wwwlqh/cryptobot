@@ -71,101 +71,6 @@ def lut_p_bucket_indices(p: np.ndarray, bucket_count: int = LUT_BUCKET_COUNT) ->
     )
 
 
-def simulate_bet_queue(
-    bets: pd.DataFrame,
-    *,
-    exposure_cap: float,
-    directional_cap: float | None = None,
-    sort_keys: list[str] | None = None,
-    return_picks: bool = False,
-) -> dict:
-    """Settle a pre-sized bet queue under shared bankroll + exposure cap.
-
-    Canonical implementation of the per-tick exposure-cap dance. Each caller
-    translates its domain object into the normalized columns below and this
-    function settles the queue identically for all of them.
-
-    Required columns on ``bets``:
-        entry_ts (int)        — entry time
-        resolve_ts (int)      — settlement time
-        notional (float)      — face notional this bet uses against the cap
-        pl (float)            — pre-computed dollar PnL for this bet
-
-    Optional column (required only when ``directional_cap`` is set):
-        side (str)            — "Up" or "Down" / "Yes" or "No"
-
-    Args:
-        exposure_cap: total pending notional cap in dollars
-        directional_cap: optional per-side pending notional cap in dollars
-        sort_keys: extra columns to sort by after ``entry_ts`` for
-            deterministic tie-breaking. Default: just ``entry_ts``.
-        return_picks: if True, additionally returns the kept rows (sorted)
-            and per-bet PnL array under keys ``picks`` and ``pls``.
-
-    Returns dict with keys ``n_bets``, ``total_pnl``, ``win_rate``,
-    ``max_dd``. ``win_rate`` is NaN on empty / fully-rejected input
-    (callers want to distinguish a zero-bet day from a 0% WR day).
-    """
-    empty_result = dict(n_bets=0, total_pnl=0.0, win_rate=float("nan"), max_dd=0.0)
-    if return_picks:
-        empty_result["picks"] = bets.iloc[0:0]
-        empty_result["pls"] = np.array([], dtype=np.float64)
-    if bets.empty:
-        return empty_result
-
-    sort_cols = ["entry_ts"] + (list(sort_keys) if sort_keys else [])
-    sorted_bets = bets.sort_values(sort_cols).reset_index(drop=True)
-
-    # active entry = (resolve_ts, notional, side); side is "" when directional
-    # cap is unused — sum() over an empty filter is 0 either way.
-    track_side = directional_cap is not None
-    if track_side and "side" not in sorted_bets.columns:
-        raise ValueError("simulate_bet_queue: directional_cap requires a 'side' column")
-
-    active: list[tuple[int, float, str]] = []
-    pls: list[float] = []
-    kept_idx: list[int] = []
-
-    for pos, row in enumerate(sorted_bets.itertuples(index=False)):
-        entry_ts = int(row.entry_ts)
-        active = [(rt, nt, sd) for rt, nt, sd in active if rt > entry_ts]
-        pending = sum(nt for _, nt, _ in active)
-
-        notional = float(row.notional)
-        if pending + notional > exposure_cap:
-            continue
-
-        if track_side:
-            row_side = str(row.side)
-            pending_same_side = sum(nt for _, nt, sd in active if sd == row_side)
-            if pending_same_side + notional > directional_cap:
-                continue
-        else:
-            row_side = ""
-
-        pls.append(float(row.pl))
-        kept_idx.append(pos)
-        active.append((int(row.resolve_ts), notional, row_side))
-
-    if not pls:
-        return empty_result
-
-    pls_arr = np.array(pls, dtype=np.float64)
-    cum = np.cumsum(pls_arr)
-    peak = np.maximum.accumulate(cum)
-    max_dd = float((peak - cum).max())
-    result = dict(
-        n_bets=len(pls),
-        total_pnl=float(pls_arr.sum()),
-        win_rate=float((pls_arr > 0).mean()),
-        max_dd=max_dd,
-    )
-    if return_picks:
-        result["picks"] = sorted_bets.iloc[kept_idx].reset_index(drop=True)
-        result["pls"] = pls_arr
-    return result
-
-
 def atomic_to_parquet(df: pd.DataFrame, path: str | os.PathLike[str], **kwargs: Any) -> None:
     """Write ``df`` to ``path`` atomically (write tmp, then ``os.replace``).
 
@@ -189,22 +94,6 @@ def edge(model_p_up: np.ndarray, yes_price: np.ndarray, no_price: np.ndarray, si
     if side == "Up":
         return model_p_up - yes_price - POLY_FEE_THETA * yes_price * (1.0 - yes_price)
     return (1.0 - model_p_up) - no_price - POLY_FEE_THETA * no_price * (1.0 - no_price)
-
-
-def pnl_per_bet(side: str, fill_price: np.ndarray, won_up: np.ndarray) -> np.ndarray:
-    """P&L per share for a single resolved bet.
-
-    win  = (1 - fill_price) - theta * fill_price * (1 - fill_price)
-         = (1 - fill_price) * (1 - theta * fill_price)
-    lose = -fill_price
-
-    Polymarket V2 only charges fees on the winning side, so the loss leg is
-    fee-free.
-    """
-    won_side = won_up if side == "Up" else (1 - won_up)
-    win = (1.0 - fill_price) - POLY_FEE_THETA * fill_price * (1.0 - fill_price)
-    lose = -fill_price
-    return np.where(won_side == 1, win, lose)
 
 
 def unit_pnl(

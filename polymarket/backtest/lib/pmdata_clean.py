@@ -94,25 +94,6 @@ def load_outcomes(path: str = OUTCOMES_PATH, ok_only: bool = True) -> pd.DataFra
     return out
 
 
-def clean_snapshot_frame(df: pd.DataFrame) -> pd.DataFrame:
-    """Normalize one raw poly_snapshot parquet to the canonical schema.
-
-    - adds a missing ``winning_outcome`` column as NaN (schema-drift files)
-    - timestamp coerced to UTC-naive datetime64[ms] regardless of source unit
-    - book arrays coerced to float64 numpy arrays (object-of-str variant parsed)
-    - placeholder strings normalized to NaN
-    """
-    df, _ = normalize_placeholders(df)
-    for col in EXPECTED_SNAPSHOT_COLUMNS:
-        if col not in df.columns:
-            df[col] = pd.NA
-    df = df.loc[:, list(EXPECTED_SNAPSHOT_COLUMNS)].copy()
-    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True).dt.tz_localize(None).astype("datetime64[ms]")
-    for col in ("ask_prices", "ask_sizes", "bid_prices", "bid_sizes"):
-        df[col] = df[col].map(_coerce_price_array)
-    return df
-
-
 def _coerce_price_array(value) -> np.ndarray | None:
     if value is None or (isinstance(value, float) and np.isnan(value)):
         return None

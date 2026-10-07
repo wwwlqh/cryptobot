@@ -53,55 +53,6 @@ class TestCalldataHelpers:
             "000000000000000000000000000000000000000000000000000000000000007b"
         )
 
-    def test_redeem_positions_calldata_passes_normalized_args(self, monkeypatch) -> None:
-        captured: dict[str, object] = {}
-
-        def fake_encode(signature, arg_types, args):
-            captured["signature"] = signature
-            captured["arg_types"] = arg_types
-            captured["args"] = args
-            return "0xredeem"
-
-        monkeypatch.setattr(primitives, "encode_contract_call", fake_encode)
-
-        condition_id = "0x" + "22" * 32
-        parent_collection_id = "0x" + "33" * 32
-        data = primitives.redeem_positions_calldata(
-            condition_id=condition_id,
-            parent_collection_id=parent_collection_id,
-            collateral_token=VALID_ADDRESS,
-            index_sets=[1, "2"],
-        )
-
-        assert data == "0xredeem"
-        assert captured["signature"] == (
-            "redeemPositions(address,bytes32,bytes32,uint256[])"
-        )
-        assert captured["arg_types"] == ["address", "bytes32", "bytes32", "uint256[]"]
-        assert captured["args"] == [
-            VALID_ADDRESS,
-            bytes.fromhex("33" * 32),
-            bytes.fromhex("22" * 32),
-            [1, 2],
-        ]
-
-    @pytest.mark.parametrize("index_sets", [[], [0], [-1], ["bad"]])
-    def test_redeem_positions_rejects_invalid_index_sets(
-        self, index_sets: list[int]
-    ) -> None:
-        with pytest.raises(ValueError, match="index_sets"):
-            primitives.redeem_positions_calldata(
-                condition_id="0x" + "22" * 32,
-                index_sets=index_sets,
-            )
-
-    def test_redeem_positions_rejects_invalid_condition_id(self) -> None:
-        with pytest.raises(ValueError, match="condition_id"):
-            primitives.redeem_positions_calldata(
-                condition_id="0x123",
-                index_sets=[1],
-            )
-
 
 def test_request_json_raises_with_response_payload(monkeypatch) -> None:
     class FakeResponse:

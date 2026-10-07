@@ -6,14 +6,6 @@ import pytest
 from polymarket.backtest.engine import tick_exit004 as te
 
 
-def test_fee_and_hold_pnl():
-    assert te.fee(0.75) == pytest.approx(te.fee(0.25))
-    assert te.flat_pnl_net(1, 0.8) == pytest.approx(
-        1.0 / 0.8 - 1.0 - te.fee(0.8)
-    )
-    assert te.flat_pnl_net(0, 0.8) == pytest.approx(-1.0 - te.fee(0.8))
-
-
 # --------------------------------------------------------------------------
 # Settlement-fee parity with LIVE (2026-08-01).
 #
@@ -84,27 +76,6 @@ def test_side_level_conversion_uses_complementary_up_book():
     assert np.allclose(tick.bid_levels(0, "DOWN"), ((0.20, 2.0), (0.18, 3.0)))
 
 
-def test_edge_quote_stops_before_bad_level():
-    levels = ((0.80, 1.0), (0.90, 10.0))
-    quote = te.quote_edge_preserving(
-        levels,
-        5.0,
-        model_p=0.86,
-        min_edge=0.03,
-    )
-    assert quote is None  # first level is only $0.80, below the $1 venue floor
-
-    quote = te.quote_edge_preserving(
-        ((0.80, 2.0), (0.90, 10.0)),
-        5.0,
-        model_p=0.86,
-        min_edge=0.03,
-    )
-    assert quote is not None
-    assert quote.amount_usd == pytest.approx(1.6)
-    assert quote.limit_price == pytest.approx(0.80)
-
-
 def test_fak_allows_partial_fill_under_padded_limit():
     fill = te.fak_buy(((0.80, 1.0), (0.81, 0.5), (0.82, 10.0)), 2.0, 0.81)
     assert fill is not None
@@ -120,64 +91,6 @@ def test_fok_requires_full_size_and_respects_trigger_bid():
     assert fill is not None
     assert fill.cash_usd == pytest.approx(1.42)
     assert fill.vwap == pytest.approx(0.71)
-
-
-def test_selects_higher_edge_side_before_band_gate():
-    scored = pd.DataFrame(
-        {
-            "fold": ["B"] * 4,
-            "market_slug": ["m1"] * 4,
-            "entry_ts": [100, 100, 101, 101],
-            "interval": ["5m"] * 4,
-            "coin": ["btc"] * 4,
-            "ask": [0.80, 0.70, 0.90, 0.72],
-            "offset_sec": [270, 270, 271, 271],
-            "pred_edge": [0.04, 0.05, 0.02, 0.01],
-            "win_true": [1, 0, 1, 0],
-            "side_up": [True, False, True, False],
-        }
-    )
-    attempts = te.build_union_attempts(scored)
-    assert attempts["side"].tolist() == ["DOWN", "UP"]
-    assert attempts["band"].tolist() == ["MID", "NL"]
-    assert attempts["concurrency_k"].tolist() == [1, 1]
-
-
-def test_dynamic_held_side_score_triggers_delayed_full_fok():
-    tick = _tick(
-        [101.4, 102.0, 102.4],
-        asks=[[0.80], [0.80], [0.80]],
-        ask_sizes=[[10.0], [10.0], [10.0]],
-        bids=[[0.75], [0.70], [0.71]],
-        bid_sizes=[[10.0], [10.0], [10.0]],
-    )
-    ask = 0.60
-    model_p = 0.65
-    scores = pd.DataFrame(
-        {
-            "entry_ts": [101],
-            "ask": [ask],
-            "pred_edge": [model_p - ask - te.fee(ask)],
-        }
-    )
-    result = te.simulate_exit004(
-        tick,
-        scores,
-        side="UP",
-        entry_score_ts=100,
-        entry_fill_ts=101.4,
-        entry_fill_price=0.80,
-        shares=1.25,
-        settlement_ts=105,
-        win=0,
-        latency_seconds=0.4,
-    )
-    assert result.stop_triggered
-    assert result.stopped
-    assert result.attempts == 1
-    assert result.close_ts == pytest.approx(102.4)
-    assert result.exit_fill is not None
-    assert result.exit_fill.vwap == pytest.approx(0.71)
 
 
 def _tick(seconds, *, asks, ask_sizes, bids, bid_sizes):

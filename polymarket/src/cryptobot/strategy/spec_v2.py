@@ -61,15 +61,6 @@ def fee(ask):
     return config.POLY_FEE_THETA * ask * (1.0 - ask)
 
 
-def in_ask_band(ask: float) -> bool:
-    """True when ``0.65 < ask <= 0.85`` (open low, closed high).
-
-    Matches ``pool_study.build_bets`` (``ask > lo & ask <= hi``): the low bound
-    0.65 is EXCLUDED, the high bound 0.85 is INCLUDED.
-    """
-    return (ask > V2_SPEC["ask_lo"]) and (ask <= V2_SPEC["ask_hi"])
-
-
 def in_offset_window(interval: str, offset_sec: int) -> bool:
     """True when ``offset_sec`` lands in the interval's last-30s per-second window.
 
@@ -85,35 +76,6 @@ def in_offset_window(interval: str, offset_sec: int) -> bool:
 # ---------------------------------------------------------------------------
 # Frame-level bet construction — pure replica of pool_study.build_bets
 # ---------------------------------------------------------------------------
-def build_bets_src(frame, spec: Mapping[str, Any] | None = None):
-    """Pure re-implementation of ``pool_study.build_bets`` for src parity.
-
-    ``frame`` must carry columns: ``market_slug, entry_ts, interval, coin, ask,
-    offset_sec, reachable, pred_edge`` (plus ``range_z`` / ``partial_ret_z_side``
-    only when the corresponding orb/z gates are active, and any payout columns
-    such as ``side_fill_ask, win_true`` that callers want to keep).
-
-    Frozen order (matches pool_study.py:265-276): interval/coin -> ask band ->
-    offset window -> [orb] -> [z] -> reachable -> dedup (first entry_ts per
-    market) -> gate. Returns a NEW DataFrame; the input is not mutated.
-    """
-    s = dict(V2_SPEC, **(spec or {}))
-    d = frame
-    d = d[d["interval"].isin(s["intervals"]) & d["coin"].isin(s["coins"])]
-    d = d[(d["ask"] > s["ask_lo"]) & (d["ask"] <= s["ask_hi"])]
-    off = d["offset_sec"] - np.where(d["interval"] == "5m", 270, 870)
-    d = d[(off >= s["off_lo"]) & (off <= s["off_hi"])]
-    if s["orb_min"] > 0:
-        d = d[d["range_z"].abs() >= s["orb_min"]]
-    if s["z_min"] > 0:
-        d = d[d["partial_ret_z_side"].abs() >= s["z_min"]]
-    if s["reachable_only"]:
-        d = d[d["reachable"]]
-    # dedup BEFORE gate: earliest entry_ts per market, then apply the gate.
-    d = d.sort_values(["market_slug", "entry_ts"]).groupby(
-        "market_slug", as_index=False
-    ).first()
-    return d[d["pred_edge"] >= s["gate"]].copy()
 
 
 # ---------------------------------------------------------------------------
@@ -185,10 +147,6 @@ class WindowDecider:
         self._filled: set[tuple] = set()              # market keys spent by a fill
         self._attempts: dict[tuple, int] = {}         # side key -> placement count
         self._attempted_offsets: dict[tuple, set] = {}  # side key -> offsets fired
-        # market key -> count of PLACE verdicts this window (qualifying-second
-        # rank; feeds the F2 tier-A size boost: rank 1 == the market's FIRST
-        # band+gate-passing second, the backtest attempt_rank==1 population).
-        self._place_ranks: dict[tuple, int] = {}
         # Anchored FAK pad (config.V2_FAK_PAD): side key -> walked_limit of the
         # FIRST placed attempt in this (coin, interval, window_start, side)
         # window. See :meth:`anchor_limit`.
@@ -234,7 +192,6 @@ class WindowDecider:
         # First in-band, in-window second: commit and gate exactly this second.
         self._committed.add(key)
         if cell["pred_edge"] >= self.gate:
-            self._note_place(cell)
             return "PLACE"
         return "WINDOW_DONE"
 
@@ -256,25 +213,7 @@ class WindowDecider:
             # Gate FAIL does NOT consume — this second is dead, the next second
             # (fresh book / fresh score / fresh ask) is independently eligible.
             return "SKIP"
-        self._note_place(cell)
         return "PLACE"
-
-    def _note_place(self, cell: Mapping[str, Any]) -> None:
-        mkey = self._market_key(cell)
-        self._place_ranks[mkey] = self._place_ranks.get(mkey, 0) + 1
-
-    def market_place_rank(self, cell: Mapping[str, Any]) -> int:
-        """1-based rank of the market's most recent PLACE verdict.
-
-        Counts band+gate-passing seconds per MARKET key (both sides), i.e. the
-        live replica of the backtest ``attempt_rank``: rank 1 is the FIRST
-        qualifying second of this (coin, interval, window) resolution. Read it
-        immediately after :meth:`on_second` returns ``"PLACE"`` for the same
-        cell. In-memory only — a restart mid-window resets to 0, which callers
-        must treat as "not rank 1" (fail-conservative for the tier-A boost).
-        Returns 0 if this market has never PLACEd.
-        """
-        return self._place_ranks.get(self._market_key(cell), 0)
 
     def next_attempt(self, cell: Mapping[str, Any]) -> int:
         """Increment and return the 1-based placement-attempt number for this
@@ -331,4 +270,3 @@ class WindowDecider:
         self._attempts.clear()
         self._attempted_offsets.clear()
         self._first_limit.clear()
-        self._place_ranks.clear()

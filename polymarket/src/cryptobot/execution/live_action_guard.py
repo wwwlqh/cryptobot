@@ -71,17 +71,6 @@ def require_processing_enabled(conn: sqlite3.Connection) -> None:
     )
 
 
-def require_no_transfer_lock(conn: sqlite3.Connection) -> None:
-    """Reject any action that must not run during a transfer (e.g.,
-    promoting a wallet to LIVE)."""
-    state = get_operator_state(conn)
-    if state.state == TRANSFER_LOCK:
-        raise BlockedError(
-            "transfer_lock",
-            "operator state is TRANSFER_LOCK; action refused",
-        )
-
-
 # ---------------------------------------------------------------------------
 # Readiness gate (D-LIVE-5 / D-LIVE-9)
 # ---------------------------------------------------------------------------

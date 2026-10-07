@@ -49,38 +49,6 @@ logger = logging.getLogger(__name__)
 PolymarketResolutionFetcher = Callable[[str, int, int], Optional[PolymarketResolution]]
 
 
-def _unit_pnl(side: str, fill_price: float, won_up: bool, slippage_haircut: float = 0.0) -> float:
-    """Per-share P&L for one Polymarket binary share — D2 parity.
-
-    Thin wrapper over ``cryptobot.strategy.parity.unit_pnl``. The U16
-    parity test asserts this runtime copy agrees with ``backtest.sweep_lib``.
-    """
-    from cryptobot.strategy.parity import unit_pnl as _shared_unit_pnl
-
-    return _shared_unit_pnl(side, fill_price, won_up, slippage_haircut=slippage_haircut)
-
-
-def _cash_pnl(
-    side: str,
-    fill_price: float,
-    won_up: bool,
-    stake_usd: float,
-    slippage_haircut: float = 0.0,
-) -> float:
-    """Uncalibrated dollar P&L — the U16 backtest-parity surface ONLY.
-
-    Since the 2026-07-23 calibrated fee grading, settlement books through
-    ``_graded_cash_pnl`` below; this wrapper stays so the parity test
-    (test_backtest_parity) can keep pinning the frozen
-    ``strategy.parity`` <-> ``backtest.sweep_lib`` chain byte-for-byte.
-    """
-    from cryptobot.strategy.parity import cash_pnl as _shared_cash_pnl
-
-    return _shared_cash_pnl(
-        side, fill_price, won_up, stake_usd, slippage_haircut=slippage_haircut
-    )
-
-
 def _graded_cash_pnl(
     side: str,
     fill_price: float,

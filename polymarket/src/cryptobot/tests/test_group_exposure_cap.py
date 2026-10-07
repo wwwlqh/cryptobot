@@ -1,4 +1,4 @@
-﻿"""U6 group exposure cap tests.
+"""U6 group exposure cap tests.
 
 Covers `_gate_group_exposure` (LIVE-only, D-LIVE-2 / D-LIVE-4 / D-LIVE-14)
 both at the unit level (GateInput â†’ GateResult) and the integration level

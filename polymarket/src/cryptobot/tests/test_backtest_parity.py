@@ -1,4 +1,4 @@
-﻿"""U16 backtest-parity test (R-NEW-19 enforcement, CI-blocking).
+"""U16 backtest-parity test (R-NEW-19 enforcement, CI-blocking).
 
 For each of 100 historical rows from `decision_table.parquet`, drive the
 live `_unit_pnl` / cash sizing formulas and assert they match the backtest's
@@ -34,10 +34,8 @@ from __future__ import annotations
 import pytest
 
 from cryptobot import config
-from cryptobot.scheduler.resolution_sweep import (
-    _cash_pnl as live_cash_pnl,
-    _unit_pnl as live_unit_pnl,
-)
+from cryptobot.strategy.parity import cash_pnl as live_cash_pnl
+from cryptobot.strategy.parity import unit_pnl as live_unit_pnl
 from cryptobot.strategy.portfolio_loader import load_sleeves
 from cryptobot.tests._legacy_artifact import legacy_portfolio
 

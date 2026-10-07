@@ -1,4 +1,4 @@
-﻿"""U15b E2E: transfer lock blocks LIVE entries, releases on completion.
+"""U15b E2E: transfer lock blocks LIVE entries, releases on completion.
 
 Mirrors the pipeline pre-gate guard chain from U6:
   1. Operator presses Start â†’ state=LIVE.

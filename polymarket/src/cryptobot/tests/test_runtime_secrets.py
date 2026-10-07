@@ -22,7 +22,6 @@ from cryptobot_polymarket.walker import (
 from cryptobot.runtime_secrets import (
     Config,
     get_config,
-    known_relayer_prefixes,
     set_config,
 )
 
@@ -196,9 +195,6 @@ class TestRelayerPrefixGate:
         cfg = Config(relayer_url="https://evil.example.com/relayer")
         assert not cfg.relayer_url_is_known()
 
-    def test_known_prefixes_export_includes_v2_endpoint(self) -> None:
-        prefixes = known_relayer_prefixes()
-        assert "https://relayer-v2.polymarket.com" in prefixes
 
     def test_trailing_slash_does_not_break_known(self) -> None:
         cfg = Config(relayer_url="https://relayer-v2.polymarket.com/")

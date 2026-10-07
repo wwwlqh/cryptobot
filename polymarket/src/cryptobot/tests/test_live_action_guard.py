@@ -25,7 +25,6 @@ from cryptobot.db.connection import utc_now_sql
 from cryptobot.execution.live_action_guard import (
     require_fresh_live_readiness,
     require_fresh_wallet_reconciliation,
-    require_no_transfer_lock,
     require_processing_enabled,
     require_wallet_can_go_live,
 )
@@ -103,20 +102,6 @@ class TestRequireProcessingEnabled:
         enter_transfer_lock(conn)
         with pytest.raises(BlockedError) as exc:
             require_processing_enabled(conn)
-        assert exc.value.reason == "transfer_lock"
-
-
-class TestRequireNoTransferLock:
-    def test_passes_when_not_transfer_lock(self, conn: sqlite3.Connection) -> None:
-        require_no_transfer_lock(conn)
-        start_processing(conn)
-        require_no_transfer_lock(conn)
-
-    def test_blocks_when_transfer_lock(self, conn: sqlite3.Connection) -> None:
-        start_processing(conn)
-        enter_transfer_lock(conn)
-        with pytest.raises(BlockedError) as exc:
-            require_no_transfer_lock(conn)
         assert exc.value.reason == "transfer_lock"
 
 

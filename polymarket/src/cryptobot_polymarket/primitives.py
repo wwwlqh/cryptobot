@@ -147,40 +147,6 @@ def _validate_bytes32(value: str, *, name: str) -> bytes:
     return bytes.fromhex(text)
 
 
-def redeem_positions_calldata(
-    *,
-    condition_id: str,
-    index_sets: list[int],
-    collateral_token: str = PUSD_ADDRESS,
-    parent_collection_id: str = "0x" + "0" * 64,
-) -> str:
-    """Encode Polymarket pUSD adapter redeemPositions calldata.
-
-    The pUSD-native redemption path routes through the collateral adapters and
-    burns the caller's full token balance for the condition/index sets. There is
-    intentionally no amount parameter.
-    """
-    try:
-        normalized_index_sets = [int(index) for index in index_sets]
-    except (TypeError, ValueError) as exc:
-        raise ValueError(
-            "index_sets must contain positive CTF index set integers."
-        ) from exc
-    if not normalized_index_sets or any(index <= 0 for index in normalized_index_sets):
-        raise ValueError("index_sets must contain positive CTF index set integers.")
-
-    return encode_contract_call(
-        "redeemPositions(address,bytes32,bytes32,uint256[])",
-        ["address", "bytes32", "bytes32", "uint256[]"],
-        [
-            validate_address(collateral_token, name="collateral token"),
-            _validate_bytes32(parent_collection_id, name="parent_collection_id"),
-            _validate_bytes32(condition_id, name="condition_id"),
-            normalized_index_sets,
-        ],
-    )
-
-
 def derive_wallets(
     private_key: str,
     *,

@@ -1,4 +1,4 @@
-﻿"""U5 v6 sleeve loader tests.
+"""U5 v6 sleeve loader tests.
 
 Reads the real `backtest/optimize_runs/v2_step1last_live.json` (the deployed
 v2 "step1last" checkpoint-only config — the exp044/ORB minute strategy was

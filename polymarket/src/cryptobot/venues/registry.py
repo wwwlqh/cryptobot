@@ -49,10 +49,6 @@ def active_adapter() -> "VenueAdapter":
     return get_adapter(config.VENUE)
 
 
-def _reset_cache_for_tests() -> None:
-    _ADAPTER_CACHE.clear()
-
-
 __all__ = [
     "VENUE_PACKAGES",
     "KNOWN_VENUES",

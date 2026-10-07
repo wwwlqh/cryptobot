@@ -478,40 +478,6 @@ def subminute_window_existing_side(
     return str(raw) if raw is not None else None
 
 
-def subminute_window_existing_side_any_sleeve(
-    conn: sqlite3.Connection,
-    *,
-    coin: str,
-    interval_min: int,
-    window_start_ts: int,
-) -> Optional[str]:
-    """First non-cancelled side already opened on this resolution market, ACROSS
-    ALL sleeves.
-
-    The cross-sleeve twin of ``subminute_window_existing_side`` (which filters
-    ``WHERE sleeve = ?`` and so only sees one band's entries). Scoped exactly
-    like ``count_window_entries`` — (coin, interval_min, window_start_ts) — which
-    identifies the single binary market that every loaded sleeve scores
-    (``interval_min`` separates 5m vs 15m markets sharing a
-    ``window_start_ts``). The multifill gate (operator 2026-07-10) uses this to
-    enforce that every extra entry on a resolution is the SAME side as whatever
-    already opened it (any sleeve): buying both YES and NO on one binary is a
-    guaranteed-losing hedge, so an opposite-side candidate is rejected even
-    though multifill deliberately bypasses the first-fill-wins guard.
-    """
-    row = conn.execute(
-        "SELECT side FROM ledger "
-        "WHERE coin = ? AND interval_min = ? "
-        "  AND window_start_ts = ? AND outcome != 'CANCELLED' "
-        "ORDER BY bet_ts ASC, id ASC LIMIT 1",
-        (coin, int(interval_min), int(window_start_ts)),
-    ).fetchone()
-    if row is None:
-        return None
-    raw = row["side"] if isinstance(row, sqlite3.Row) else row[0]
-    return str(raw) if raw is not None else None
-
-
 def subminute_slot_seen(
     conn: sqlite3.Connection,
     *,
@@ -561,36 +527,6 @@ def subminute_market_other_sleeve(
         (coin, int(interval_min), int(window_start_ts), sleeve),
     ).fetchone()
     return row is not None
-
-
-def count_window_entries(
-    conn: sqlite3.Connection,
-    *,
-    coin: str,
-    interval_min: int,
-    window_start_ts: int,
-) -> int:
-    """Number of INDEPENDENT non-cancelled entries on this resolution market.
-
-    Counts top-level entries (``is_topup = 0``) across ALL sleeves and sides on
-    this exact (coin, interval_min, window) market. This is the durable,
-    restart-safe entry tally the multifill gate reads (operator 2026-07-10): a
-    further INDEPENDENT entry is admissible once this count is >= 1. Only FILLS
-    write a ledger row (a reject records no row), so a count >= 1 proves a prior
-    entry actually filled — the sole requirement now that the fixed per-resolution
-    count ceiling is removed (operator 2026-07-11). Cross-sleeve by design — two
-    sleeves taking the same market count as two entries.
-    """
-    row = conn.execute(
-        "SELECT COUNT(*) AS n FROM ledger "
-        "WHERE coin = ? AND interval_min = ? AND window_start_ts = ? "
-        "  AND is_topup = 0 AND outcome != 'CANCELLED'",
-        (coin, int(interval_min), int(window_start_ts)),
-    ).fetchone()
-    if row is None:
-        return 0
-    n = row["n"] if isinstance(row, sqlite3.Row) else row[0]
-    return int(n or 0)
 
 
 def claim_subminute_scan(

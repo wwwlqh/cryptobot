@@ -192,6 +192,3 @@ def set_config(cfg: Optional[Config]) -> None:
         _cfg_singleton = cfg
 
 
-def known_relayer_prefixes() -> tuple[str, ...]:
-    """Expose the D-LIVE-27 prefix tuple for tests + boot-gate logging."""
-    return _KNOWN_RELAYER_PREFIXES

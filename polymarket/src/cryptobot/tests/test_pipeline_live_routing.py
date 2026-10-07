@@ -1,4 +1,4 @@
-﻿"""U6 pipeline LIVE/DRY routing tests.
+"""U6 pipeline LIVE/DRY routing tests.
 
 Covers the per-strategy mode router in `_commit_cell` and
 `_commit_pair_candidate`:

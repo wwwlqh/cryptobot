@@ -1,4 +1,4 @@
-﻿"""U15a Phase-1 E2E foundation tests.
+"""U15a Phase-1 E2E foundation tests.
 
 Per the 2026-05-24-001 per-strategy LIVE deploy plan Â§U15a:
 

@@ -15,20 +15,6 @@ def test_spot_at_seconds_uses_latest_prior_second() -> None:
     assert got[1:].tolist() == [10.0, 10.0, 11.0, 12.0]
 
 
-def test_side_books_from_snapshot_builds_up_and_down_asks() -> None:
-    snap = pd.Series(
-        {
-            "ask_prices": [0.44, 0.46],
-            "ask_sizes": [100.0, 50.0],
-            "bid_prices": [0.41, 0.43],
-            "bid_sizes": [75.0, 25.0],
-        }
-    )
-    up, down = s._side_books_from_snapshot(snap)
-    assert up[0] == {"price": 0.44, "size": 100.0}
-    assert down[0] == {"price": 0.5700000000000001, "size": 25.0}
-
-
 def test_top_side_filters_dust_and_mirrors_down_bid() -> None:
     up_best, up_depth = s._top_side([0.0, 0.46, 0.44, 1.0], [10.0, 50.0, 100.0, 20.0], mirror_bid=False)
     down_best, down_depth = s._top_side([0.41, 0.43, 0.0], [75.0, 25.0, 10.0], mirror_bid=True)

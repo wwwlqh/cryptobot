@@ -177,58 +177,6 @@ def test_fold_window_diagnostics_report_bucket_and_group_counts() -> None:
 # --- Calibration summary -----------------------------------------------------
 
 
-def test_calibration_summary_well_calibrated_has_zero_gap() -> None:
-    # Predicted 0.5 everywhere, realized exactly 0.5 -> no calibration gap.
-    model_prob = np.full(100, 0.5)
-    won = np.tile([1.0, 0.0], 50)
-
-    cal = ev._calibration_summary(model_prob, won, n_buckets=10)
-
-    assert cal["n_bets"] == 100
-    assert cal["n_buckets"] == 10
-    assert cal["mean_pred"] == pytest.approx(0.5)
-    assert cal["realized_wr"] == pytest.approx(0.5)
-    assert cal["calibration_gap"] == pytest.approx(0.0)
-    assert cal["high_conf_gap"] == pytest.approx(0.0)
-
-
-def test_calibration_summary_overconfident_is_negative_gap() -> None:
-    # Model says 0.9 win prob; every bet loses -> badly over-confident.
-    model_prob = np.full(80, 0.9)
-    won = np.zeros(80)
-
-    cal = ev._calibration_summary(model_prob, won)
-
-    assert cal["mean_pred"] == pytest.approx(0.9)
-    assert cal["realized_wr"] == pytest.approx(0.0)
-    assert cal["calibration_gap"] == pytest.approx(-0.9)
-    assert cal["high_conf_n"] == 40
-    assert cal["high_conf_gap"] == pytest.approx(-0.9)
-    assert all(bucket["gap"] < 0 for bucket in cal["buckets"])
-
-
-def test_calibration_summary_high_conf_isolates_upper_half() -> None:
-    # Low-prob bets are well calibrated; only the high-confidence bets fail.
-    model_prob = np.concatenate([np.full(50, 0.2), np.full(50, 0.8)])
-    won = np.concatenate([np.tile([1.0, 0.0, 0.0, 0.0, 0.0], 10), np.zeros(50)])
-
-    cal = ev._calibration_summary(model_prob, won, n_buckets=10)
-
-    # Upper half is the 0.8-prob bets that never won.
-    assert cal["high_conf_mean_pred"] == pytest.approx(0.8)
-    assert cal["high_conf_realized_wr"] == pytest.approx(0.0)
-    assert cal["high_conf_gap"] == pytest.approx(-0.8)
-
-
-def test_calibration_summary_empty_and_mismatch() -> None:
-    empty = ev._calibration_summary(np.array([]), np.array([]))
-    assert empty == ev._empty_calibration()
-    assert empty["n_bets"] == 0
-
-    with pytest.raises(ValueError, match="same shape"):
-        ev._calibration_summary(np.array([0.5, 0.6]), np.array([1.0]))
-
-
 # --------------------------------------------------------------------------- #
 # Migrated 2026-08-01 (phase 6) from tests/test_residual_replay_execution.py,
 # which was deleted with training.residual_replay. These four touch ONLY

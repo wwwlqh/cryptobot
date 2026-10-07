@@ -108,24 +108,6 @@ def _spot_at_seconds(sec: np.ndarray, spot: np.ndarray, targets: np.ndarray) -> 
     return out
 
 
-def _side_books_from_snapshot(snap: pd.Series) -> tuple[list[dict[str, float]], list[dict[str, float]]]:
-    up: list[dict[str, float]] = []
-    down: list[dict[str, float]] = []
-    for price, size in zip(snap["ask_prices"], snap["ask_sizes"]):
-        p = float(price)
-        z = float(size)
-        if math.isfinite(p) and math.isfinite(z) and 0.0 < p < 1.0 and z > 0:
-            up.append({"price": p, "size": z})
-    for bid, size in zip(snap["bid_prices"], snap["bid_sizes"]):
-        p = 1.0 - float(bid)
-        z = float(size)
-        if math.isfinite(p) and math.isfinite(z) and 0.0 < p < 1.0 and z > 0:
-            down.append({"price": p, "size": z})
-    up.sort(key=lambda x: x["price"])
-    down.sort(key=lambda x: x["price"])
-    return up, down
-
-
 def _top_side(prices, sizes, *, mirror_bid: bool) -> tuple[float, float]:
     best = math.nan
     depth = 0.0

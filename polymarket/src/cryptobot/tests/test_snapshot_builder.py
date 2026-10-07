@@ -1,4 +1,4 @@
-﻿"""U12 snapshot_builder tests â€” payload shape + KPI math."""
+"""U12 snapshot_builder tests â€” payload shape + KPI math."""
 
 from __future__ import annotations
 
