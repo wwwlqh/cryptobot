@@ -1,0 +1,97 @@
+{
+  "$schema": "https://developer.microsoft.com/json-schemas/fabric/item/report/definition/visualContainer/2.4.0/schema.json",
+  "name": "coins_03",
+  "position": {
+    "x": 24,
+    "y": 444,
+    "z": 3,
+    "width": 808,
+    "height": 252,
+    "tabOrder": 3
+  },
+  "visual": {
+    "visualType": "clusteredColumnChart",
+    "query": {
+      "queryState": {
+        "Category": {
+          "projections": [
+            {
+              "field": {
+                "Column": {
+                  "Expression": {
+                    "SourceRef": {
+                      "Entity": "trades"
+                    }
+                  },
+                  "Property": "bet_hour_utc"
+                }
+              },
+              "queryRef": "trades.bet_hour_utc",
+              "nativeQueryRef": "bet_hour_utc",
+              "displayName": "Hour (UTC)"
+            }
+          ]
+        },
+        "Y": {
+          "projections": [
+            {
+              "field": {
+                "Measure": {
+                  "Expression": {
+                    "SourceRef": {
+                      "Entity": "trades"
+                    }
+                  },
+                  "Property": "Net PnL"
+                }
+              },
+              "queryRef": "trades.Net PnL",
+              "nativeQueryRef": "Net PnL",
+              "displayName": "Net P&L"
+            }
+          ]
+        }
+      },
+      "sortDefinition": {
+        "sort": [
+          {
+            "field": {
+              "Column": {
+                "Expression": {
+                  "SourceRef": {
+                    "Entity": "trades"
+                  }
+                },
+                "Property": "bet_hour_utc"
+              }
+            },
+            "direction": "Ascending"
+          }
+        ],
+        "isDefaultSort": false
+      }
+    },
+    "visualContainerObjects": {
+      "title": [
+        {
+          "properties": {
+            "show": {
+              "expr": {
+                "Literal": {
+                  "Value": "true"
+                }
+              }
+            },
+            "text": {
+              "expr": {
+                "Literal": {
+                  "Value": "'Net P&L by hour of day (UTC)'"
+                }
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

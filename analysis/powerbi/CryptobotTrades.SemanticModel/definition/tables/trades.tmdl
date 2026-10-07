@@ -1,0 +1,178 @@
+table trades
+
+	measure 'Trades' = COUNTROWS ( trades )
+		formatString: #,0
+
+	measure 'Resolved Trades' = CALCULATE ( [Trades], trades[outcome] <> "Pending" )
+		formatString: #,0
+
+	measure 'Net PnL' = SUM ( trades[pnl_usd] )
+		formatString: \$#,0.00;-\$#,0.00;\$0.00
+
+	measure 'Total Staked' = SUM ( trades[stake_usd] )
+		formatString: \$#,0
+
+	measure 'ROI %' = DIVIDE ( [Net PnL], [Total Staked] )
+		formatString: 0.00%
+
+	measure 'Win Rate %' = DIVIDE ( CALCULATE ( [Trades], trades[pnl_usd] > 0 ), [Resolved Trades] )
+		formatString: 0.0%
+
+	measure 'Avg Win' = CALCULATE ( AVERAGE ( trades[pnl_usd] ), trades[pnl_usd] > 0 )
+		formatString: \$#,0.00;-\$#,0.00;\$0.00
+
+	measure 'Avg Loss' = CALCULATE ( AVERAGE ( trades[pnl_usd] ), trades[pnl_usd] < 0 )
+		formatString: \$#,0.00;-\$#,0.00;\$0.00
+
+	measure 'Model Accuracy %' = CALCULATE ( AVERAGE ( trades[model_correct] ), NOT ISBLANK ( trades[model_prob] ) )
+		formatString: 0.0%
+
+	measure 'Avg Model Prob %' = AVERAGE ( trades[model_prob] )
+		formatString: 0.0%
+
+	measure 'Avg Price Paid %' = CALCULATE ( AVERAGE ( trades[market_price] ), NOT ISBLANK ( trades[model_prob] ) )
+		formatString: 0.0%
+
+	measure 'Accuracy vs Price (pts)' = ( [Model Accuracy %] - [Avg Price Paid %] ) * 100
+		formatString: +0.0;-0.0
+
+	measure 'Cumulative PnL' = VAR _upTo = MAX ( trades[bet_date] ) RETURN CALCULATE ( [Net PnL], trades[bet_date] <= _upTo, REMOVEFILTERS ( trades[bet_date], trades[bet_time_utc], trades[trade_id] ) )
+		formatString: \$#,0.00;-\$#,0.00;\$0.00
+
+	measure 'Max Drawdown' = MIN ( trades[drawdown_usd] )
+		formatString: \$#,0.00;-\$#,0.00;\$0.00
+
+	column trade_id
+		dataType: int64
+		formatString: 0
+		summarizeBy: none
+		sourceColumn: trade_id
+
+	column bet_time_utc
+		dataType: dateTime
+		formatString: yyyy-mm-dd hh:nn
+		summarizeBy: none
+		sourceColumn: bet_time_utc
+
+	column bet_date
+		dataType: dateTime
+		formatString: yyyy-mm-dd
+		summarizeBy: none
+		sourceColumn: bet_date
+
+	column bet_hour_utc
+		dataType: int64
+		formatString: 0
+		summarizeBy: none
+		sourceColumn: bet_hour_utc
+
+	column coin
+		dataType: string
+		summarizeBy: none
+		sourceColumn: coin
+
+	column strategy
+		dataType: string
+		summarizeBy: none
+		sourceColumn: strategy
+
+	column window
+		dataType: string
+		summarizeBy: none
+		sourceColumn: window
+
+	column side
+		dataType: string
+		summarizeBy: none
+		sourceColumn: side
+
+	column model_prob
+		dataType: double
+		formatString: 0.0%
+		summarizeBy: none
+		sourceColumn: model_prob
+
+	column market_price
+		dataType: double
+		formatString: 0.0%
+		summarizeBy: none
+		sourceColumn: market_price
+
+	column model_edge
+		dataType: double
+		formatString: 0.0%
+		summarizeBy: none
+		sourceColumn: model_edge
+
+	column fill_price
+		dataType: double
+		formatString: 0.000
+		summarizeBy: none
+		sourceColumn: fill_price
+
+	column stake_usd
+		dataType: double
+		formatString: \$#,0.00
+		summarizeBy: none
+		sourceColumn: stake_usd
+
+	column is_top_up
+		dataType: int64
+		formatString: 0
+		summarizeBy: none
+		sourceColumn: is_top_up
+
+	column outcome
+		dataType: string
+		summarizeBy: none
+		sourceColumn: outcome
+
+	column market_went_up
+		dataType: int64
+		formatString: 0
+		summarizeBy: none
+		sourceColumn: market_went_up
+
+	column model_correct
+		dataType: int64
+		formatString: 0
+		summarizeBy: none
+		sourceColumn: model_correct
+
+	column pnl_usd
+		dataType: double
+		formatString: \$#,0.00;-\$#,0.00
+		summarizeBy: none
+		sourceColumn: pnl_usd
+
+	column seconds_into_window
+		dataType: int64
+		formatString: 0
+		summarizeBy: none
+		sourceColumn: seconds_into_window
+
+	column cum_pnl_usd
+		dataType: double
+		formatString: \$#,0.00;-\$#,0.00
+		summarizeBy: none
+		sourceColumn: cum_pnl_usd
+
+	column drawdown_usd
+		dataType: double
+		formatString: \$#,0.00;-\$#,0.00
+		summarizeBy: none
+		sourceColumn: drawdown_usd
+
+	column 'Prob Bucket' = SWITCH ( TRUE (), ISBLANK ( trades[model_prob] ), BLANK (), trades[model_prob] < 0.7, "60-70%", trades[model_prob] < 0.8, "70-80%", trades[model_prob] < 0.9, "80-90%", "90-100%" )
+		dataType: string
+		summarizeBy: none
+
+	partition trades = m
+		mode: import
+		source =
+				let
+				    Source = Csv.Document(File.Contents(DataFile), [Delimiter=",", Columns=21, Encoding=65001, QuoteStyle=QuoteStyle.Csv]),
+				    Promoted = Table.PromoteHeaders(Source, [PromoteAllScalars=true]),
+				    Typed = Table.TransformColumnTypes(Promoted, {{"trade_id", Int64.Type}, {"bet_time_utc", type datetime}, {"bet_date", type date}, {"bet_hour_utc", Int64.Type}, {"coin", type text}, {"strategy", type text}, {"window", type text}, {"side", type text}, {"model_prob", type number}, {"market_price", type number}, {"model_edge", type number}, {"fill_price", type number}, {"stake_usd", type number}, {"is_top_up", Int64.Type}, {"outcome", type text}, {"market_went_up", Int64.Type}, {"model_correct", Int64.Type}, {"pnl_usd", type number}, {"seconds_into_window", Int64.Type}, {"cum_pnl_usd", type number}, {"drawdown_usd", type number}}, "en-US")
+				in
+				    Typed

@@ -1,0 +1,232 @@
+{
+  "$schema": "https://developer.microsoft.com/json-schemas/fabric/item/report/definition/visualContainer/2.4.0/schema.json",
+  "name": "coins_02",
+  "position": {
+    "x": 24,
+    "y": 92,
+    "z": 2,
+    "width": 1232,
+    "height": 336,
+    "tabOrder": 2
+  },
+  "visual": {
+    "visualType": "tableEx",
+    "query": {
+      "queryState": {
+        "Values": {
+          "projections": [
+            {
+              "field": {
+                "Column": {
+                  "Expression": {
+                    "SourceRef": {
+                      "Entity": "trades"
+                    }
+                  },
+                  "Property": "coin"
+                }
+              },
+              "queryRef": "trades.coin",
+              "nativeQueryRef": "coin",
+              "displayName": "Coin"
+            },
+            {
+              "field": {
+                "Measure": {
+                  "Expression": {
+                    "SourceRef": {
+                      "Entity": "trades"
+                    }
+                  },
+                  "Property": "Trades"
+                }
+              },
+              "queryRef": "trades.Trades",
+              "nativeQueryRef": "Trades"
+            },
+            {
+              "field": {
+                "Measure": {
+                  "Expression": {
+                    "SourceRef": {
+                      "Entity": "trades"
+                    }
+                  },
+                  "Property": "Win Rate %"
+                }
+              },
+              "queryRef": "trades.Win Rate %",
+              "nativeQueryRef": "Win Rate %",
+              "displayName": "Win rate"
+            },
+            {
+              "field": {
+                "Measure": {
+                  "Expression": {
+                    "SourceRef": {
+                      "Entity": "trades"
+                    }
+                  },
+                  "Property": "Model Accuracy %"
+                }
+              },
+              "queryRef": "trades.Model Accuracy %",
+              "nativeQueryRef": "Model Accuracy %",
+              "displayName": "Hit rate"
+            },
+            {
+              "field": {
+                "Measure": {
+                  "Expression": {
+                    "SourceRef": {
+                      "Entity": "trades"
+                    }
+                  },
+                  "Property": "Avg Price Paid %"
+                }
+              },
+              "queryRef": "trades.Avg Price Paid %",
+              "nativeQueryRef": "Avg Price Paid %",
+              "displayName": "Price paid"
+            },
+            {
+              "field": {
+                "Measure": {
+                  "Expression": {
+                    "SourceRef": {
+                      "Entity": "trades"
+                    }
+                  },
+                  "Property": "Avg Win"
+                }
+              },
+              "queryRef": "trades.Avg Win",
+              "nativeQueryRef": "Avg Win",
+              "displayName": "Avg win"
+            },
+            {
+              "field": {
+                "Measure": {
+                  "Expression": {
+                    "SourceRef": {
+                      "Entity": "trades"
+                    }
+                  },
+                  "Property": "Avg Loss"
+                }
+              },
+              "queryRef": "trades.Avg Loss",
+              "nativeQueryRef": "Avg Loss",
+              "displayName": "Avg loss"
+            },
+            {
+              "field": {
+                "Measure": {
+                  "Expression": {
+                    "SourceRef": {
+                      "Entity": "trades"
+                    }
+                  },
+                  "Property": "Net PnL"
+                }
+              },
+              "queryRef": "trades.Net PnL",
+              "nativeQueryRef": "Net PnL",
+              "displayName": "Net P&L"
+            },
+            {
+              "field": {
+                "Measure": {
+                  "Expression": {
+                    "SourceRef": {
+                      "Entity": "trades"
+                    }
+                  },
+                  "Property": "ROI %"
+                }
+              },
+              "queryRef": "trades.ROI %",
+              "nativeQueryRef": "ROI %",
+              "displayName": "ROI"
+            }
+          ]
+        }
+      },
+      "sortDefinition": {
+        "sort": [
+          {
+            "field": {
+              "Measure": {
+                "Expression": {
+                  "SourceRef": {
+                    "Entity": "trades"
+                  }
+                },
+                "Property": "Net PnL"
+              }
+            },
+            "direction": "Descending"
+          }
+        ],
+        "isDefaultSort": false
+      }
+    },
+    "objects": {
+      "grid": [
+        {
+          "properties": {
+            "textSize": {
+              "expr": {
+                "Literal": {
+                  "Value": "12D"
+                }
+              }
+            },
+            "rowPadding": {
+              "expr": {
+                "Literal": {
+                  "Value": "4D"
+                }
+              }
+            }
+          }
+        }
+      ],
+      "columnHeaders": [
+        {
+          "properties": {
+            "fontSize": {
+              "expr": {
+                "Literal": {
+                  "Value": "11D"
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "visualContainerObjects": {
+      "title": [
+        {
+          "properties": {
+            "show": {
+              "expr": {
+                "Literal": {
+                  "Value": "true"
+                }
+              }
+            },
+            "text": {
+              "expr": {
+                "Literal": {
+                  "Value": "'Per-coin scorecard'"
+                }
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

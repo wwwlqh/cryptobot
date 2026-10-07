@@ -1,0 +1,138 @@
+{
+  "$schema": "https://developer.microsoft.com/json-schemas/fabric/item/report/definition/visualContainer/2.4.0/schema.json",
+  "name": "model_06",
+  "position": {
+    "x": 800,
+    "y": 200,
+    "z": 6,
+    "width": 456,
+    "height": 236,
+    "tabOrder": 6
+  },
+  "visual": {
+    "visualType": "pivotTable",
+    "query": {
+      "queryState": {
+        "Rows": {
+          "projections": [
+            {
+              "field": {
+                "Column": {
+                  "Expression": {
+                    "SourceRef": {
+                      "Entity": "trades"
+                    }
+                  },
+                  "Property": "strategy"
+                }
+              },
+              "queryRef": "trades.strategy",
+              "nativeQueryRef": "strategy",
+              "displayName": "Strategy"
+            },
+            {
+              "field": {
+                "Column": {
+                  "Expression": {
+                    "SourceRef": {
+                      "Entity": "trades"
+                    }
+                  },
+                  "Property": "window"
+                }
+              },
+              "queryRef": "trades.window",
+              "nativeQueryRef": "window",
+              "displayName": "Window"
+            }
+          ]
+        },
+        "Values": {
+          "projections": [
+            {
+              "field": {
+                "Measure": {
+                  "Expression": {
+                    "SourceRef": {
+                      "Entity": "trades"
+                    }
+                  },
+                  "Property": "Trades"
+                }
+              },
+              "queryRef": "trades.Trades",
+              "nativeQueryRef": "Trades"
+            },
+            {
+              "field": {
+                "Measure": {
+                  "Expression": {
+                    "SourceRef": {
+                      "Entity": "trades"
+                    }
+                  },
+                  "Property": "Model Accuracy %"
+                }
+              },
+              "queryRef": "trades.Model Accuracy %",
+              "nativeQueryRef": "Model Accuracy %",
+              "displayName": "Hit rate"
+            },
+            {
+              "field": {
+                "Measure": {
+                  "Expression": {
+                    "SourceRef": {
+                      "Entity": "trades"
+                    }
+                  },
+                  "Property": "Avg Price Paid %"
+                }
+              },
+              "queryRef": "trades.Avg Price Paid %",
+              "nativeQueryRef": "Avg Price Paid %",
+              "displayName": "Price paid"
+            },
+            {
+              "field": {
+                "Measure": {
+                  "Expression": {
+                    "SourceRef": {
+                      "Entity": "trades"
+                    }
+                  },
+                  "Property": "Net PnL"
+                }
+              },
+              "queryRef": "trades.Net PnL",
+              "nativeQueryRef": "Net PnL",
+              "displayName": "Net P&L"
+            }
+          ]
+        }
+      }
+    },
+    "visualContainerObjects": {
+      "title": [
+        {
+          "properties": {
+            "show": {
+              "expr": {
+                "Literal": {
+                  "Value": "true"
+                }
+              }
+            },
+            "text": {
+              "expr": {
+                "Literal": {
+                  "Value": "'By strategy and window'"
+                }
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

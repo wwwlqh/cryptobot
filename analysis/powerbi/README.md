@@ -1,60 +1,38 @@
 # Power BI dashboard
 
-Build steps for the trade-analysis dashboard. It uses `../data/trades.csv` (5,384 live trades) and the measures in `measures.dax`.
+A three-page Power BI report built on `../data/trades.csv` (5,384 live trades). It's saved as a Power BI Project (`.pbip`), so the report and data model are plain text files.
 
-## 1. Load the data
+![Overview](screenshots/1_overview.png)
+![Model accuracy](screenshots/2_model_accuracy.png)
+![Coins and timing](screenshots/3_coins_timing.png)
 
-1. Power BI Desktop → **Get data → Text/CSV** → `analysis/data/trades.csv` → **Transform Data**.
-2. Check the column types:
-   - `bet_time_utc`: Date/Time. `bet_date`: Date.
-   - `model_prob`, `market_price`, `model_edge`, `fill_price`, `stake_usd`, `pnl_usd`, `cum_pnl_usd`, `drawdown_usd`: Decimal number.
-   - `model_correct`, `market_went_up`, `is_top_up`, `bet_hour_utc`, `seconds_into_window`: Whole number.
-3. Rename the query to `trades` → **Close & Apply**.
-4. Paste each block in `measures.dax` in as a **New measure**. Format `Win Rate %`, `ROI %`, `Model Accuracy %`, `Avg Model Prob %` and `Avg Price Paid %` as percentages, and the `*PnL*`, `Avg Win`, `Avg Loss` and `Max Drawdown` measures as currency.
-5. Optional: add a calculated column for the calibration chart:
+## Open it
 
-   ```DAX
-   Prob Bucket =
-   SWITCH ( TRUE (),
-       ISBLANK ( trades[model_prob] ), BLANK (),
-       trades[model_prob] < 0.7, "60-70%",
-       trades[model_prob] < 0.8, "70-80%",
-       trades[model_prob] < 0.9, "80-90%",
-       "90-100%" )
-   ```
+1. Run `python analysis/powerbi/build_pbip.py`. This points the report at your copy of `trades.csv`.
+2. Open `analysis/powerbi/CryptobotTrades.pbip` in Power BI Desktop.
+3. Click **Refresh** to load the data.
 
-## 2. Pages
+## Pages
 
-**Page 1: Overview**
-- Cards: `Resolved Trades`, `Net PnL`, `Win Rate %`, `ROI %`, `Max Drawdown`.
-- Line chart: x = `bet_date`, y = `Cumulative PnL`.
-- Slicers (one row at the top): `coin`, `strategy`, `window`.
+| Page | What it shows |
+|---|---|
+| Overview | KPI cards (trades, win rate, net P&L, ROI, max drawdown), cumulative P&L, P&L by coin, wins vs losses. Coin and strategy slicers. |
+| Model accuracy | Calibration chart: the model's predicted probability vs the price paid vs the actual hit rate, per confidence band. Results by strategy and window. |
+| Coins & timing | Per-coin scorecard, P&L by hour of day (UTC), up bets vs down bets. Window slicer. |
 
-**Page 2: By coin**
-- Clustered bar chart: y = `coin`, x = `Net PnL`. Turn on data labels.
-- Table: `coin`, `Trades`, `Win Rate %`, `Model Accuracy %`, `Avg Price Paid %`, `Avg Win`, `Avg Loss`, `ROI %`.
+## How it's built
 
-**Page 3: Model accuracy**
-- Line chart: x = `Prob Bucket`, y = `Avg Model Prob %`, `Avg Price Paid %`, `Model Accuracy %`. This page shows the main finding: the model's hit rate was close to, but below, the price it paid.
-- Card: `Accuracy vs Price (pts)`.
-- Matrix: rows = `strategy`, `window`; values = `Trades`, `Model Accuracy %`, `Net PnL`.
+- `build_pbip.py` generates the whole project: the semantic model (TMDL: typed columns, 14 DAX measures, a `Prob Bucket` calculated column), the report pages and visuals (PBIR JSON), and a dark custom theme. Change the layout there and rerun it instead of editing the JSON by hand.
+- `measures.dax` lists the same measures for copying into another report.
 
-**Page 4: Timing**
-- Column chart: x = `bet_hour_utc`, y = `Net PnL`.
-- Column chart: x = `outcome`, y = `Net PnL` (wins vs losses vs stop-loss exits).
-
-## 3. Reference numbers
-
-Use these to check your visuals:
+## Reference numbers
 
 | Measure | Value |
 |---|---|
 | Resolved trades | 5,382 (2 still pending) |
-| Net P&L | −$124.55 |
-| Total staked | $8,321 |
+| Net P&L | −$124.55 on $8,321 staked |
 | Win rate | 71.1% |
-| ROI | −1.5% |
+| ROI | −1.50% |
 | Avg win / avg loss | $0.56 / −$1.46 |
 | Max drawdown | −$170.24 |
-| Model accuracy (prediction-model trades) | 73.3% |
-| Avg price paid (same trades) | 74.9% |
+| Model hit rate vs price paid (prediction-model trades) | 73.3% vs 74.9% |

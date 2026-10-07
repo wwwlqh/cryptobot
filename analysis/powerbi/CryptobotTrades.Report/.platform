@@ -1,0 +1,11 @@
+{
+  "$schema": "https://developer.microsoft.com/json-schemas/fabric/gitIntegration/platformProperties/2.0.0/schema.json",
+  "metadata": {
+    "type": "Report",
+    "displayName": "CryptobotTrades"
+  },
+  "config": {
+    "version": "2.0",
+    "logicalId": "7d7e885e-4093-506d-a48a-83d33cd312cf"
+  }
+}

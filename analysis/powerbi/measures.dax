@@ -38,11 +38,11 @@ Accuracy vs Price (pts) = ( [Model Accuracy %] - [Avg Price Paid %] ) * 100
 
 // Use with bet_date on the x-axis. Respects coin / strategy slicers.
 Cumulative PnL =
-VAR LastDate = MAX ( trades[bet_date] )
+VAR _upTo = MAX ( trades[bet_date] )
 RETURN
     CALCULATE (
         [Net PnL],
-        trades[bet_date] <= LastDate,
+        trades[bet_date] <= _upTo,
         REMOVEFILTERS ( trades[bet_date], trades[bet_time_utc], trades[trade_id] )
     )
 

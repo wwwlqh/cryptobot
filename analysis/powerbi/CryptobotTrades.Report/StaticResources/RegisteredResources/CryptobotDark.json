@@ -1,0 +1,295 @@
+{
+  "name": "Cryptobot Dark",
+  "dataColors": [
+    "#3987e5",
+    "#d95926",
+    "#199e70",
+    "#c98500",
+    "#d55181",
+    "#9085e9"
+  ],
+  "background": "#161C2B",
+  "foreground": "#E8EAF0",
+  "tableAccent": "#3987e5",
+  "good": "#0ca30c",
+  "neutral": "#c98500",
+  "bad": "#d03b3b",
+  "textClasses": {
+    "callout": {
+      "fontFace": "Segoe UI Semibold",
+      "fontSize": 24,
+      "color": "#E8EAF0"
+    },
+    "title": {
+      "fontFace": "Segoe UI Semibold",
+      "fontSize": 12,
+      "color": "#E8EAF0"
+    },
+    "header": {
+      "fontFace": "Segoe UI Semibold",
+      "fontSize": 11,
+      "color": "#E8EAF0"
+    },
+    "label": {
+      "fontFace": "Segoe UI",
+      "fontSize": 10,
+      "color": "#9AA3B5"
+    }
+  },
+  "visualStyles": {
+    "*": {
+      "*": {
+        "background": [
+          {
+            "show": true,
+            "color": {
+              "solid": {
+                "color": "#161C2B"
+              }
+            },
+            "transparency": 0
+          }
+        ],
+        "border": [
+          {
+            "show": true,
+            "color": {
+              "solid": {
+                "color": "#232B3E"
+              }
+            },
+            "radius": 10
+          }
+        ],
+        "dropShadow": [
+          {
+            "show": false
+          }
+        ],
+        "title": [
+          {
+            "show": true,
+            "fontColor": {
+              "solid": {
+                "color": "#E8EAF0"
+              }
+            },
+            "fontSize": 12
+          }
+        ],
+        "visualHeader": [
+          {
+            "show": false
+          }
+        ],
+        "padding": [
+          {
+            "top": 10,
+            "bottom": 10,
+            "left": 12,
+            "right": 12
+          }
+        ],
+        "categoryAxis": [
+          {
+            "labelColor": {
+              "solid": {
+                "color": "#9AA3B5"
+              }
+            },
+            "titleColor": {
+              "solid": {
+                "color": "#9AA3B5"
+              }
+            },
+            "gridlineShow": false
+          }
+        ],
+        "valueAxis": [
+          {
+            "labelColor": {
+              "solid": {
+                "color": "#9AA3B5"
+              }
+            },
+            "titleColor": {
+              "solid": {
+                "color": "#9AA3B5"
+              }
+            },
+            "gridlineColor": {
+              "solid": {
+                "color": "#232B3E"
+              }
+            }
+          }
+        ],
+        "legend": [
+          {
+            "labelColor": {
+              "solid": {
+                "color": "#9AA3B5"
+              }
+            },
+            "position": "Top"
+          }
+        ],
+        "lineStyles": [
+          {
+            "strokeWidth": 3
+          }
+        ]
+      }
+    },
+    "page": {
+      "*": {
+        "background": [
+          {
+            "color": {
+              "solid": {
+                "color": "#0F1420"
+              }
+            },
+            "transparency": 0
+          }
+        ],
+        "outspace": [
+          {
+            "color": {
+              "solid": {
+                "color": "#0F1420"
+              }
+            },
+            "transparency": 0
+          }
+        ]
+      }
+    },
+    "tableEx": {
+      "*": {
+        "grid": [
+          {
+            "gridHorizontalColor": {
+              "solid": {
+                "color": "#232B3E"
+              }
+            },
+            "rowPadding": 6
+          }
+        ],
+        "columnHeaders": [
+          {
+            "fontColor": {
+              "solid": {
+                "color": "#9AA3B5"
+              }
+            },
+            "backColor": {
+              "solid": {
+                "color": "#161C2B"
+              }
+            }
+          }
+        ],
+        "values": [
+          {
+            "fontColorPrimary": {
+              "solid": {
+                "color": "#E8EAF0"
+              }
+            },
+            "backColorPrimary": {
+              "solid": {
+                "color": "#161C2B"
+              }
+            },
+            "fontColorSecondary": {
+              "solid": {
+                "color": "#E8EAF0"
+              }
+            },
+            "backColorSecondary": {
+              "solid": {
+                "color": "#1B2235"
+              }
+            }
+          }
+        ]
+      }
+    },
+    "pivotTable": {
+      "*": {
+        "columnHeaders": [
+          {
+            "fontColor": {
+              "solid": {
+                "color": "#9AA3B5"
+              }
+            },
+            "backColor": {
+              "solid": {
+                "color": "#161C2B"
+              }
+            }
+          }
+        ],
+        "rowHeaders": [
+          {
+            "fontColor": {
+              "solid": {
+                "color": "#E8EAF0"
+              }
+            },
+            "backColor": {
+              "solid": {
+                "color": "#161C2B"
+              }
+            }
+          }
+        ],
+        "values": [
+          {
+            "fontColorPrimary": {
+              "solid": {
+                "color": "#E8EAF0"
+              }
+            },
+            "backColorPrimary": {
+              "solid": {
+                "color": "#161C2B"
+              }
+            },
+            "fontColorSecondary": {
+              "solid": {
+                "color": "#E8EAF0"
+              }
+            },
+            "backColorSecondary": {
+              "solid": {
+                "color": "#1B2235"
+              }
+            }
+          }
+        ]
+      }
+    },
+    "slicer": {
+      "*": {
+        "items": [
+          {
+            "fontColor": {
+              "solid": {
+                "color": "#E8EAF0"
+              }
+            },
+            "background": {
+              "solid": {
+                "color": "#161C2B"
+              }
+            }
+          }
+        ]
+      }
+    }
+  }
+}

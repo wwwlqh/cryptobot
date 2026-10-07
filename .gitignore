@@ -97,3 +97,7 @@ tab-*.png
 
 # -- pytest basetemp (see pyproject addopts; default temp root is ACL-locked)
 .pytest_tmp/
+
+# Power BI Desktop local state (PBIP)
+analysis/powerbi/**/.pbi/localSettings.json
+analysis/powerbi/**/.pbi/cache.abf

@@ -1,0 +1,79 @@
+{
+  "$schema": "https://developer.microsoft.com/json-schemas/fabric/item/report/definition/visualContainer/2.4.0/schema.json",
+  "name": "overview_08",
+  "position": {
+    "x": 24,
+    "y": 200,
+    "z": 8,
+    "width": 800,
+    "height": 496,
+    "tabOrder": 8
+  },
+  "visual": {
+    "visualType": "lineChart",
+    "query": {
+      "queryState": {
+        "Category": {
+          "projections": [
+            {
+              "field": {
+                "Column": {
+                  "Expression": {
+                    "SourceRef": {
+                      "Entity": "trades"
+                    }
+                  },
+                  "Property": "bet_date"
+                }
+              },
+              "queryRef": "trades.bet_date",
+              "nativeQueryRef": "bet_date",
+              "displayName": "Date"
+            }
+          ]
+        },
+        "Y": {
+          "projections": [
+            {
+              "field": {
+                "Measure": {
+                  "Expression": {
+                    "SourceRef": {
+                      "Entity": "trades"
+                    }
+                  },
+                  "Property": "Cumulative PnL"
+                }
+              },
+              "queryRef": "trades.Cumulative PnL",
+              "nativeQueryRef": "Cumulative PnL",
+              "displayName": "Cumulative P&L"
+            }
+          ]
+        }
+      }
+    },
+    "visualContainerObjects": {
+      "title": [
+        {
+          "properties": {
+            "show": {
+              "expr": {
+                "Literal": {
+                  "Value": "true"
+                }
+              }
+            },
+            "text": {
+              "expr": {
+                "Literal": {
+                  "Value": "'Cumulative net P&L'"
+                }
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

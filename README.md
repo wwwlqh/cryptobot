@@ -12,7 +12,7 @@ A machine-learning bot that traded Polymarket's 5-minute and 15-minute "will BTC
 2. **Modelling.** Built an 11-feature dataset of about 2.85M labelled rows and trained gradient-boosting classifiers (scikit-learn `HistGradientBoostingClassifier`) with walk-forward validation: train on the past, test on the next period. Backtests replay each bet against the real order book instead of the quoted price. See `polymarket/backtest/training/` and `polymarket/backtest/engine/`.
 3. **Live trading.** A scheduler scores every open market once per second. When the model's probability beats the market price by enough after fees, the bot sizes the bet as a fraction of equity and sends it to Polymarket's order book. A drawdown limit halts trading. See `polymarket/src/cryptobot/`.
 4. **Reconciliation.** Background jobs settle resolved markets every 5 minutes, check the trade ledger against the on-chain wallet balance every 10 minutes and repair orphaned orders. A daily job checkpoints the SQLite database and checks free disk space. See `polymarket/src/cryptobot/reconciliation/` and `polymarket/infra/cron.daily.sh`.
-5. **Analysis.** Live trades were exported from SQLite and analysed in Power BI (win rate, P&L by coin, model accuracy). See [`analysis/`](analysis/).
+5. **Analysis.** Live trades were exported from SQLite into a three-page Power BI dashboard covering win rate, P&L by coin, model accuracy and timing. See [`analysis/powerbi/`](analysis/powerbi/).
 
 ## Results
 
@@ -32,6 +32,12 @@ A machine-learning bot that traded Polymarket's 5-minute and 15-minute "will BTC
 ![Model calibration](analysis/charts/calibration.png)
 
 The main lesson was that being right more often than not isn't enough. A prediction model has to beat the market's own probability by more than fees and slippage. The strategy was retired on 2026-08-19 after these live results.
+
+## Power BI dashboard
+
+![Power BI overview](analysis/powerbi/screenshots/1_overview.png)
+
+More pages, plus how to open the report: [`analysis/powerbi/`](analysis/powerbi/).
 
 ## Repository layout
 

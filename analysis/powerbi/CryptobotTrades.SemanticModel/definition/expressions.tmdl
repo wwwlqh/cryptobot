@@ -1,0 +1,1 @@
+expression DataFile = "C:\Users\leowq\Desktop\crypto-price-prediction-bot\analysis\data\trades.csv" meta [IsParameterQuery=true, Type="Text", IsParameterQueryRequired=true]
