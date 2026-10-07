@@ -224,7 +224,6 @@ body::before {
    for Polymarket; the info hue for predict.fun so a non-Polymarket console is
    unmistakable on a live-money desk. */
 .badge-venue { background: var(--accent-bg); color: var(--accent-ink); border-color: var(--accent-line); }
-.badge-venue.pf { background: var(--info-bg); color: var(--info); border-color: var(--info-line); }
 .badge-venue::before { animation: none; }
 
 

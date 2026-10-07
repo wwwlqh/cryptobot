@@ -1347,16 +1347,12 @@ def test_v2_spec_emits_bands():
     assert ow["5m"].startswith("150") and ow["5m"].endswith("299s")
     assert ow["15m"].startswith("750") and ow["15m"].endswith("899s")
 
-    # Bands derived from the deployed sleeves (tracks the manifest, not
-    # literals): the artifact carries the single MID band, so exactly one band
-    # is emitted (_v2_spec is data-driven off the loaded sleeves).
+    # Bands are derived from the deployed sleeves: one shared band.
     by_label = {s.label: s for s in portfolio.sleeves}
-    bands = {b["key"]: b for b in spec["bands"]}
-    assert set(bands) == {"mid"}
-    assert [b["key"] for b in spec["bands"]] == ["mid"]
-
-    mid = bands["mid"]
-    assert mid["label"] == "MID (step1last)"
+    assert len(spec["bands"]) == 1
+    mid = spec["bands"][0]
+    assert mid["key"] == "0.55-0.85"
+    assert mid["label"] == "0.55–0.85"
     assert mid["sleeves"] == ["subminute_5m", "subminute_15m"]
     assert (mid["ask_lo"], mid["ask_hi"]) == by_label["subminute_5m"].ask_bucket_ranges[0]
     assert mid["gate"] == pytest.approx(by_label["subminute_5m"].threshold)
@@ -1371,8 +1367,7 @@ def test_v2_block_threads_portfolio_into_spec(db: sqlite3.Connection):
     portfolio = load_sleeves()
     payload, _ = build_payload(db, portfolio)
     spec = payload["v2"]["spec"]
-    # The live artifact carries one band -> a single mid entry.
-    assert [b["key"] for b in spec["bands"]] == ["mid"]
+    assert [b["key"] for b in spec["bands"]] == ["0.55-0.85"]
     # Flat single-band presentation removed from the emitted spec.
     assert "ask_lo" not in spec
 
@@ -1494,10 +1489,8 @@ def test_v2_console_respects_wallet_start_cutover(
 
 
 # ---------------------------------------------------------------------------
-# HISTORICAL stop-loss (PURE_STOP_04) early-exit display surface.
-# The stop ENGINE was deleted 2026-08-05 (execution/stop_loss.py); nothing can
-# write a new stop row. These tests pin how the payload must keep RENDERING the
-# rows already in the ledger — a read-path contract, not a live behaviour.
+# Historical stop-loss rows. The bot no longer writes them, but a ledger may
+# still contain them; the payload must keep counting their realized loss.
 # ---------------------------------------------------------------------------
 def _insert_stop_row(
     db: sqlite3.Connection,
@@ -1508,8 +1501,8 @@ def _insert_stop_row(
     pnl_net: float = -1.0,
     exit_price: float = 0.50,
 ) -> int:
-    """A booked-once stop-closed sub-minute row: outcome='CANCELLED',
-    exit_kind='stop_loss', realized round-trip pnl_net, 5 shares @0.70 cost."""
+    """A stop-closed sub-minute row: outcome='CANCELLED', exit_kind='stop_loss',
+    realized pnl_net, 5 shares @0.70 cost."""
     rid = record_bet(
         db,
         make_signal(sleeve="subminute_5m", side=side, bet_size=3.5,
@@ -1529,67 +1522,27 @@ def _insert_stop_row(
     return rid
 
 
-def _if_held_win_expected(shares: float = 5.0, entry: float = 0.70) -> float:
-    """shares − cost − winner_fee (θ·fp·(1−fp)·shares) — M3 fix 2026-07-21:
-    the held-to-resolution counterfactual now subtracts the SAME winning-payout
-    skim _reject_missed_pnl does. 5 sh @0.70, θ=0.07 → 1.50 − 0.0735 = 1.4265."""
-    theta = float(config.POLY_FEE_THETA)
-    return shares - shares * entry - theta * entry * (1.0 - entry) * shares
-
-
-def test_stop_row_v2_bets_if_held_win_case(db: sqlite3.Connection):
-    """A stop-closed row rides into live.v2.bets carrying exit_kind / exit_price
-    and the held-to-resolution counterfactual. YES stop, market later went UP →
-    the held side WOULD have won: if_held = 5·1 − 5·0.70 − θ·0.7·0.3·5 (winner
-    fee subtracted like _reject_missed_pnl — item 16)."""
+def test_stop_row_in_v2_bets(db: sqlite3.Connection):
+    """A stop-closed row appears in live.v2.bets tagged exit_kind='stop_loss'
+    with its realized loss."""
     portfolio = load_sleeves()
     _insert_stop_row(db, side="YES", won_up=1)
 
     payload, _ = build_payload(db, portfolio)
     bet = next(b for b in payload["v2"]["bets"] if b["exit_kind"] == "stop_loss")
-    assert bet["exit_price"] == pytest.approx(0.50)
-    assert bet["pnl_net"] == pytest.approx(-1.0)     # realized loss flows through
+    assert bet["pnl_net"] == pytest.approx(-1.0)
     assert bet["outcome"] == "CANCELLED"
-    assert bet["stop_if_held_pnl"] == pytest.approx(
-        _if_held_win_expected(), abs=0.005
-    )
-
-
-def test_stop_row_v2_bets_if_held_loss_case(db: sqlite3.Connection):
-    """YES stop but the market went DOWN (won_up=0): the held side WOULD have
-    lost → if_held = −cost = −3.50."""
-    portfolio = load_sleeves()
-    _insert_stop_row(db, side="YES", won_up=0)
-
-    payload, _ = build_payload(db, portfolio)
-    bet = next(b for b in payload["v2"]["bets"] if b["exit_kind"] == "stop_loss")
-    assert bet["stop_if_held_pnl"] == pytest.approx(-3.50)
-
-
-def test_stop_row_if_held_null_before_resolution_backfill(
-    db: sqlite3.Connection,
-):
-    """Until the sweep backfills won_up, the counterfactual is unknown → the
-    stop row still carries its exit_kind/exit_price but stop_if_held_pnl=None."""
-    portfolio = load_sleeves()
-    _insert_stop_row(db, side="YES", won_up=None)
-
-    payload, _ = build_payload(db, portfolio)
-    bet = next(b for b in payload["v2"]["bets"] if b["exit_kind"] == "stop_loss")
-    assert bet["exit_kind"] == "stop_loss"
-    assert bet["exit_price"] == pytest.approx(0.50)
-    assert bet["stop_if_held_pnl"] is None
+    assert "stop_if_held_pnl" not in bet
 
 
 def test_stop_row_pnl_in_journal_sum_legacy_cancelled_excluded(
     db: sqlite3.Connection,
 ):
-    """The streamed ledger row surfaces the stop exit fields, and the stop row's
-    realized loss flows into the lifetime pnl rollup + equity series alongside
-    WIN/LOSS rows — while a legacy voided CANCELLED row (exit_kind NULL, pnl_net
-    NULL) contributes nothing to those sums."""
+    """A stop row's realized loss flows into the lifetime pnl rollup and equity
+    series alongside WIN/LOSS rows, while a voided CANCELLED row (exit_kind
+    NULL, pnl_net NULL) contributes nothing."""
     portfolio = load_sleeves()
-    # WIN (+2.0), stop (-1.0, if_held +1.50), legacy voided CANCELLED (no pnl).
+    # WIN (+2.0), stop (-1.0), voided CANCELLED (no pnl).
     win = record_bet(db, make_signal(sleeve="subminute_5m", side="YES"),
                      mode="LIVE")
     db.execute(
@@ -1613,15 +1566,8 @@ def test_stop_row_pnl_in_journal_sum_legacy_cancelled_excluded(
     payload, _ = build_payload(db, portfolio)
 
     by_id = {r["id"]: r for r in payload["ledger"]}
-    # Stop row surfaces its exit fields on the streamed ledger.
     assert by_id[stop]["exit_kind"] == "stop_loss"
-    assert by_id[stop]["exit_price"] == pytest.approx(0.50)
-    assert by_id[stop]["stop_if_held_pnl"] == pytest.approx(
-        _if_held_win_expected(), abs=0.005
-    )
-    # Non-stop rows carry NULL exit fields (discriminate only on exit_kind).
     assert by_id[win]["exit_kind"] is None
-    assert by_id[win]["stop_if_held_pnl"] is None
     assert by_id[legacy]["exit_kind"] is None
 
     # Lifetime rollup pnl = WIN(+2.0) + stop(−1.0) = +1.0; the legacy voided

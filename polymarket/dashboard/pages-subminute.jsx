@@ -320,24 +320,6 @@ function MissedPnl({ value, tagless, dim, toned, title }) {
   );
 }
 
-// Stop-loss annotation (PURE_STOP_04): the realized exit price + the
-// counterfactual "if held to resolution" PnL, rendered under the realized
-// (loss-styled) stop PnL. The realized loss owns the P&L column; the if-held
-// figure is PAPER — muted + italic so it is never read as realized money — and
-// only appears once the market resolution has been backfilled onto the row.
-function StopAnnote({ exitPrice, ifHeld }) {
-  return (
-    <div className="slot-ref" style={{ whiteSpace: 'nowrap' }}>
-      {exitPrice != null ? `exit ${fmt.prob(exitPrice, 3)}` : 'stop'}
-      {ifHeld != null && (
-        <span className="muted" style={{ fontStyle: 'italic' }}
-          title="would-be PnL had the stop not fired and the position settled — counterfactual, not realized money">
-          {' · if held '}{fmt.moneyDelta(ifHeld)}
-        </span>
-      )}
-    </div>
-  );
-}
 
 // ── per-attempt drill-down (inside the expand) ───────────────────────
 function AttemptTable({ group }) {
@@ -474,12 +456,7 @@ function ResolutionRows({ groups, openSet, toggle, missIdx }) {
           <td className={'num ' + (g.pnl != null ? tone(g.pnl) : 'muted')}
             style={{ whiteSpace: 'nowrap' }}
             title={multi ? `Σ over the ${g.nFills} fills` : undefined}>
-            {g.isStop
-              ? <React.Fragment>
-                  {g.pnl != null ? fmt.moneyDelta(g.pnl) : '—'}   {/* realized stop loss */}
-                  <StopAnnote exitPrice={g.exitPrice} ifHeld={g.ifHeldPnl} />
-                </React.Fragment>
-              : isMissRow && missVal != null
+            {isMissRow && missVal != null
               ? <MissedPnl value={missVal}                        /* paper: no real fill */
                   dim={winnable === false}
                   toned={winnable === true}
@@ -871,7 +848,7 @@ function SubminutePage({ live }) {
       <Panel title="resolutions" q={`${groups.length}`}
         titleHint={(exactGrouping ? '' : 'Grouping is APPROXIMATE — the window key is not yet in the payload. ')
           + 'ATTEMPT-level population: one row per resolution/position INCLUDING resolutions that never filled — not the settled-trade count the Overview/Journal report. '
-          + 'One row per POSITION: a base bet and its T3 top-ups are one CLOB balance, so they fold into a single "N in 1" row (Σ size, Σ P&L, size-weighted price) — the same fold the Trade journal applies. Attempt and reject counts stay per-ORDER; expand a row for the individual fills and attempts. '
+          + 'One row per POSITION: all fills of one position are one CLOB balance, so they fold into a single "N in 1" row (Σ size, Σ P&L, size-weighted price) — the same fold the Trade journal applies. Attempt and reject counts stay per-ORDER; expand a row for the individual fills and attempts. '
           + 'Newest-rows window (server bets/rejects caps); lifetime totals live on Overview/Journal.'} flush>
         {groups.length === 0 ? <EmptyState msg="no v2 resolutions yet" /> : (
           <React.Fragment>
@@ -900,25 +877,11 @@ function SubminutePage({ live }) {
 
 window.SubminutePage = SubminutePage;
 
-// The "deployed execution flags" panel (StrategyFlagsPanel) was DELETED
-// 2026-08-05 (operator truth pass). It was a SECOND table on the same Strategy
-// tab restating rows the contract table below already carries — entry FAK pad,
-// min bet, hard halt, the DD stake throttle — and it crammed the whole T3
-// contract into one unreadable run-on line. Every LIVE knob it rendered moved
-// into the contract table as a short row in its proper group (late-window skip
-// + ask-band skip → decision spec; tier-A → sizing; the T3 knobs → their own
-// T3 top-ups group; exposure caps → halt), still read from the SAME payload
-// fields (strategy_flags · v2.sizing · portfolio) — nothing is hardcoded.
-
 // ── Sub-minute spec page (Config section) ────────────────────────────
-// The DEPLOYED strategy contract as one compact reference table. Every value
-// reads from the live payload (live.v2.spec · live.v2.sizing ·
-// live.strategy_flags · live.portfolio) with '—' fallbacks — no hardcoded
-// number where a config value exists. Six groups: bands · decision spec ·
-// sizing · T3 top-ups · execution · halt.
-// The spec FIGURE was MOVED here off the sub-minute page (operator
-// 2026-07-11) so the operational page leads with live state, this tab with
-// the frozen contract.
+// The deployed strategy contract as one compact reference table. Every value
+// comes from the live payload (live.v2.spec, live.v2.sizing, live.portfolio)
+// with '—' fallbacks, so nothing is hardcoded. Groups: bands, decision spec,
+// sizing, execution, halt.
 function SubminuteSpecPage({ live }) {
   const v2 = live.v2;
   if (!v2) {
@@ -932,46 +895,28 @@ function SubminuteSpecPage({ live }) {
   const s = v2.spec || {};
   const z = v2.sizing || {};
   const bands = specBands(s);
-  const venue = window.CB.venueOf(live);
   const venueFloor = live.latency && live.latency.venue_floor;
   const takerDelay = venueFloor && venueFloor.taker_delay_ms != null
     ? venueFloor.taker_delay_ms : null;
   const venueDelayText = takerDelay != null
     ? `${takerDelay}ms uncancellable taker delay (live venue floor)`
-    : venue === 'predictfun'
-      ? 'no uncancellable taker delay documented by predict.fun'
-      : 'not reported by live venue telemetry';
-
-  // Env-pinned execution knobs — the block the deleted StrategyFlagsPanel used
-  // to render. Read straight from the payload; a payload predating the block
-  // renders '—' on every row it feeds.
-  const f = live.strategy_flags || null;
-  const t3 = f && f.scalein_t3;
-  const ta = f && f.tier_a;
-  const lws = (f && f.late_window_skip) || {};
-  const lwsKeys = Object.keys(lws).sort();
-  const absRules = (f && f.ask_band_skip) || [];
+    : 'not reported by live venue telemetry';
   const p = live.portfolio || {};
 
-  // SIZING (equity-fraction stake · DD-brake · capacity). The throttle was
-  // REMOVED 2026-07-31 (floor ×1.00): the row states that in one line and the
-  // formula lives in the tooltip — it is a caveat, not a control value.
+  // Sizing: with the brake floor at 1.00 the throttle is off; the row says so
+  // and the formula goes in the tooltip.
   const brakeRemoved = z.brake_floor != null && throttleOff(z.brake_floor);
   const brakeRule = brakeRemoved
     ? 'removed — floor ×1.00, full size at every drawdown depth'
     : `full size at 0% dd-from-peak → ×${z.brake_floor != null ? fmt.num(z.brake_floor, 2) : '—'} at ≥${z.throttle_dd_at_floor != null ? fmt.pct(z.throttle_dd_at_floor, 1) : '—'} dd from peak`;
   const brakeHint = `brake = max(×${z.brake_floor != null ? fmt.num(z.brake_floor, 2) : '—'}, 1 − dd/${z.brake_scale != null ? fmt.num(z.brake_scale, 2) : '—'}) · dd = (peak − equity) / peak`
     + (brakeRemoved ? ' — identically ×1.00, so the hard halt is the only drawdown control' : '');
-  const multifill = z.multifill_enabled
-    ? `on — same-side entries above ${fmt.money(z.multifill_min_equity)} equity`
-    : 'off — one entry per resolution';
-  // EXECUTION (order type · anchored pad · retries · venue floor).
+  // Execution: order type, anchored pad, retries, venue floor.
   const padValue = z.fak_pad != null && z.fak_pad > 0
     ? `+${fmt.num(z.fak_pad, 2)} on limit`
     : 'off — bare walked limit';
-  // Per-coin hard bet caps from the deployed manifest (portfolio sleeves carry
-  // max_bet_usd_by_coin — e.g. the SOL $1.00 probe, 2026-07-21). Payload-driven
-  // only: an empty map renders no row, so nothing here is ever hardcoded.
+  // Per-coin hard bet caps from the strategy config (max_bet_usd_by_coin on
+  // each sleeve). An empty map renders no row.
   const coinCaps = {};
   (((live.portfolio || {}).sleeves) || []).forEach((sl) => {
     const by = sl && sl.max_bet_usd_by_coin;
@@ -985,11 +930,8 @@ function SubminuteSpecPage({ live }) {
   const coinCapText = Object.keys(coinCaps).sort()
     .map((c) => `${c} ≤ ${fmt.money(coinCaps[c])}`).join(' · ');
 
-  // Comparison-table layout (operator 2026-07-12), band columns DATA-DRIVEN
-  // (2026-07-21): one row per spec field, one column per spec band. Band
-  // fields fill each band's column; everything the bands share renders once
-  // with colSpan=bands.length, so the sheet is a clean single column under
-  // the MID-only manifest and a side-by-side comparison with two+ bands.
+  // One row per spec field, one column per ask band. Fields the bands share
+  // render once across all columns, so a single band gives a single column.
   const bandCols = bands.length ? bands : [{ label: '—' }];
   const nCols = bandCols.length;
   const range = (b) => (b.ask_lo != null ? `${fmt.prob(b.ask_lo, 2)} < ask ≤ ${fmt.prob(b.ask_hi, 2)}` : null);
@@ -999,9 +941,8 @@ function SubminuteSpecPage({ live }) {
       paddingTop: 14, borderBottom: '1px solid var(--line)' }}>{label}</td></tr>
   );
   // Per-band row: vals[i] aligns with bandCols[i]; shared row: one value
-  // spanning every band column. `hint` is the caveat channel — the declutter
-  // rule for this page is short rows + tooltips, never a second prose line
-  // under the value (2026-08-05).
+  // spanning every band column. Caveats go in `hint` (a tooltip), never in a
+  // second line under the value.
   const Row = ({ k, vals, shared, mono = true, hint }) => (
     <tr title={hint || undefined}>
       <td className="muted" style={{ whiteSpace: 'nowrap', verticalAlign: 'top' }}>{k}</td>
@@ -1017,7 +958,7 @@ function SubminuteSpecPage({ live }) {
   return (
     <div className="content">
       <Panel title="strategy" q={bandCols.map(bandShort).join(' vs ')}
-        titleHint={`${nCols === 1 ? 'One ask band' : `${nCols} ask bands`} over the last-30s window; one ENTRY per resolution, first-fill-wins. T3 top-ups add to that entry.`} flush>
+        titleHint={`${nCols === 1 ? 'One ask band' : `${nCols} ask bands`} over the entry window; one entry per resolution, first fill wins.`} flush>
         <div className="tbl-wrap"><table className="tbl">
           <thead><tr>
             <th style={{ width: '18%' }}>spec</th>
@@ -1031,42 +972,20 @@ function SubminuteSpecPage({ live }) {
             <GroupRow label="decision spec — shared" />
             <Row k="intervals" shared={(s.intervals || []).join(' + ') || null} />
             <Row k="edge" shared="model_p − ask − fee" />
-            {/* VENUE-AWARE (2026-08-01): this row said POLY_FEE_θ on every
-                console, naming a constant predict.fun does not charge. The
-                server now emits `fee_spec` for the DEPLOYED venue (parabola
-                vs 200bps tent); the theta fallback keeps an older payload
-                readable. */}
             <Row k="taker fee" mono={false}
               shared={s.fee_spec
                 || (s.poly_fee_theta != null ? `POLY_FEE_theta ${fmt.num(s.poly_fee_theta, 3)}` : null)} />
-            {/* Why theta reads 0.07 while realized friction implies less
-                (operator 2026-08-05). Payload-driven (spec.fee_calibration ←
-                config.POLY_FEE_CALIBRATION); null off-Polymarket, where the
-                tent share-fee is venue-measured exact and no calibration
-                applies — the row then renders '—'. */}
             <Row k="fee calibration" mono={false}
               shared={s.fee_calibration != null
-                ? <span title="Flat-to-flat wallet-tape audit (2026-07-23, both endpoints flat — zero positions, zero unsettled, empty transfers): realized venue friction was $1.73 against $2.18 modeled by the published parabola, i.e. the venue extracts ~0.864x of it at the corrected published theta 0.07 (the audited product k*theta = 0.06048 is unchanged; it was 0.84x when theta was assumed 0.072). Applied ONLY where realized pnl_net is booked (execution.grade_fees); DECISION math — edge gates, walkers, parity — keeps the raw published theta, so bet selection is unchanged. Re-measure with the same flat-to-flat method before retuning.">
+                ? <span title="A flat-to-flat wallet audit (no open positions at either end) found the venue charged ~0.864x of the published fee curve. Applied only where realized pnl_net is booked (execution.grade_fees); decision math (edge gates, book walker) keeps the raw published theta, so bet selection is unchanged.">
                     ×{fmt.num(s.fee_calibration, 2)} on BOOKED fees · decision math keeps raw theta
                   </span>
                 : null} />
-            <Row k="cadence" shared={s.cadence || 'last 30s · per-second (0–29s)'} mono={false} />
-            <Row k="last-30s offsets" shared={s.offset_windows && Object.keys(s.offset_windows).length
+            <Row k="cadence" shared={s.cadence || null} mono={false} />
+            <Row k="entry offsets" shared={s.offset_windows && Object.keys(s.offset_windows).length
               ? Object.keys(s.offset_windows).map((iv) => `${iv}: ${s.offset_windows[iv]}`).join(' · ')
               : null} />
             <Row k="selection" shared={s.selection || 'first-fill-wins per resolution · dedup-before-gate'} mono={false} />
-            {/* LATE-WINDOW SKIP is a DECISION gate, not a flag footnote: it is
-                live on all four coins at 5s (CRYPTOBOT_LATE_WINDOW_SKIP), so
-                the real entry window is shorter than the cadence row's span.
-                It sat only in the deleted flags panel before 2026-08-05. */}
-            <Row k="late-window skip" shared={!f ? null : (lwsKeys.length
-              ? lwsKeys.map((c) => `${c}: last ${lws[c]}s`).join(' · ')
-              : 'off')}
-              hint="No entry is attempted inside the last N seconds of the window, per coin — the entry window ends this many seconds before close." />
-            <Row k="ask-band skip" shared={!f ? null : (absRules.length
-              ? absRules.map((r) => `${r.coin || '*'} ${r.sleeve || '*'} (${fmt.prob(r.lo, 2)}, ${fmt.prob(r.hi, 2)}]`).join(' · ')
-              : 'off')}
-              hint="Extra ask-band veto on top of the band gate above (ASK_BAND_SKIP). Empty = no band is vetoed." />
             <Row k="features" shared={s.features || null} mono={false} />
             <Row k="signal" shared={s.signal_source || null} />
             <Row k="coins" shared={(s.coins || []).join(' · ') || null} />
@@ -1078,42 +997,18 @@ function SubminuteSpecPage({ live }) {
               ? (live.portfolio.sleeves || []).map((sl) => `${sl.label} ${sl.capital_frac != null ? fmt.pct(sl.capital_frac, 1) : '—'}`).join(' · ')
               : null} />
             <Row k="concurrency" shared={z.conc_downweight ? '1/√k same-minute downweight' : 'off'} mono={false} />
-            <Row k="tier-A upsize" shared={!f || !ta ? null
-              : `×${fmt.num(ta.mult, 2)} when pred_edge ≥ ${fmt.num(ta.edge, 4)}`}
-              hint="First-fill upsize: the market's FIRST qualifying second, when the edge clears the tier-A threshold." />
             <Row k="DD-brake" shared={brakeRule} mono={false} hint={brakeHint} />
-            <Row k="entries per resolution" shared={multifill} mono={false}
-              hint="One ENTRY per resolution, first-fill-wins across bands. T3 top-ups (below) add to that same position — they are not new entries." />
+            <Row k="entries per resolution" shared="one — first fill wins across bands" mono={false} />
             <Row k="min bet" shared={z.min_bet_usd != null ? fmt.money(z.min_bet_usd) : null} />
             {coinCapText && <Row k="per-coin cap" shared={coinCapText}
               hint="Hard per-bet cap from the deployed manifest (max_bet_usd_by_coin) — applied after every sizing multiplier." />}
 
-            {/* T3 TOP-UPS get their own group (2026-08-05). The deleted flags
-                panel crushed all nine knobs into one unreadable line, and the
-                loop itself MOVED into execution/held_position_pass.py when the
-                stop-loss exit was retired — the deterioration predicate now
-                DISARMS top-ups instead of selling. */}
-            <GroupRow label="T3 top-ups — shared · taker adds to a filled position, never an exit" />
-            <Row k="status" shared={!t3 ? null : (t3.enabled ? 'on' : 'off')} mono={false}
-              hint="Driven per-second by execution/held_position_pass.py against a fresh book + model re-score; the whole pass is a no-op when off." />
-            {t3 && t3.enabled && <Row k="size" shared={`≤ ${t3.max_n} top-ups × ${fmt.pct(t3.frac, 0)} of base`} />}
-            {t3 && t3.enabled && <Row k="price gates" shared={`price ≤ ${fmt.prob(t3.cap, 2)} · spread ≤ ${fmt.prob(t3.spread_max, 2)} · exposure ≤ ×${fmt.num(t3.exposure_cap, 2)}`}
-              hint="Every gate must hold on the fresh book; exposure is cumulative top-up fill cash vs the entry stake." />}
-            {t3 && t3.enabled && <Row k="cadence" shared={`every ${t3.cadence_s}s · stops ${t3.end_buffer_s}s before close · pad +${fmt.num(t3.fak_pad, 2)}`}
-              hint="At most ONE FAK top-up per position per pass; the pad is T3's own, decoupled from the entry FAK pad." />}
-            {t3 && t3.enabled && <Row k="no-dip" shared={t3.no_dip ? `${fmt.num(t3.no_dip, 2)} below entry ask` : 'off'}
-              hint="Durable running-min ask: the first dip this far below the entry ask permanently disarms T3 for the market." />}
-            {t3 && t3.enabled && <Row k="deterioration disarm" shared={t3.disarm_band != null ? `bid ≥ model_p + ${fmt.num(t3.disarm_band, 2)} while underwater` : null}
-              hint="The ex-stop-loss trigger, kept as a DISARM signal (SCALEIN_T3_DISARM_BAND): it permanently stops further top-ups on that market. It never sells — the stop-loss exit was deleted 2026-08-05." />}
-            {t3 && t3.enabled && <Row k="fresh gate" shared={!f ? null : (f.topup_fresh_gate_mode || 'off')} mono={false}
-              hint="Top-up book-freshness gate, tri-state: off / shadow (logs only) / live (blocks)." />}
 
             <GroupRow label="execution — shared" />
             <Row k="orders" shared="FAK (fill-and-kill) taker" mono={false} />
             <Row k="anchored pad" shared={padValue} mono={false}
               hint="limit = min(walked, first_limit) + pad · CRYPTOBOT_V2_FAK_PAD" />
-            <Row k="retries" shared="consume-on-fill · per-second re-eval until a fill or the entry window ends" mono={false}
-              hint="The entry window ends at the late-window skip above, not at market close." />
+            <Row k="retries" shared="consume-on-fill · per-second re-eval until a fill or the entry window ends" mono={false} />
             <Row k="venue delay" shared={venueDelayText} mono={false} />
             <Row k="fees" shared="live venue fees — charged and booked on every fill" mono={false}
               hint="The taker-fee contract in the decision-spec row is the SAME schedule the live grader books against; there is no paper-fee mode." />

@@ -1,46 +1,24 @@
-"""Build dashboard/snapshot.json — the static fallback context for the journal.
+"""Build dashboard/snapshot.json, the static fallback the dashboard shows
+before its first live update.
 
-Reads:
-  v2_step1last_live.json  - live portfolio/sleeve config, wherever
-                            config.V6_CONFIG_PATH resolves it (deployed
-                            runtime/config/, else polymarket/live/config/)
-  --db-path PATH                           - optional cryptobot.db to hydrate
-                                             operator state
-  --venue {polymarket,predictfun}          - which BOX this snapshot ships to
-                                             (deploy.sh passes the box role).
-                                             Stamped into the payload as
-                                             `venue`.
-
-Writes:
-  dashboard/snapshot.json   - static portfolio + live-state fallback context
-
-The Strategy/Research tabs were retired (2026-07-07/07-09). The retired Research
-tab's decision-table stats block was removed 2026-07-11 (grep-verified
-zero-consumer: no dashboard page reads window.SNAPSHOT.decision_table — the whole
-static snapshot is a fallback the live surfaces read the SSE payload over). The
-mode_state / live_wallet blocks and the operator events/transfers history went
-the same way 2026-08-05. The portfolio + operator blocks stay as the static
-fallback (review #16 keeps their shape in lockstep with the live payload). Run
-after a config change to refresh the fallback.
+Reads the strategy config (wherever config.V6_CONFIG_PATH resolves it) and,
+with ``--db-path``, operator state from cryptobot.db. Writes
+dashboard/snapshot.json with the portfolio and operator blocks, in the same
+shape as the live payload. Run after a config change to refresh it.
 """
 from __future__ import annotations
 
 import argparse
 import json
-import os
 import sqlite3
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
 _HERE = Path(__file__).resolve()
-# ROOT must satisfy BOTH tree layouts, and a fixed parent depth cannot:
-# locally this file is `<repo>/polymarket/dashboard/build_snapshot.py` (the
-# dashboard moved under the venue on 2026-08-04, so the repo root is TWO up),
-# while deploy.sh stages it flat as `$PROJECT_DIR/dashboard/build_snapshot.py`
-# (project root ONE up). Walk up for the repo marker exactly like
-# cryptobot.config._resolve_repo_root does, and fall back to the deployed
-# shape — no pyproject.toml ships in the runtime bundle.
+# Locally this file is <repo>/polymarket/dashboard/build_snapshot.py; deploy.sh
+# stages it as $PROJECT_DIR/dashboard/build_snapshot.py. Find the repo root the
+# same way cryptobot.config does, falling back to the deployed layout.
 ROOT = _HERE.parent.parent
 for _candidate in _HERE.parents:
     if (_candidate / "pyproject.toml").is_file():
@@ -49,29 +27,17 @@ for _candidate in _HERE.parents:
     if (_candidate / "polymarket" / "src" / "cryptobot").is_dir():
         ROOT = _candidate
         break
-# The package roots differ between the local tree and the deployed bundle —
-# deploy.sh maps one onto the other, so try both shapes.
-#
-# Phase 2 (2026-07-28) added the venue adapter packages. They are NOT optional
-# here: the snapshot books cash P&L through execution.grade_fees, which prices
-# every row through cryptobot.venues -> the venue adapter. Locally they sit in
-# their venue trees (the Polymarket adapter shares `polymarket/src` with the
-# engine since 2026-08-04); in the deployed bundle deploy.sh stages them flat
-# next to cryptobot in src/, so `ROOT / "src"` already covers them there.
+# Package roots: polymarket/src locally, src/ in the deployed bundle.
 for _src in (
     ROOT / "polymarket" / "src",
-    ROOT / "predictfun" / "live" / "src",
     ROOT / "src",
 ):
     if _src.is_dir() and str(_src) not in sys.path:
         sys.path.insert(0, str(_src))
 
-# V6_CONFIG tracks whatever the live loader reads (config.V6_CONFIG_PATH) so
-# the static snapshot's wallet-group caps + existence guard follow the deployed
-# config automatically. Fallback = v2_step1last_live.json (exp044 retired
-# 2026-07-09; its config no longer exists) — snapshot build must never hard-fail.
-# The fallback chain mirrors config._resolve_artifact: deployed runtime/ copy,
-# then the pre-2026-07-28 research-tree path, then the venue live config.
+# Use the same config file the live loader reads. If cryptobot cannot be
+# imported, fall back to the deployed copy, then the repo copy; building the
+# snapshot must never fail outright.
 try:
     from cryptobot import config as _cfg
 
@@ -88,19 +54,13 @@ OUT = Path(__file__).parent / "snapshot.json"
 
 
 def load_portfolio() -> dict | None:
-    """Return the live portfolio block for the dashboard's static fallback.
+    """Return the portfolio block for the static fallback.
 
-    Delegates to the LIVE loaders (`load_sleeves` + `_portfolio_block`) so the
-    static snapshot can never drift from the SSE payload's portfolio shape or
-    values (review #16). This is why the exp044 migration — which retired
-    `dry_run_recommended.json` and flipped `config.V6_CONFIG_PATH` to
-    `exp044_live.json` — required no per-field reparsing here: the static
-    snapshot follows the live loader automatically. `_portfolio_block` already
-    forces `max_walk_price` to the runtime override (config.MAX_WALK_PRICE),
-    counts shared-equity groups once, and now carries the ORB per-coin filters.
+    Uses the live loaders (``load_sleeves`` + ``_portfolio_block``), so the
+    static snapshot always matches the live payload's portfolio block.
 
-    Returns None when the deployed config artifact is absent or unreadable;
-    the dashboard then relies on the live SSE `portfolio` block.
+    Returns None when the config is missing or unreadable; the dashboard then
+    waits for the live ``portfolio`` block.
     """
     if not V6_CONFIG.exists():
         return None
@@ -149,16 +109,10 @@ def _readiness_checks(payload: dict) -> list[dict]:
 
 
 def load_live_state(db_path: Path | None) -> dict:
-    """Hydrate the LIVE operator block from the live SQLite DB.
+    """Read the operator block (state and readiness) from the SQLite DB.
 
-    Returns a dict carrying `operator` (singleton state + readiness). When
-    `db_path` is None or the DB is missing, the block defaults to the
-    schema's SQL DEFAULT — operator STOPPED_PROCESSING. This matches what
-    the live `snapshot_builder` would produce on a fresh deploy.
-    (The `wallet_groups` cap-utilization block was dropped 2026-07-14 with
-    the retired group bar; `mode_state`, `live_wallet` and the operator
-    events/transfers history followed 2026-08-05 — no dashboard surface
-    read any of them off the static snapshot.)
+    Without a database it returns the schema default, STOPPED_PROCESSING,
+    which is what a fresh deploy shows.
     """
     defaults = {
         "operator": {
@@ -251,26 +205,12 @@ def main():
         default=None,
         help="optional cryptobot.db to hydrate operator state",
     )
-    parser.add_argument(
-        "--venue",
-        choices=("polymarket", "predictfun"),
-        default=os.environ.get("CRYPTOBOT_BOX_ROLE") or "polymarket",
-        help=(
-            "which BOX this snapshot ships to. The dashboard is ONE app "
-            "parameterized by venue (the cross-venue view was retired "
-            "2026-08-01), and the client reads `venue` off the payload to pick "
-            "its wallet vocabulary, latency floor and fee spec — so the static "
-            "pre-SSE fallback must carry it too, or the predict.fun console "
-            "renders Polymarket labels until the first tick. deploy.sh passes "
-            "the box role; defaults to polymarket."
-        ),
-    )
     args = parser.parse_args()
 
     live = load_live_state(args.db_path)
     snapshot = {
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "venue": args.venue,
+        "venue": "polymarket",
         "portfolio": load_portfolio(),
         "operator": live["operator"],
     }

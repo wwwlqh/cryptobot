@@ -19,14 +19,11 @@
 // ===========================================================================
 
 (function () {
-// Venue registry. The bot is being ported from Polymarket (7% parabola fee,
-// BTC/ETH/SOL/XRP) to predict.fun (BNB-chain CLOB, 2% tent fee, BTC/ETH/BNB).
-// The live payload carries `venue`; an ABSENT venue ⇒ polymarket (older
-// snapshots predate the field). Coin universes here are only a fallback for
-// the pre-first-tick boot window — the live `markets` array wins when present.
+// Venue registry. The live payload carries `venue`; an absent venue means
+// polymarket. The coin list is only a fallback before the first tick; the
+// live `markets` array wins when present.
 const VENUE_META = {
   polymarket: { key: 'polymarket', label: 'POLYMARKET', short: 'Polymarket', coins: ['BTC', 'ETH', 'SOL', 'XRP'] },
-  predictfun: { key: 'predictfun', label: 'PREDICT.FUN', short: 'predict.fun', coins: ['BTC', 'ETH', 'BNB'] },
 };
 const DASHBOARD_TZ = 'Asia/Kuala_Lumpur';
 const INITIAL_BANKROLL = 100.0;
@@ -221,7 +218,7 @@ function normVenueSel(sel) {
   // Unset resolves to THIS deployment's venue — stashed by App from the live
   // payload (window.__CB_DEPLOY_VENUE) — never a cross-venue passthrough.
   const s = String(sel || '').toLowerCase();
-  if (s === 'polymarket' || s === 'predictfun') return s;
+  if (VENUE_META[s]) return s;
   return (typeof window !== 'undefined' && window.__CB_DEPLOY_VENUE) || 'polymarket';
 }
 // A single row's venue, normalized (ABSENT ⇒ polymarket, unknown ⇒ polymarket).
@@ -315,23 +312,6 @@ function scopedCoins(live, sel, rows) {
 function stripCash(m) {
   return { ...m, cashLive: null, cashNet: null, net: m.paper, drift: null, hasCash: false, degraded: false };
 }
-// Normalize the predict.fun funder wallet block (live.predictfun_wallet, mirrored
-// on window.SNAPSHOT). ABSENT ⇒ {present:false} for the wallet panel's clean
-// empty state.
-function predictfunWallet(source) {
-  const snap = (typeof window !== 'undefined' && window.SNAPSHOT) ? window.SNAPSHOT : null;
-  const w = (source && source.predictfun_wallet) || (snap && snap.predictfun_wallet) || null;
-  if (!w || typeof w !== 'object') return { present: false };
-  const col = (w.collateral && typeof w.collateral === 'object') ? w.collateral : null;
-  return {
-    present: true,
-    address: w.address || null,
-    chain: w.chain || 'bnb',
-    apiKeyPresent: w.api_key_present === true,
-    collateral: col ? { symbol: col.symbol || null, balance: typeof col.balance === 'number' ? col.balance : null } : null,
-  };
-}
-
 function strategyBase(k) {
   if (!k) return INITIAL_BANKROLL;
   return k.initial_bankroll != null ? k.initial_bankroll : INITIAL_BANKROLL;
@@ -1149,9 +1129,6 @@ function buildResolutionRow(res, opts) {
       outcome: stop ? 'LOSS'
         : (f.ghost || !(f.filled_usd > 0)) ? 'GHOST_FILL' : (f.outcome || 'PENDING'),
       time: f.time,
-      isStop: stop,
-      exitPrice: stop ? f.exit_price : null,   // realized stop-sell VWAP
-      ifHeldPnl: stop ? f.stop_if_held_pnl : null,  // held-to-resolution counterfactual
       // Unrealized mark on an OPEN (PENDING) fill — marked-to-book, else entry.
       markPx: f.mark_px != null ? f.mark_px : null,
       markSource: f.mark_source || null,
@@ -1205,13 +1182,6 @@ function buildResolutionRow(res, opts) {
     // same fold the journal applies, so both tables book the same dollars.
     pnl: group ? group.pnl : null,
     missedPnl,
-    // HISTORICAL stop-loss early-exit surface: the row's realized pnl (a loss)
-    // is already carried in `pnl`; these expose the exit price and the
-    // held-to-resolution counterfactual (NULL until the sweep backfills
-    // won_up). Read-only history — the engine no longer books stop exits.
-    isStop: !!(anchor && anchor.exit_kind === 'stop_loss'),
-    exitPrice: (anchor && anchor.exit_kind === 'stop_loss') ? anchor.exit_price : null,
-    ifHeldPnl: (anchor && anchor.exit_kind === 'stop_loss') ? anchor.stop_if_held_pnl : null,
     // SIZE-WEIGHTED across the position's fills (groupTrades) — the effective
     // price actually paid, not the base bet's alone.
     execPx: group ? group.avgExec : null,
@@ -1434,7 +1404,7 @@ window.CB = {
   rowStake, sliceRef, execPrice, fillPrice, liveCoins, inRange, dailyInRange, parseUtcTimestamp,
   venueOf, venueUniverse,
   normVenueSel, rowVenue, rowKey, venueFilter, scopeLive, scopedCoins,
-  stripCash, predictfunWallet,
+  stripCash,
   aggEquity, aggDaily, selectDaily, selectAnalytics, aggWeekly, aggHistogram, aggCoins,
   aggSlices, aggStreaks, aggRatios, aggSummary, lifetimeSummary, lifetimeEquity,
   strategyBase, money, withPaperBasis, ledgerWindow,

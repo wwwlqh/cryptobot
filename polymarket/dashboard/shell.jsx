@@ -12,8 +12,8 @@ const { fmt, tone, useSecond, directionFromSide, venueOf } = window.CB;
 // carries `venue`, so every venue-specific string is derived from it rather
 // than hardcoded to Polymarket (which is what made the predict.fun console
 // call its own wallet "POLY_FUNDER" and quote Polymarket's taker delay).
-const VENUE_LABEL = { polymarket: 'Polymarket', predictfun: 'predict.fun' };
-const VENUE_LABEL_CAPS = { polymarket: 'POLYMARKET', predictfun: 'PREDICT.FUN' };
+const VENUE_LABEL = { polymarket: 'Polymarket' };
+const VENUE_LABEL_CAPS = { polymarket: 'POLYMARKET' };
 function venueLabel(live) { return VENUE_LABEL[venueOf(live)] || VENUE_LABEL.polymarket; }
 function venueLabelCaps(live) { return VENUE_LABEL_CAPS[venueOf(live)] || VENUE_LABEL_CAPS.polymarket; }
 
@@ -119,7 +119,6 @@ function Topbar({ meta, live, range, setRange }) {
   const sse = window.__SSE_STATE || 'connecting';
   const s = SSE[sse] || SSE.mock;
   const modeCls = mode === 'LIVE' ? 'badge-live' : mode === 'DRY' ? 'badge-dry' : 'badge-mixed';
-  const venue = venueOf(live);
   return (
     <div className="topbar">
       <div>
@@ -131,7 +130,7 @@ function Topbar({ meta, live, range, setRange }) {
             2026-08-01: each console is single-venue by deployment, so a
             switcher could only ever pin the console to a venue it cannot
             render. This states which box you are looking at. */}
-        <span className={'badge badge-venue' + (venue === 'predictfun' ? ' pf' : '')}>
+        <span className="badge badge-venue">
           {venueLabelCaps(live)}
         </span>
         {meta.range && setRange && (

@@ -234,19 +234,11 @@ def _strategy_flags_block() -> dict[str, Any]:
 
 
 def _v2_spec(portfolio: V6Portfolio) -> dict[str, Any]:
-    """The live sub-minute decision spec surfaced on the dashboard v2 header.
+    """The live sub-minute decision spec shown on the dashboard.
 
-    The deployed strategy is MID/step1last (subminute_5m/15m, ask (0.65, 0.85],
-    pred_edge >= 0.03) over each sleeve's configured per-second window,
-    first-fill-wins per
-    resolution. Every band fact is DERIVED from the loaded portfolio sleeves (a
-    sleeve is a v2 sleeve iff it carries a non-empty checkpoint_offset_set), so
-    the header cannot drift from the manifest hgb_loader validates. MID's
-    canonical numbers are pinned by strategy.spec_v2.V2_SPEC.
-
-    The stale flat single-band ask_lo/ask_hi/gate fields are intentionally NOT
-    emitted — consumers read spec["bands"] and fall back to the legacy flat
-    fields only for an older payload.
+    Everything is derived from the loaded sleeves (a sleeve is sub-minute when
+    it has a non-empty checkpoint_offset_set), so the page always matches the
+    deployed config. Bands are a list, one entry per distinct ask band.
     """
     def _iv_minutes(interval: Optional[str]) -> int:
         try:
@@ -275,9 +267,7 @@ def _v2_spec(portfolio: V6Portfolio) -> dict[str, Any]:
         width = next(iter(window_widths))
         cadence = f"last {width}s · per-second (0–{width - 1}s)"
 
-    # bands: group sleeves by ask band — the live artifact carries the single
-    # frozen MID band (spec_v2's 0.65 low). Emitted ascending by ask_lo, and as
-    # a LIST because the dashboard renders it data-driven over N bands.
+    # Group sleeves by ask band, ascending by ask_lo.
     by_band: dict[tuple[float, float], list] = {}
     for s in v2_sleeves:
         band = tuple(s.ask_bucket_ranges[0]) if s.ask_bucket_ranges else (0.0, 0.0)
@@ -287,13 +277,12 @@ def _v2_spec(portfolio: V6Portfolio) -> dict[str, Any]:
     for (ask_lo, ask_hi), group in sorted(by_band.items(), key=lambda kv: kv[0][0]):
         group = sorted(group, key=lambda s: (_iv_minutes(s.interval), s.label))
         bands.append({
-            "key": "mid",
-            "label": "MID (step1last)",
+            "key": f"{ask_lo:g}-{ask_hi:g}",
+            "label": f"{ask_lo:g}–{ask_hi:g}",
             "sleeves": [s.label for s in group],
             "ask_lo": ask_lo,
             "ask_hi": ask_hi,
-            # pred_edge gate on model_p − ask − fee (NOT the exp044 HGB score
-            # threshold): 0.03.
+            # pred_edge gate on model_p − ask − fee.
             "gate": group[0].threshold,
         })
 
@@ -303,7 +292,7 @@ def _v2_spec(portfolio: V6Portfolio) -> dict[str, Any]:
     intervals = sorted(
         {s.interval for s in v2_sleeves}, key=_iv_minutes
     ) or list(V2_SPEC["intervals"])
-    feature_groups = getattr(rep, "feature_groups", None) or "rf,price,identity,time"
+    feature_groups = getattr(rep, "feature_groups", None) or "price,identity,time,momentum"
     signal_source = getattr(rep, "signal_source", None) or "hgb"
     return {
         "intervals": intervals,
@@ -320,7 +309,7 @@ def _v2_spec(portfolio: V6Portfolio) -> dict[str, Any]:
         # band -> reachable -> dedup(first entry_ts) -> gate, then first-fill-
         # wins across both bands (one bet per resolution).
         "selection": "first-fill-wins per resolution · dedup-before-gate",
-        # 11-set model input contract shared by every sleeve.
+        # The model's 11 input features, shared by every sleeve.
         "features": f"{feature_groups} (11-set)",
         "signal_source": signal_source,
         "bands": bands,
@@ -582,99 +571,6 @@ def _float_or_none(raw: Any) -> Optional[float]:
     except (TypeError, ValueError):
         return None
     return value if math.isfinite(value) else None
-
-
-def _stop_if_held_pnl(
-    *,
-    side: Any,
-    won_up: Any,
-    live_filled_size: Any,
-    live_filled_price: Any,
-    bet_size: Any,
-    fill_price: Any,
-) -> Optional[float]:
-    """Counterfactual PnL a stop-closed position WOULD have realized had it been
-    held to binary settlement instead of stopped out early.
-
-    ``shares·1 − cost − winner_fee`` when the held side won the resolution,
-    ``−cost`` when it lost. ``shares`` = realized fill size
-    (``live_filled_size``; fallback ``bet_size / fill_price``); ``cost`` =
-    realized cash spent (``live_filled_size · live_filled_price``; fallback
-    ``bet_size``). ``winner_fee`` = the VENUE-dispatched per-share fee
-    (``fee_per_share``: Polymarket parabola ``θ·fp·(1−fp)``, byte-identical to
-    the pre-dispatch inline form; predict.fun tent on ``fee_rate_bps``) at the
-    effective entry price ``fp = cost/shares``, times ``shares`` — the SAME
-    winning-payout skim ``_reject_missed_pnl`` subtracts, so the two
-    counterfactual surfaces agree (2026-07-21 fix: the fee was previously
-    omitted here, overstating every would-have-won stop by the winner fee).
-    Returns None until the market outcome (``won_up``) has been backfilled onto
-    the stop row (see ``resolution_sweep.backfill_stop_loss_resolutions``),
-    when neither shares nor cost can be recovered, or on an unrecognized
-    ``venue`` string (an honest null beats pricing the fee with the wrong
-    shape). Display-only — never a sizing/settlement primitive."""
-    if won_up is None:
-        return None
-    lf_size = _float_or_none(live_filled_size)
-    lf_price = _float_or_none(live_filled_price)
-    if lf_size is not None and lf_size > 0:
-        shares = lf_size
-    else:
-        bs = _float_or_none(bet_size)
-        fp = _float_or_none(fill_price)
-        if bs is None or fp is None or fp <= 0.0:
-            return None
-        shares = bs / fp
-    if lf_size is not None and lf_size > 0 and lf_price is not None:
-        cost = lf_size * lf_price
-    else:
-        bs = _float_or_none(bet_size)
-        if bs is None:
-            return None
-        cost = bs
-    s = str(side or "").upper()
-    won = bool(won_up)
-    side_won = (s == "YES" and won) or (s == "NO" and not won)
-    if not side_won:
-        return -cost
-    entry_px = (cost / shares) if shares > 0 else None
-    winner_fee = 0.0
-    if entry_px is not None:
-        winner_fee = fee_per_share(
-            entry_px, theta=float(getattr(config, "POLY_FEE_THETA", 0.07))
-        ) * shares
-    return shares - cost - winner_fee
-
-
-def _stop_display_fields(
-    r: Any, live_filled_size: Any, live_filled_price: Any
-) -> dict[str, Optional[float]]:
-    """Stop-loss early-exit display fields (PURE_STOP_04), shared by the ledger
-    and v2 row builders so the emit contract lives in one place.
-
-    ``exit_price``/``exit_kind`` pass through; ``stop_if_held_pnl`` is the
-    held-to-resolution counterfactual, NULL on every non-stop row. ``r`` must
-    expose ``side``/``won_up``/``bet_size``/``fill_price``/``exit_price``/
-    ``exit_kind``; the caller supplies the realized live fill size/price (a
-    local var in the ledger builder, a row column in the v2 builder). The
-    winner fee inside the counterfactual dispatches on the row's venue
-    (``_row_venue`` — absent-in-SELECT folds to 'polymarket', byte-identical
-    parabola) with the per-market ``fee_rate_bps`` threaded when the SELECT
-    carries it. Display-only — never a sizing/settlement primitive."""
-    return {
-        "exit_price": _round_prob(r["exit_price"]),
-        "exit_kind": r["exit_kind"],
-        "stop_if_held_pnl": (
-            _round_money(_stop_if_held_pnl(
-                side=r["side"],
-                won_up=r["won_up"],
-                live_filled_size=live_filled_size,
-                live_filled_price=live_filled_price,
-                bet_size=r["bet_size"],
-                fill_price=r["fill_price"],
-            ))
-            if r["exit_kind"] == "stop_loss" else None
-        ),
-    }
 
 
 def _live_account_reconciliation(
@@ -2619,10 +2515,10 @@ def _ledger_block(
         "       mode, venue, fill_price, walked_vwap, bet_size, live_filled_size, "
         "       live_filled_price, is_topup, pnl_net, "
         "       model_p, p_market, realized_edge, resolution_ts, won_up, interval_min, "
-        "       pair_group_id, pair_role, pair_component, paired_coin, offset_sec, "
+        "       pair_component, offset_sec, "
         # poly_token_id is read ONLY for the open-position book mark below — it is
         # NOT emitted to the client (no auth/token leak).
-        "       exit_price, exit_kind, exit_ts, poly_token_id "
+        "       exit_kind, exit_ts, poly_token_id "
         f"FROM ledger{where} ORDER BY id DESC LIMIT ?",
         params,
     ).fetchall()
@@ -2700,21 +2596,13 @@ def _ledger_block(
             "exit_ts": r["exit_ts"],
             "won_up": r["won_up"],
             "interval_min": r["interval_min"],
-            "pair_group_id": r["pair_group_id"],
-            "pair_role": r["pair_role"],
-            "pair_component": r["pair_component"],
-            "paired_coin": r["paired_coin"],
             # B1 sub-minute checkpoint stamp (NULL on baseline rows) — the
             # Journal's "+Ns" badge reads this (review finding: the SELECT
             # carried it but the emitted dict dropped it).
             "offset_sec": r["offset_sec"],
-            # Stop-loss early-exit display (PURE_STOP_04). NULL on every non-stop
-            # row; exit_kind='stop_loss' tags a booked-once early close whose
-            # pnl_net is the realized round-trip loss (already flowing into the
-            # rollup/equity sums as a CANCELLED row). stop_if_held_pnl is the
-            # counterfactual PnL had the position been held to resolution — NULL
-            # until the sweep backfills won_up onto the stop row.
-            **_stop_display_fields(r, live_fill_size, live_fill_price),
+            # Historical stop-loss rows: exit_kind='stop_loss' marks an early
+            # close whose pnl_net is the realized loss.
+            "exit_kind": r["exit_kind"],
         }
         # Mark OPEN positions to the current book (unrealized). Zero venue calls
         # — the SAME off-tick book source the held-position pass reads. A token outside the
@@ -4237,7 +4125,7 @@ def _v2_block(
                 "       window_start_ts, side, poly_token_id, is_topup, "
                 "       model_p, p_market, bet_size, target_usd, fill_price, walked_vwap, outcome, "
                 "       pnl_net, mode, won_up, live_filled_size, "
-                "       live_filled_price, exit_price, exit_kind, exit_ts, "
+                "       live_filled_price, exit_kind, exit_ts, "
                 "       venue, fee_rate_bps "
                 "FROM ledger WHERE offset_sec IS NOT NULL "
                 "ORDER BY id DESC LIMIT ?",
@@ -4312,14 +4200,8 @@ def _v2_block(
                     "pnl_net": _round_money(r["pnl_net"]),
                     "mode": r["mode"],
                     "exit_ts": r["exit_ts"],
-                    # Stop-loss early-exit display (PURE_STOP_04). A stop row
-                    # rides in as a normal filled bet (outcome='CANCELLED',
-                    # pnl_net = realized round-trip loss) so it groups into its
-                    # resolution and its pnl_net flows into the same sums as
-                    # WIN/LOSS. exit_kind tags it; exit_price is the realized
-                    # sell VWAP; stop_if_held_pnl is the held-to-resolution
-                    # counterfactual (NULL until won_up is backfilled).
-                    **_stop_display_fields(r, r["live_filled_size"], r["live_filled_price"]),
+                    # Historical stop-loss rows count as a realized loss.
+                    "exit_kind": r["exit_kind"],
                 }
                 # Unrealized mark on OPEN sub-minute positions (Subminute drill-down).
                 if str(r["outcome"] or "").upper() == "PENDING":

@@ -27,14 +27,8 @@ function OperatorConsolePage({ live }) {
   // process's own live payload, so the operator POSTs always target the bot
   // whose state is on screen. There is no longer any way to view one venue's
   // state while the controls drive another's.
-  //
-  // Venue-aware wallet labelling: `venue` rides on the payload, and the
-  // funder-wallet card was hardcoded to Polymarket's vocabulary (POLY_FUNDER /
-  // pUSD), which on the predict.fun console named a wallet that does not exist.
-  const venue = window.CB.venueOf(live);
-  const isPf = venue === 'predictfun';
-  const walletTitle = isPf ? 'PREDICT_ACCOUNT wallet record' : 'POLY_FUNDER wallet record';
-  const collateral = isPf ? 'USDT' : 'pUSD';
+  const walletTitle = 'POLY_FUNDER wallet record';
+  const collateral = 'pUSD';
   const lw = live.live_wallet || {};
   const [copied, setCopied] = useState(false);
   const [busy, setBusy] = useState(null);

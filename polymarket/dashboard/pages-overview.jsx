@@ -172,7 +172,7 @@ function OverviewPage({ live, range, venueSel }) {
       <span className="tag">{(VENUE_META[sel] || {}).short || sel}</span>
       &nbsp;no trading rows on this box yet — the scanner has not written a
       ledger row since the accounting cutover. The account tiles below are this
-      deployment's own {sel === 'predictfun' ? 'predict.fun' : 'Polymarket'}
+      deployment's own Polymarket
       &nbsp;account; the tables stay empty until it trades.
     </div>
   ) : null;

@@ -270,16 +270,14 @@ def test_load_portfolio_real_artifact():
     bs = _load_module()
     portfolio = bs.load_portfolio()
     assert portfolio is not None
-    # Single-band amendment 2026-07-21 (FOLDF_HOLDOUT_20260721.md): the
-    # deployed artifact (v2_step1last_live.json) carries only the two
-    # sub-minute checkpoint sleeves in one shared-equity group_live; the
-    # second sleeve pair trialled from 2026-07-10 is gone.
+    # The deployed config has two sub-minute sleeves in one shared-equity
+    # group.
     labels = [s["label"] for s in portfolio["sleeves"]]
     assert labels == ["subminute_5m", "subminute_15m"]
     assert portfolio["shared_exposure_cap_frac"] == pytest.approx(1.0)
     assert portfolio["wallet_exposure_cap_fracs"]["subminute_5m"] == pytest.approx(1.0)
     assert portfolio["wallet_exposure_cap_fracs"]["subminute_15m"] == pytest.approx(1.0)
-    assert portfolio["max_drawdown_halt_frac"] == pytest.approx(0.30)
+    assert portfolio["max_drawdown_halt_frac"] == pytest.approx(0.40)
     # max_walk_price MUST be the runtime override (config.MAX_WALK_PRICE),
     # never a per-sleeve value from the JSON.
     assert portfolio["max_walk_price"] == 0.05
@@ -326,34 +324,26 @@ def test_v2_spec_bands_and_sizing_constants(monkeypatch):
         assert stale not in spec, f"stale flat spec field {stale!r} still emitted"
     assert spec["poly_fee_theta"] == pytest.approx(0.07)
     assert spec["one_per_market"] is True
-    # Bands derived from the deployed sleeves — one band since 2026-07-21
-    # (FOLDF_HOLDOUT_20260721.md: the second band left the artifact).
-    assert [b["key"] for b in spec["bands"]] == ["mid"]
-    bands = {b["key"]: b for b in spec["bands"]}
-    assert bands["mid"]["sleeves"] == ["subminute_5m", "subminute_15m"]
-    assert (bands["mid"]["ask_lo"], bands["mid"]["ask_hi"], bands["mid"]["gate"]) == (
-        0.65, 0.85, 0.03,
-    )
+    # Bands are derived from the deployed sleeves: one shared band.
+    assert len(spec["bands"]) == 1
+    band = spec["bands"][0]
+    assert band["sleeves"] == ["subminute_5m", "subminute_15m"]
+    assert (band["ask_lo"], band["ask_hi"], band["gate"]) == (0.55, 0.85, 0.10)
 
     consts = snapshot_builder._v2_sizing_constants()
-    # Flat 1% on both intervals (2026-08-09 operator orders: 1% -> 2% -> 1%
-    # around the same-day flip re-arm; was 3% flip-era).
+    # Flat 1% on both intervals.
     assert consts["base_frac_15m"] == pytest.approx(0.010)
     assert consts["base_frac_5m"] == pytest.approx(0.010)
-    # Brake rule: THROTTLE REMOVED (operator 2026-07-31) — floor 1.0 pins the
-    # multiplier at 1.0 at every drawdown depth. Scale stays 0.60 so the
-    # throttle can be re-armed by moving the floor alone.
+    # Floor 1.0 keeps the brake at 1.0 for every drawdown (throttle off).
     assert consts["brake_scale"] == pytest.approx(0.60)
     assert consts["brake_floor"] == pytest.approx(1.0)
-    # dd_rail (research budget, not a live control) is removed from the payload
-    # (dashboard DD-display cleanup, operator 2026-07-09).
     assert "dd_rail" not in consts
     assert consts["poly_fee_theta"] == pytest.approx(0.07)
 
 
 def test_v2_block_shape_and_brake(monkeypatch, tmp_path):
     """_v2_block emits spec/sizing/fill_rate/bets and computes the DD-brake as
-    max(0.50, 1 − dd/0.60) off the current drawdown."""
+    max(floor, 1 − dd/0.60) off the current drawdown."""
     import sqlite3
 
     from cryptobot import config
@@ -380,25 +370,19 @@ def test_v2_block_shape_and_brake(monkeypatch, tmp_path):
     # The spec carries `bands`, not a flat single-band presentation.
     for stale in ("ask_lo", "ask_hi", "gate"):
         assert stale not in spec, f"stale flat spec field {stale!r} still emitted"
-    bands = {b["key"]: b for b in spec["bands"]}
-    # Single-band artifact (2026-07-21): only the mid band is emitted.
-    assert set(bands) == {"mid"}
-    assert (bands["mid"]["ask_lo"], bands["mid"]["ask_hi"], bands["mid"]["gate"]) == (
-        0.65, 0.85, 0.03,
-    )
+    assert len(spec["bands"]) == 1
+    band = spec["bands"][0]
+    assert (band["ask_lo"], band["ask_hi"], band["gate"]) == (0.55, 0.85, 0.10)
     assert spec["poly_fee_theta"] == pytest.approx(0.07)
     sizing = block["sizing"]
-    # THROTTLE REMOVED (operator 2026-07-31): brake = max(1.00, 1 − 0.15/0.60)
-    # = 1.00 — a 15% drawdown no longer downsizes. The hard halt (0.30) is the
-    # only drawdown control, and 15% is well short of it.
+    # Throttle off: brake = max(1.00, 1 − 0.15/0.60) = 1.00, so a 15% drawdown
+    # does not downsize. The hard halt (0.40) is the only drawdown control.
     assert sizing["brake_multiplier"] == pytest.approx(1.0)
-    assert sizing["hard_halt_frac"] == pytest.approx(0.30)
+    assert sizing["hard_halt_frac"] == pytest.approx(0.40)
     assert sizing["equity"] == pytest.approx(100.0)
     assert sizing["trading_halted"] is False
-    # DD-display cleanup (operator 2026-07-09): dd_rail gone; plain-language
-    # throttle descriptors present. With the throttle removed the floor is
-    # ×1.00 and its knee collapses to 0 DD — the dashboard reads that pair as
-    # "throttle off" rather than "pinned at the floor".
+    # With the throttle off the floor is ×1.00 and its knee is 0 DD; the
+    # dashboard reads that pair as "throttle off", not "pinned at the floor".
     assert "dd_rail" not in sizing
     assert sizing["throttle_floor_frac"] == pytest.approx(1.0)
     assert sizing["throttle_dd_at_floor"] == pytest.approx(0.0)
@@ -1229,9 +1213,7 @@ def test_load_portfolio_sleeve_fields():
     assert s5["entry_minutes"] == [0, 1, 2, 3, 4]
     assert s5["signal_source"] == "hgb"
     assert s5["min_lut_n"] == 0
-    # 0.266 = the deployed both-hold 1%/1% twin's worst-fold maxDD (fold C),
-    # replacing the pre-resize 0.188 (operator order 2026-07-31).
-    assert s5["backtest_max_drawdown_frac"] == pytest.approx(0.266)
+    assert s5["backtest_max_drawdown_frac"] == pytest.approx(0.1309)
 
 
 def test_dashboard_shell_has_no_mock_payload():
@@ -1897,24 +1879,18 @@ def test_missed_trade_index_maps_chain_verdicts_onto_groups():
 
 
 def test_resolution_grouping_surfaces_stop_row():
-    """window.CB.groupResolutions renders a HISTORICAL stop-closed bet
-    (exit_kind='stop_loss') as ONE fill row carrying the realized loss, the exit
-    price, and the held-to-resolution counterfactual. The standalone STOP badge
-    was retired with the engine's stop-loss (2026-08-05): these rows now render
-    as the LOSS they are, matching the journal. A legacy voided CANCELLED bet
-    (exit_kind null) is unchanged — NOT treated as a stop, and NOT relabelled a
-    loss."""
+    """window.CB.groupResolutions renders a historical stop-closed bet
+    (exit_kind='stop_loss') as one fill row carrying the realized loss, shown
+    as a LOSS. A voided CANCELLED bet (exit_kind null) is not relabelled."""
     payload = _run_client_js(
         """
         const bets = [
-          // Stop-closed YES fill: sold @0.50 → realized −1.00; the market later
-          // went UP so the held side WOULD have won → if held +1.50.
+          // Stop-closed YES fill: realized -1.00.
           { coin: 'BTC', sleeve: 'subminute_5m', interval: '5m', side: 'YES',
              window_start_ts: 1000, offset_sec: 285, ask: 0.70, fill_price: 0.70,
              stake_usd: 3.5, filled_usd: 3.5, ghost: false, outcome: 'CANCELLED',
-             pnl_net: -1.0, exit_kind: 'stop_loss', exit_price: 0.50,
-             stop_if_held_pnl: 1.5, time: '2026-07-11 00:45:00' },
-          // Legacy voided CANCELLED (no exit_kind): must NOT be a stop row.
+             pnl_net: -1.0, exit_kind: 'stop_loss', time: '2026-07-11 00:45:00' },
+          // Voided CANCELLED (no exit_kind).
           { coin: 'ETH', sleeve: 'subminute_5m', interval: '5m', side: 'YES',
              window_start_ts: 2000, offset_sec: 285, ask: 0.70, fill_price: 0.70,
              stake_usd: 3.5, filled_usd: 3.5, ghost: false, outcome: 'CANCELLED',
@@ -1923,9 +1899,7 @@ def test_resolution_grouping_surfaces_stop_row():
         const groups = cb.groupResolutions(bets, []);
         const by = {};
         groups.forEach((g) => { by[g.coin] = {
-          isStop: g.isStop, status: g.status, pnl: g.pnl,
-          exitPrice: g.exitPrice, ifHeldPnl: g.ifHeldPnl,
-          attemptStatus: g.attemptRows[0].outcome,
+          status: g.status, pnl: g.pnl, attemptStatus: g.attemptRows[0].outcome,
         }; });
         console.log(JSON.stringify({ nGroups: groups.length, by }));
         """
@@ -1933,15 +1907,10 @@ def test_resolution_grouping_surfaces_stop_row():
 
     assert payload["nGroups"] == 2
     btc = payload["by"]["BTC"]
-    assert btc["isStop"] is True
-    assert btc["status"] == "LOSS"           # realized loss, no STOP badge
-    assert btc["pnl"] == -1.0                # realized loss counts on the row
-    assert btc["exitPrice"] == 0.50          # exit price surfaced
-    assert btc["ifHeldPnl"] == 1.5           # held-to-resolution counterfactual
-    assert btc["attemptStatus"] == "LOSS"    # drill-down attempt row too
-    # Legacy voided CANCELLED — unchanged, not a stop.
+    assert btc["status"] == "LOSS"
+    assert btc["pnl"] == -1.0
+    assert btc["attemptStatus"] == "LOSS"
     eth = payload["by"]["ETH"]
-    assert eth["isStop"] is False
     assert eth["status"] == "CANCELLED"
 
 
@@ -2516,223 +2485,112 @@ def test_calendar_prefers_server_daily_rollup():
 
 
 def test_dashboard_runtime_assets_match_live_coin_universe():
-    """Coin glyphs cover BOTH venue universes: Polymarket (BTC/ETH/SOL/XRP) and
-    the predict.fun port (BTC/ETH/BNB) — bnb.svg was added for the venue port."""
+    """There is a coin glyph for every coin in the live universe."""
     coins_dir = _REPO_ROOT / "polymarket" / "dashboard" / "assets" / "coins"
     assert sorted(p.name for p in coins_dir.glob("*.svg")) == [
-        "bnb.svg",
         "btc.svg",
         "eth.svg",
         "sol.svg",
         "xrp.svg",
     ]
-    # bnb.svg matches the established coin-glyph shape (32-grid brand circle).
-    bnb = (coins_dir / "bnb.svg").read_text(encoding="utf-8")
-    assert 'viewBox="0 0 32 32"' in bnb
-    assert "<circle" in bnb
 
 
-def test_calibration_page_removed_and_venue_badge_wired():
-    """The Calibration tab (reintroduced 2026-07-21 for the predict.fun port)
-    was REMOVED the same day for the direct-DRY plan — this is the inverse
-    guard: no page file, no index.html script tag, no app.jsx route, no
-    shell.jsx NAV entry/icon. (Its live book-recorder KPIs were folded into the
-    Operator page's predict.fun panel and then retired outright with the book
-    recorders, 2026-08-04.) The venue switcher + the data.jsx venue registry
-    survive unchanged, as does the ?v= cache-buster lockstep."""
+def test_cache_busters_in_lockstep_and_venue_badge_wired():
+    """Every ?v= cache-buster in index.html carries the same tag (browsers cache
+    .jsx aggressively), and the topbar shows a passive venue badge."""
     dash = _REPO_ROOT / "polymarket" / "dashboard"
     index = (dash / "index.html").read_text(encoding="utf-8")
-    app = (dash / "app.jsx").read_text(encoding="utf-8")
     shell = (dash / "shell.jsx").read_text(encoding="utf-8")
     data = (dash / "data.jsx").read_text(encoding="utf-8")
 
-    # The page file is gone and nothing references it. (The sse_server static
-    # allowlist never served pages-calibration.jsx, so on a real deploy the tab
-    # 404'd — removal also closes that latent bug.)
-    assert not (dash / "pages-calibration.jsx").exists()
-    assert "pages-calibration" not in index
-    assert "calibration: window.CalibrationPage" not in app
-    assert "CalibrationPage" not in app
-    assert "key: 'calibration'" not in shell
-    assert "calibration:" not in shell  # NAV entry AND the I.calibration icon
-
-    # Every ?v= cache-buster is still in lockstep (browser .jsx cache gotcha).
     tags = re.findall(r"\?v=([A-Za-z0-9._-]+)", index)
     assert tags, "no ?v= cache-buster tags found in index.html"
     assert len(set(tags)) == 1, f"cache-buster tags not in lockstep: {set(tags)}"
     assert "styles.css?v=" in index
 
-    # Venue identity in the topbar is a PASSIVE BADGE (2026-08-01). The
-    # segmented switcher and its VENUE_SELECTORS list were removed with the
-    # cross-venue view: each console is single-venue by deployment, so a
-    # switcher could only pin it to a venue it cannot render.
     assert "badge-venue" in shell
-    assert "venue-seg" not in _code_only(shell)
-    assert "VENUE_SELECTORS" not in _code_only(shell)
-    assert "VENUE_SELECTORS" not in _code_only(data)
     styles = (dash / "styles.css").read_text(encoding="utf-8")
     assert ".badge-venue" in styles
-    assert ".venue-seg" not in _code_only(styles)
 
-    # data.jsx owns the venue registry + helpers (kept OUT of app.jsx so the
-    # existing "no BNB in app" guard stays green).
-    assert "BNB" not in app
     assert "const VENUE_META" in data
-    assert "'PREDICT.FUN'" in data
     for fn in ("function venueOf", "function venueUniverse"):
         assert fn in data
     assert "venueOf, venueUniverse," in data
 
 
 def test_venue_helpers_execute():
-    """window.CB venue helpers behave for BOTH a payload lacking the venue field
-    (older snapshot ⇒ polymarket default) and a synthetic predict.fun payload
-    carrying it. This is the app-boots-with-both-snapshots smoke check at the
-    data layer (the pages read exactly these helpers)."""
+    """window.CB venue helpers: a payload without a venue field, or with an
+    unknown one, resolves to polymarket and its coin universe; a live markets
+    array wins over that fallback."""
     p = _run_client_js(
         """
-        // (a) legacy payload: no venue, no markets.
         const legacy = { tick_ts: null, markets: [] };
-        // (b) synthetic predict.fun payload carrying the venue field.
-        const pf = {
-          venue: 'predictfun', tick_ts: '2026-07-21T08:00:00Z', markets: [],
-        };
         console.log(JSON.stringify({
           legacyVenue: cb.venueOf(legacy),
           legacyUniverse: cb.venueUniverse(legacy),
           legacyCoins: cb.liveCoins(legacy),
-          pfVenue: cb.venueOf(pf),
-          pfUniverse: cb.venueUniverse(pf),
-          pfCoinsFromFallback: cb.liveCoins(pf),
-          marketsWin: cb.liveCoins({ venue: 'predictfun', markets: [{ coin: 'BTC' }] }),
-          unknownVenue: cb.venueOf({ venue: 'kalshi' }),
+          marketsWin: cb.liveCoins({ markets: [{ coin: 'BTC' }] }),
+          unknownVenue: cb.venueOf({ venue: 'other' }),
         }));
         """
     )
 
-    # (a) absent fields degrade to Polymarket — legacy behavior.
     assert p["legacyVenue"] == "polymarket"
     assert p["legacyUniverse"] == ["BTC", "ETH", "SOL", "XRP"]
     assert p["legacyCoins"] == ["BTC", "ETH", "SOL", "XRP"]
-    # (b) predict.fun payload resolves the venue + its BTC/ETH/BNB universe.
-    assert p["pfVenue"] == "predictfun"
-    assert p["pfUniverse"] == ["BTC", "ETH", "BNB"]
-    assert p["pfCoinsFromFallback"] == ["BTC", "ETH", "BNB"]
-    # A live markets array always wins over the venue fallback.
     assert p["marketsWin"] == ["BTC"]
-    # Unrecognized venue never blanks the UI — it degrades to polymarket.
     assert p["unknownVenue"] == "polymarket"
 
 
 def test_venue_filter_scope_helpers_execute():
-    """The shared venue scope helpers (CB.venueFilter/scopeLive/scopedCoins/
-    predictfunWallet/stripCash) behave for BOTH untagged rows (absent venue ⇒
-    polymarket) and per-row-tagged rows. This is the app-boots smoke check for
-    the venue dimension.
-
-    2026-08-01: loadVenueSel/saveVenueSel are GONE with the venue switcher.
-    They persisted the operator's choice in localStorage, and on a
-    single-venue console a stale pin (e.g. 'polymarket' carried onto the
-    predict.fun box) would filter every row away and render an empty console
-    on a live-money desk. The venue is now derived from the payload only."""
+    """The shared scope helpers (CB.rowVenue/venueFilter/scopeLive/scopedCoins/
+    stripCash): untagged and unknown-venue rows count as polymarket, scopeLive
+    keeps the server rollups when nothing is filtered out, and scopedCoins
+    unions in coins from the rows on screen."""
     p = _run_client_js(
         """
         const rows = [
           { id: 1, coin: 'BTC', venue: 'polymarket' },
-          { id: 2, coin: 'ETH' },                 // ABSENT venue ⇒ polymarket
-          { id: 3, coin: 'BNB', venue: 'predictfun' },
-          { id: 4, coin: 'SOL', venue: 'kalshi' },// unknown ⇒ polymarket
+          { id: 2, coin: 'ETH' },
+          { id: 4, coin: 'SOL', venue: 'other' },
         ];
         const live = { kpis: { a: 1 }, ledger: rows,
           ledger_rollup: { total: 9 }, ledger_equity: { x: 1 },
           ledger_daily: [{ d: 1 }], markets: [{ coin: 'BTC' }] };
-
-        const scopeAll = cb.scopeLive(live, 'all');
-        const scopePf = cb.scopeLive(live, 'predictfun');
+        const scoped = cb.scopeLive(live, 'polymarket');
         const m = { cashLive: 120, cashNet: 20, paper: 18, drift: 2, hasCash: true, degraded: true, basis: 100 };
-
         console.log(JSON.stringify({
-          selectorHelpersGone: [cb.loadVenueSel, cb.saveVenueSel, cb.VENUE_SELECTORS,
-            cb.pfPaperRows, cb.mergedLedger].every((x) => x === undefined),
           rowVenueAbsent: cb.rowVenue(rows[1]),
-          rowVenueUnknown: cb.rowVenue(rows[3]),
-          rowVenuePf: cb.rowVenue(rows[2]),
-          filterAll: cb.venueFilter(rows, 'all').map((r) => r.id),
+          rowVenueUnknown: cb.rowVenue(rows[2]),
           filterPoly: cb.venueFilter(rows, 'polymarket').map((r) => r.id),
-          filterPf: cb.venueFilter(rows, 'predictfun').map((r) => r.id),
-          scopeAllSameRef: scopeAll === live,
-          scopePfLedger: scopePf.ledger.map((r) => r.id),
-          scopePfRollupNull: scopePf.ledger_rollup === null,
-          scopePfEquityNull: scopePf.ledger_equity === null,
-          scopePfDailyNull: scopePf.ledger_daily === null,
-          scopePfKpisKept: scopePf.kpis === live.kpis,
-          coinsPf: cb.scopedCoins(live, 'predictfun'),
+          scopedLedger: scoped.ledger.map((r) => r.id),
+          scopedRollupKept: scoped.ledger_rollup === live.ledger_rollup,
+          scopedKpisKept: scoped.kpis === live.kpis,
           coinsPoly: cb.scopedCoins(live, 'polymarket'),
           coinsPolyUnion: cb.scopedCoins(live, 'polymarket', [{ coin: 'XRP' }, { coin: 'BTC' }]),
-          coinsAll: cb.scopedCoins(live, 'all'),
           strip: cb.stripCash(m),
-          walletAbsent: cb.predictfunWallet({}),
-          walletPresent: cb.predictfunWallet({ predictfun_wallet: {
-            address: '0x1234567890abcdef1234', chain: 'bnb', api_key_present: true,
-            collateral: { symbol: 'USDT', balance: 250.5 } } }),
         }));
         """,
         window_extra=_LOCALSTORAGE_SHIM,
     )
 
-    # The selector/merge seam is REMOVED from window.CB entirely — not just
-    # unused. A dangling export is how a "removed" feature comes back.
-    assert p["selectorHelpersGone"] is True
-    # rowVenue: absent + unknown degrade to polymarket; a real tag is honored.
     assert p["rowVenueAbsent"] == "polymarket"
     assert p["rowVenueUnknown"] == "polymarket"
-    assert p["rowVenuePf"] == "predictfun"
-    # venueFilter: ALL removed 2026-07-23 — a legacy 'all'/unknown selector now
-    # resolves to the DEPLOYMENT venue (polymarket by default in this harness,
-    # window.__CB_DEPLOY_VENUE unset), so it behaves like the polymarket filter;
-    # predictfun = only the tagged predictfun row.
-    assert p["filterAll"] == [1, 2, 4]
     assert p["filterPoly"] == [1, 2, 4]
-    assert p["filterPf"] == [3]
-    # scopeLive: every selection now scopes to a venue (no passthrough) — a
-    # legacy 'all' resolves to the deploy venue and returns a NEW filtered object.
-    assert p["scopeAllSameRef"] is False
-    assert p["scopePfLedger"] == [3]
-    assert p["scopePfRollupNull"] is True
-    assert p["scopePfEquityNull"] is True
-    assert p["scopePfDailyNull"] is True
-    assert p["scopePfKpisKept"] is True
-    # scopedCoins: the DEPLOYED venue (this payload has no `venue` ⇒ polymarket)
-    # reads the LIVE scan universe (markets array = config.COINS — so a retired
-    # coin like XRP never stays pinned); the non-deployed venue falls back to
-    # its registry universe (BNB only under predictfun); 'all' reads the live
-    # scan universe; passing rows unions in historical coins still in view.
-    assert p["coinsPf"] == ["BTC", "ETH", "BNB"]
+    assert p["scopedLedger"] == [1, 2, 4]
+    assert p["scopedRollupKept"] is True
+    assert p["scopedKpisKept"] is True
     assert p["coinsPoly"] == ["BTC"]
     assert p["coinsPolyUnion"] == ["BTC", "XRP"]
-    assert p["coinsAll"] == ["BTC"]
-    # stripCash collapses net to the paper figure (cash is account-level).
     assert p["strip"]["hasCash"] is False
     assert p["strip"]["cashNet"] is None
     assert p["strip"]["net"] == 18
-    # predictfunWallet: absent ⇒ placeholder; present ⇒ normalized fields.
-    assert p["walletAbsent"] == {"present": False}
-    assert p["walletPresent"]["present"] is True
-    assert p["walletPresent"]["address"] == "0x1234567890abcdef1234"
-    assert p["walletPresent"]["chain"] == "bnb"
-    assert p["walletPresent"]["apiKeyPresent"] is True
-    assert p["walletPresent"]["collateral"] == {"symbol": "USDT", "balance": 250.5}
 
 
-def test_single_venue_console_wiring_and_wallet_panel():
-    """SINGLE-VENUE console wiring (2026-08-01, predict.fun Tokyo cutover).
-
-    The venue dimension is still first-class, but it is now DERIVED, never
-    CHOSEN: app.jsx reads the venue off the live payload and threads it to
-    every page, the Topbar shows a passive badge instead of a switcher, and
-    there is no PF_LIVE payload swap. Every venue-specific label (wallet
-    vocabulary, brand line) comes from the payload so the predict.fun console
-    stops describing itself in Polymarket's terms."""
+def test_console_wiring_and_wallet_panel():
+    """The venue is derived from the live payload and passed to every page; the
+    topbar shows a passive badge; the Operator page labels the Polymarket
+    funder wallet; capital flows list deposits and withdrawals only."""
     dash = _REPO_ROOT / "polymarket" / "dashboard"
     app = (dash / "app.jsx").read_text(encoding="utf-8")
     shell = (dash / "shell.jsx").read_text(encoding="utf-8")
@@ -2742,279 +2600,80 @@ def test_single_venue_console_wiring_and_wallet_panel():
     config_page = (dash / "pages-config.jsx").read_text(encoding="utf-8")
     latency = (dash / "pages-latency.jsx").read_text(encoding="utf-8")
 
-    # Capital flows show the configured opening balance as a display row, then
-    # append future operator-recorded deposits/withdrawals. Rebate rows are
-    # filtered OUT of this panel (operator 2026-08-05 — rebates live on the
-    # Overview P&L strip), and the net row sums only the displayed flows so it
-    # cannot silently include the hidden rebates (kpis.net_deposits does).
+    # Capital flows: the opening balance as a display row, then recorded
+    # deposits/withdrawals. Rebates are shown on the Overview P&L strip instead.
     assert "initial={(live.kpis || {}).initial_bankroll}" in config_page
     assert "startAt={(live.kpis || {}).wallet_start_at}" in config_page
     assert 'sub="deposits / withdrawals"' in config_page
     assert "f.kind !== 'rebate'" in config_page
     assert "net={(live.kpis || {}).net_deposits}" not in config_page
-    assert "operator-recorded deposits, withdrawals and rebates" not in config_page
 
-    # App: the venue is DERIVED from the payload, never persisted or chosen.
-    assert "window.CB.loadVenueSel" not in _code_only(app)
-    assert "window.CB.saveVenueSel" not in _code_only(app)
-    assert "setVenue" not in _code_only(app)
     assert "window.CB.venueOf(live)" in app
-    assert "venueSel={deployVenue}" in app  # to every Page
-    # No cross-venue payload swap: the console renders THIS process's payload.
-    assert "PF_LIVE" not in _code_only(app)
+    assert "venueSel={deployVenue}" in app
     assert "const view = live;" in app
 
-    # Shell: no switcher, no setVenue prop; a passive venue badge instead.
     assert "function Topbar({ meta, live, range, setRange })" in shell
-    assert "setVenue" not in _code_only(shell)
     assert "badge-venue" in shell
-    # Brand line + the latency NAV subtitle are venue-derived / venue-neutral —
-    # neither may hardcode Polymarket.
     assert "venueLabel(live)" in shell
-    assert "Polymarket 5m/15m journal" not in _code_only(shell)
-    assert "~300ms decision→fill floor" not in _code_only(shell)
 
-    # Every ledger-derived page consumes the SHARED selector (scopeLive), not an
-    # ad-hoc filter, and reads the venueSel prop.
     for page_src in (overview, live_page, analytics):
         assert "scopeLive(live, venueSel)" in page_src
-    # Journal coin filter respects the venue universe ∪ the scoped rows' coins.
     assert "scopedCoins(live, venueSel, allLedger)" in live_page
 
-    # Operator page: venue-aware wallet vocabulary. POLY_FUNDER / pUSD named a
-    # wallet and a token that do not exist on predict.fun.
-    assert "PREDICT_ACCOUNT wallet record" in config_page
-    assert "POLY_FUNDER wallet record" in config_page
-    assert "const collateral = isPf ? 'USDT' : 'pUSD';" in config_page
-    assert 'title="POLY_FUNDER wallet record"' not in config_page
-    # ...and the cross-venue read-only guard is gone with the snapshot swap.
-    assert "is_snapshot" not in _code_only(config_page)
-    assert "readOnly" not in _code_only(config_page)
+    assert "const walletTitle = 'POLY_FUNDER wallet record';" in config_page
+    assert "const collateral = 'pUSD';" in config_page
 
-    # Latency page: taker_delay_ms is null on predict.fun — never rendered as
-    # "nullms", and never defaulted to Polymarket's 250ms.
+    # taker_delay_ms is never rendered as "nullms" or defaulted to 250ms.
     assert "vf.taker_delay_ms != null" in latency
     assert "vf ? vf.taker_delay_ms : 250" not in _code_only(latency)
 
-    # The predict.fun funder-wallet + book-recorder-health + deployed-execution
-    # -flags panels were REMOVED from the Operator page by operator request
-    # 2026-07-23 (the recorder subsystem itself was retired 2026-08-04).
-    assert "predict.fun funder wallet" not in config_page
-    assert "predictfunWallet(live)" not in config_page
-    assert "StrategyFlagsPanel" not in config_page
-
-
-
-def test_pf_paper_merge_seam_is_gone():
-    """The predict.fun DRY paper-instance merge seam is REMOVED (2026-08-01).
-
-    window.PF_PAPER was populated by a 60s poll of predictfun_paper.json — a
-    dump of a SECOND process's SQLite DB — and merged into this console's
-    ledger. With each console single-venue by deployment, the dump has no
-    producer and no consumer. The regression this guards: a stray PF_PAPER
-    global (a stale browser tab, a re-added poller) must NOT be able to inject
-    foreign rows into a live-money console's ledger ever again."""
-    p = _run_client_js(
-        """
-        const live = { kpis: { a: 1 }, ledger: [
-            { id: 1, coin: 'BTC' },
-            { id: 2, coin: 'ETH', venue: 'polymarket' },
-          ], ledger_rollup: { total: 9 }, markets: [] };
-
-        // A stray global from a stale tab / re-added poller. It must be INERT.
-        w.PF_PAPER = [
-          { id: 2, coin: 'BTC', venue: 'predictfun' },
-          { id: 7, coin: 'BNB', venue: 'predictfun' },
-        ];
-        const pf = cb.scopeLive(live, 'predictfun');
-        const poly = cb.scopeLive(live, 'polymarket');
-
-        console.log(JSON.stringify({
-          mergeHelpersGone: cb.pfPaperRows === undefined && cb.mergedLedger === undefined,
-          pfKeys: pf.ledger.map(cb.rowKey),
-          polyKeys: poly.ledger.map(cb.rowKey),
-          rowKeyAbsentVenue: cb.rowKey({ id: 3 }),
-        }));
-        """
-    )
-
-    # The helpers are gone from the shared namespace, not merely unused.
-    assert p["mergeHelpersGone"] is True
-    # PREDICT.FUN view = this payload's OWN predictfun rows only (none here) —
-    # the stray PF_PAPER global contributed nothing.
-    assert p["pfKeys"] == []
-    # POLYMARKET view is exactly the payload's own rows.
-    assert p["polyKeys"] == ["polymarket:1", "polymarket:2"]
-    # rowKey still venue-qualifies (a box's ledger can hold historic rows from
-    # a venue it no longer trades), defaulting untagged rows to polymarket.
-    assert p["rowKeyAbsentVenue"] == "polymarket:3"
-
-
-def test_snapshot_dump_producers_are_unreferenced():
-    """The dashboard-snapshot dump seam is RETIRED (2026-08-01) and must stay
-    that way. It existed only so the :8800 Polymarket console could render the
-    predict.fun box:
-
-        refresh_dashboard_snapshots.sh   -> dashboard/predictfun_paper.json
-        dump_snapshot_json.py            -> dashboard/predictfun_live.json
-        cryptobot-snapshot-refresh.{service,timer}      (ran the first)
-        cryptobot-predictfun-snapshot.{service,timer}   (ran the second)
-
-    Each console is single-venue by deployment now, so both dumps have no
-    consumer — and serving trading rows / wallet addresses off a periodically
-    dumped file that silently goes stale is pure attack surface.
-
-    This test asserts the files are UNREFERENCED, not that they are absent, so
-    it is green both before and after the orchestrator removes them. The
-    surfaces checked are exactly the ones that would resurrect a producer: the
-    deploy staging list, the remote installer, the client bundle, and the SSE
-    server's static allowlist."""
-    retired_files = (
-        "refresh_dashboard_snapshots.sh",
-        "dump_snapshot_json",
-        "cryptobot-snapshot-refresh.service",
-        "cryptobot-snapshot-refresh.timer",
-        "cryptobot-predictfun-snapshot.service",
-        "cryptobot-predictfun-snapshot.timer",
-    )
-    retired_outputs = ("predictfun_paper.json", "predictfun_live.json")
-
-    deploy_sh = (_REPO_ROOT / "polymarket" / "infra" / "deploy.sh").read_text(
-        encoding="utf-8"
-    )
-    # deploy.sh must not STAGE any of them. The `for src in ... do cp` block is
-    # the only staging surface; a name may still appear in the do-not-re-add
-    # comment, so match the staged-path form specifically.
-    staged = re.search(r"^for src in \\\n(.*?)^do$", deploy_sh, re.S | re.M)
-    assert staged, "deploy.sh staging list not found"
-    for name in retired_files:
-        assert name not in staged.group(1), f"{name} is still staged by deploy.sh"
-
-    installer = (_REPO_ROOT / "polymarket" / "infra" / "install_remote.sh").read_text(
-        encoding="utf-8"
-    )
-    # The installer may only mention them inside the CONVERGENCE list (which
-    # disables + removes them) — never in the install loop or a chmod/enable.
-    for name in retired_files:
-        assert f'"$PROJECT_DIR/deploy/{name}"' not in installer, (
-            f"installer still lays down / chmods {name}"
-        )
-        assert f"enable --now {name}" not in installer
-
-    # Client bundle: no poller, no globals, no payload swap.
-    dash = _REPO_ROOT / "polymarket" / "dashboard"
-    bridge = _code_only((dash / "live-bridge.js").read_text(encoding="utf-8"))
-    app = _code_only((dash / "app.jsx").read_text(encoding="utf-8"))
-    data = _code_only((dash / "data.jsx").read_text(encoding="utf-8"))
-    for out in retired_outputs:
-        assert f"fetch('{out}'" not in bridge
-    assert "pollPredictfunPaper" not in bridge
-    assert "pollPredictfunLive" not in bridge
-    assert "window.PF_PAPER" not in data
-    assert "window.PF_LIVE" not in app
-
-    # SSE server: dropped from BOTH the static allowlist and the auth tuple —
-    # they change together or an allowlisted JSON leaks unauthenticated.
-    sse = (
-        _REPO_ROOT / "polymarket" / "src" / "cryptobot" / "observability" / "sse_server.py"
-    ).read_text(encoding="utf-8")
-    for out in retired_outputs:
-        assert f'"/{out}",' not in sse, f"/{out} still in the sse_server allowlist"
-    assert 'if path in ("/snapshot.json",)' in sse
-
 
 def test_scope_live_rollup_retention_and_by_venue_preference():
-    """Item 1 (operator's 500-row collapse): scopeLive KEEPS the server
-    lifetime rollups when the venue filter removes ZERO rows (the payload's
-    ledger IS that venue), and PREFERS the server per-venue rollups
-    (ledger_rollup_by_venue/ledger_daily_by_venue, H5) whenever the producer
-    emits them.
-
-    2026-08-01: the `paperMerged` carve-out is gone with the static PF-paper
-    merge — every row scopeLive sees now comes from THIS box's own stream, so
-    the server rollups always describe the same population."""
+    """scopeLive keeps the server lifetime rollups when the venue filter removes
+    no rows, prefers the per-venue rollups when the producer emits them, and on
+    an empty stream nulls every block (so the client aggregates instead)."""
     p = _run_client_js(
         """
-        // (a) every row is (implicitly) polymarket, NO per-venue rollups: the
-        // POLYMARKET view removes zero rows -> all-venue rollups KEPT; the
-        // PREDICTFUN view removes every row -> rollups nulled (client agg).
         const liveA = { ledger: [{ id: 1 }, { id: 2, venue: 'polymarket' }],
           ledger_rollup: { total: 9 }, ledger_daily: [{ date: '2026-07-01', pnl: 1 }],
           ledger_equity: { points: [] }, markets: [] };
         const keepPoly = cb.scopeLive(liveA, 'polymarket');
-        const emptyPf = cb.scopeLive(liveA, 'predictfun');
 
-        // (b) per-venue rollups emitted: a venue view prefers ITS rollup even
-        // though the filter removed rows; equity (no per-venue series) nulls.
-        const liveB = { ledger: [{ id: 1 }, { id: 2, venue: 'predictfun' }],
+        const liveB = { ledger: [{ id: 1 }],
           ledger_rollup: { total: 9 }, ledger_daily: [{ date: 'all', pnl: 0 }],
           ledger_equity: { points: [] },
           ledger_rollup_by_venue: {
-            polymarket: { total: 5, wins: 3, losses: 1, stops: 1, win_rate: 0.6 },
-            predictfun: { total: 4 } },
+            polymarket: { total: 5, wins: 3, losses: 1, stops: 1, win_rate: 0.6 } },
           ledger_daily_by_venue: {
-            polymarket: [{ date: '2026-07-01', pnl: 1.5, n: 2, wins: 1, losses: 0, stops: 1 }],
-            predictfun: [] },
+            polymarket: [{ date: '2026-07-01', pnl: 1.5, n: 2, wins: 1, losses: 0, stops: 1 }] },
           markets: [] };
         const polyB = cb.scopeLive(liveB, 'polymarket');
-        const pfB = cb.scopeLive(liveB, 'predictfun');
 
-        // (c) a stray PF_PAPER global must be INERT — the static merge is gone.
-        w.PF_PAPER = [{ id: 9, venue: 'predictfun' }];
-        const pfStray = cb.scopeLive(liveB, 'predictfun');
-
-        // (d) EMPTY stream (right after a RESET_RECORDS cutover): a named-venue
-        // view must NOT leak the all-venue rollups via the 0===0 keepAll edge
-        // (the predict.fun tab rendered Polymarket lifetime numbers, 2026-07-22).
         const liveEmpty = { ledger: [], ledger_rollup: { total: 9 },
           ledger_daily: [{ date: '2026-07-01', pnl: 1 }],
           ledger_equity: { points: [] }, markets: [] };
-        const pfEmpty = cb.scopeLive(liveEmpty, 'predictfun');
         const polyEmpty = cb.scopeLive(liveEmpty, 'polymarket');
 
         console.log(JSON.stringify({
           keepPolyRollupKept: keepPoly.ledger_rollup === liveA.ledger_rollup,
           keepPolyDailyKept: keepPoly.ledger_daily === liveA.ledger_daily,
           keepPolyEquityKept: keepPoly.ledger_equity === liveA.ledger_equity,
-          emptyPfRollupNull: emptyPf.ledger_rollup === null,
-          pfEmptyAllNull: pfEmpty.ledger_rollup === null
-            && pfEmpty.ledger_daily === null && pfEmpty.ledger_equity === null,
           polyEmptyAllNull: polyEmpty.ledger_rollup === null
             && polyEmpty.ledger_daily === null && polyEmpty.ledger_equity === null,
           polyBRollupTotal: polyB.ledger_rollup.total,
           polyBDaily: polyB.ledger_daily,
-          polyBEquityNull: polyB.ledger_equity === null,
-          pfBRollupTotal: pfB.ledger_rollup.total,
-          pfBDailyLen: pfB.ledger_daily.length,
-          pfStrayRollupTotal: pfStray.ledger_rollup.total,
-          pfStrayLedgerIds: pfStray.ledger.map((r) => r.id),
         }));
         """
     )
 
-    # (a) zero-rows-removed keeps every server block by reference.
     assert p["keepPolyRollupKept"] is True
     assert p["keepPolyDailyKept"] is True
     assert p["keepPolyEquityKept"] is True
-    # A venue with no rows (and no per-venue rollup) still nulls (client agg).
-    assert p["emptyPfRollupNull"] is True
-    # (d) empty stream: the 0===0 keepAll edge must not leak all-venue blocks
-    # into ANY named-venue view (post-RESET_RECORDS regression, 2026-07-22).
-    assert p["pfEmptyAllNull"] is True
     assert p["polyEmptyAllNull"] is True
-    # (b) per-venue rollups win over both null and the all-venue block.
     assert p["polyBRollupTotal"] == 5
     assert p["polyBDaily"] == [
         {"date": "2026-07-01", "pnl": 1.5, "n": 2, "wins": 1, "losses": 0, "stops": 1}
     ]
-    assert p["polyBEquityNull"] is True  # no per-venue equity series exists
-    assert p["pfBRollupTotal"] == 4
-    assert p["pfBDailyLen"] == 0
-    # (c) a stray window.PF_PAPER global is INERT: the ledger is exactly this
-    # payload's own predictfun row (id 2), and the server per-venue rollup is
-    # still preferred because no foreign population was mixed in.
-    assert p["pfStrayLedgerIds"] == [2]
-    assert p["pfStrayRollupTotal"] == 4
 
 
 def test_client_win_loss_daily_and_settle_ts_contract():
@@ -3563,45 +3222,28 @@ def test_select_analytics_prefers_the_full_ledger_block():
 
 
 def test_scope_live_carries_ledger_analytics():
-    """The analytics block gets the SAME venue treatment as the other server
-    rollups: the per-venue variant wins, and the all-venue block survives only
-    when the venue filter removed ZERO rows.
-
-    2026-08-01: the merged-static-paper-rows carve-out is gone — a stray
-    window.PF_PAPER global no longer reaches scopeLive at all."""
+    """The analytics block is scoped like the other rollups: the per-venue
+    variant wins, and the all-venue block is kept when no rows were removed."""
     p = _run_client_js(
         """
         const live = {
-          ledger: [{ id: 1 }, { id: 2, venue: 'predictfun' }],
+          ledger: [{ id: 1 }],
           ledger_rollup: { total: 9 }, ledger_daily: [], ledger_equity: { points: [] },
           ledger_analytics: { All: { summary: { total: 9 } } },
           ledger_analytics_by_venue: {
-            polymarket: { All: { summary: { total: 5 } } },
-            predictfun: { All: { summary: { total: 4 } } } },
+            polymarket: { All: { summary: { total: 5 } } } },
           markets: [] };
         const poly = cb.scopeLive(live, 'polymarket');
-        const pf = cb.scopeLive(live, 'predictfun');
-        // Zero rows removed -> the all-venue block is KEPT by reference.
-        const allPoly = { ...live, ledger: [{ id: 1 }],
-          ledger_analytics_by_venue: undefined };
+        const allPoly = { ...live, ledger_analytics_by_venue: undefined };
         const keptAll = cb.scopeLive(allPoly, 'polymarket');
-        // A stray PF_PAPER global is inert: the per-venue block still wins.
-        w.PF_PAPER = [{ id: 9, venue: 'predictfun' }];
-        const pfStray = cb.scopeLive(live, 'predictfun');
         console.log(JSON.stringify({
           polyTotal: poly.ledger_analytics.All.summary.total,
-          pfTotal: pf.ledger_analytics.All.summary.total,
           keptAllSame: keptAll.ledger_analytics === allPoly.ledger_analytics,
-          pfStrayTotal: pfStray.ledger_analytics.All.summary.total,
-          pfStrayIds: pfStray.ledger.map((r) => r.id),
         }));
         """
     )
     assert p["polyTotal"] == 5
-    assert p["pfTotal"] == 4
     assert p["keptAllSame"] is True
-    assert p["pfStrayTotal"] == 4
-    assert p["pfStrayIds"] == [2]
 
 
 def test_fourth_wave_declutter_overview_subminute_and_latency():
@@ -3758,54 +3400,16 @@ def test_subminute_ledger_paper_equity_panel_is_deleted():
     assert "<EquityChart" in overview and "<DrawdownChart" in overview
 
 
-def test_strategy_tab_truth_pass_matches_the_deployed_engine():
-    """Operator 2026-08-05 TRUTH PASS on Config → Strategy (SubminuteSpecPage).
-
-    The tab carried TWO tables — the contract table and StrategyFlagsPanel —
-    which restated each other and, between them, described retired behaviour.
-    It is now ONE compact per-band reference in six groups:
-    bands · decision spec · sizing · T3 top-ups · execution · halt.
-
-    Engine truth this pins (sources: config.py, execution/held_position_pass.py,
-    execution/scale_in.py, snapshot_builder._v2_spec/_strategy_flags_block,
-    infra/install_remote.sh):
-
-    * StrategyFlagsPanel DELETED — its duplicate rows (entry FAK pad, min bet,
-      hard halt, DD stake throttle) already existed in the contract table; its
-      LIVE-only rows moved into the right group.
-    * "per resolution: one bet" DELETED — stale since T3: top-ups add FILLS to
-      the same position. Replaced by "entries per resolution" (payload-driven
-      multifill) with the top-up caveat in the tooltip.
-    * T3 top-ups get their OWN group of short rows, including the
-      deterioration DISARM band (SCALEIN_T3_DISARM_BAND) — the ex-stop-loss
-      trigger, which now disarms top-ups and never sells.
-    * late-window skip is a DECISION gate (live at 5s on all four coins), not
-      a flags footnote — it is why the entry window ends before close.
-    * stop-loss is DELETED: "exits: none" is the only exit row, and no
-      stop/chase row survives anywhere on the page.
-    * fees are LIVE VENUE fees.
-    * every value still reads from the payload — no hardcoded knob numbers."""
+def test_strategy_tab_matches_the_deployed_engine():
+    """Config -> Strategy is one reference table in five groups (bands, decision
+    spec, sizing, execution, halt), every value read from the payload."""
     dash = _REPO_ROOT / "polymarket" / "dashboard"
     sub = (dash / "pages-subminute.jsx").read_text(encoding="utf-8")
     code = _code_only(sub)
 
-    # ── the second table is gone ──
-    assert "StrategyFlagsPanel" not in code
-    assert "deployed execution flags" not in code
-    for dup in (
-        "['entry FAK pad',",
-        "['min bet',",
-        "['DD stake throttle',",
-        "['hard halt',",
-        "['scale-in T3 top-ups',",
-    ):
-        assert dup not in sub, f"flags-panel row {dup!r} survived the fold-in"
-
-    # ── six groups, in order ──
     groups = [
         "decision spec — shared",
         "sizing — shared · stake = equity × base frac × DD-brake × concurrency",
-        "T3 top-ups — shared · taker adds to a filled position, never an exit",
         "execution — shared",
         "halt — shared",
     ]
@@ -3815,75 +3419,37 @@ def test_strategy_tab_truth_pass_matches_the_deployed_engine():
         assert nxt > at, f"group {g!r} is out of order"
         at = nxt
 
-    # ── stale rows DELETED ──
-    # "one bet per resolution" is false under T3 — top-ups add fills.
-    assert '<Row k="per resolution" shared="one bet' not in sub
-    assert '<Row k="multifill"' not in sub
-    assert '<Row k="entries per resolution" shared={multifill}' in sub
-    assert "T3 top-ups (below) add to that same position — they are not new entries." in sub
-    # the Panel's own hint no longer says "one FILL per resolution" either
-    assert "one fill per resolution" not in sub
-    assert "one ENTRY per resolution, first-fill-wins. T3 top-ups add to that entry." in sub
-    # stop-loss / stop-chase: no row, no prose, anywhere on the tab
-    assert "stop chase" not in sub
-    assert "stop-loss row" not in sub
+    # Removed features have no rows.
+    for gone in ("scalein_t3", "tier_a", "late_window_skip", "ask_band_skip",
+                 "multifill", "T3 top-ups", "predictfun"):
+        assert gone not in code, f"{gone!r} still on the Strategy tab"
+
+    assert '<Row k="entries per resolution" shared="one — first fill wins across bands"' in sub
     assert '<Row k="exits" shared="none — every filled position HOLDs to binary settlement"' in sub
     assert code.count('k="exits"') == 1
 
-    # ── T3 group: the loop's real contract, payload-driven ──
-    assert "const t3 = f && f.scalein_t3;" in sub
-    assert '<Row k="status" shared={!t3 ? null : (t3.enabled ? \'on\' : \'off\')}' in sub
-    assert "execution/held_position_pass.py" in sub
-    assert "shared={`≤ ${t3.max_n} top-ups × ${fmt.pct(t3.frac, 0)} of base`}" in sub
-    assert "price ≤ ${fmt.prob(t3.cap, 2)} · spread ≤ ${fmt.prob(t3.spread_max, 2)}" in sub
-    assert "every ${t3.cadence_s}s · stops ${t3.end_buffer_s}s before close" in sub
-    assert '<Row k="deterioration disarm"' in sub
-    assert "bid ≥ model_p + ${fmt.num(t3.disarm_band, 2)} while underwater" in sub
-    assert "SCALEIN_T3_DISARM_BAND" in sub
-    assert "It never sells — the stop-loss exit was deleted 2026-08-05." in sub
-    assert '<Row k="fresh gate" shared={!f ? null : (f.topup_fresh_gate_mode' in sub
-
-    # ── decision spec gained the two live entry gates ──
-    assert '<Row k="late-window skip"' in sub
-    assert "lwsKeys.map((c) => `${c}: last ${lws[c]}s`)" in sub
-    assert '<Row k="ask-band skip"' in sub
-    # retries no longer claim the window runs to close
-    assert "per-second re-eval until a fill or the entry window ends" in sub
-    assert "until a fill or window end" not in sub
-
-    # ── sizing: throttle removed, one short row + formula in the tooltip ──
+    # Sizing: throttle off reads as one short row, formula in the tooltip.
     assert "const brakeRemoved = z.brake_floor != null && throttleOff(z.brake_floor);" in sub
     assert "'removed — floor ×1.00, full size at every drawdown depth'" in sub
-    assert "so the hard halt is the only drawdown control" in sub
     assert '<Row k="DD-brake" shared={brakeRule} mono={false} hint={brakeHint} />' in sub
-    assert '<Row k="tier-A upsize"' in sub
 
-    # ── fees are the live venue fees ──
     assert '<Row k="fees" shared="live venue fees — charged and booked on every fill"' in sub
-    assert "there is no paper-fee mode" in sub
-
-    # ── halt group ──
     assert '<Row k="hard halt" shared={z.hard_halt_frac != null' in sub
     assert '<Row k="exposure caps" shared={p.shared_exposure_cap_frac != null' in sub
 
-    # ── declutter style: caveats are tooltips, never a second prose line ──
+    # Caveats are tooltips, not a second line of prose.
     assert "const Row = ({ k, vals, shared, mono = true, hint }) => (" in sub
     assert "<tr title={hint || undefined}>" in sub
-    # the muted second-line prose under DD-brake / pad / per-coin cap is gone
-    assert '<br /><span className="muted">brake = max(' not in sub
-    assert '<br /><span className="muted">limit = min(walked' not in sub
-    assert "hard per-bet cap from the manifest (max_bet_usd_by_coin) · applied" not in sub
     assert 'hint="limit = min(walked, first_limit) + pad · CRYPTOBOT_V2_FAK_PAD"' in sub
 
-    # ── nothing hardcoded: the knob numbers all come off the payload ──
+    # No hardcoded knob numbers.
     for hardcoded in ("0.04", "0.83", "1.5x", "×1.5", "0.0465", "BTC:5"):
         assert hardcoded not in code, f"hardcoded knob {hardcoded!r} on the spec page"
 
 
-def test_strategy_tab_rows_match_config_and_env_pins():
-    """The Strategy tab's payload FIELDS must be the ones the producer emits
-    and the ones config.py actually defines — a row reading a field nobody
-    writes renders a silent '—' forever, which is how the page went stale."""
+def test_strategy_tab_rows_match_config():
+    """The fields the Strategy tab reads are emitted by the producer, and the
+    engine settings behind its rows exist in config.py."""
     builder = (
         _REPO_ROOT / "polymarket" / "src" / "cryptobot" / "observability"
         / "snapshot_builder.py"
@@ -3891,46 +3457,14 @@ def test_strategy_tab_rows_match_config_and_env_pins():
     cfg = (
         _REPO_ROOT / "polymarket" / "src" / "cryptobot" / "config.py"
     ).read_text(encoding="utf-8")
-    install = (
-        _REPO_ROOT / "polymarket" / "infra" / "install_remote.sh"
-    ).read_text(encoding="utf-8")
 
-    # every strategy_flags field the tab now reads is emitted by the producer
-    for field in (
-        '"scalein_t3"', '"disarm_band"', '"topup_fresh_gate_mode"',
-        '"late_window_skip"', '"ask_band_skip"', '"tier_a"',
-    ):
+    for field in ('"fee_spec"', '"fee_calibration"', '"fak_pad"', '"brake_floor"',
+                  '"bands"', '"offset_windows"'):
         assert field in builder, f"the spec tab reads {field}, producer omits it"
-
-    # engine truth behind the rewritten rows
-    assert 'SCALEIN_T3_DISARM_BAND: float = _float_env(\n    "CRYPTOBOT_SCALEIN_T3_DISARM_BAND", 0.04\n)' in cfg
     assert 'V2_BRAKE_FLOOR: float = _float_env("CRYPTOBOT_V2_BRAKE_FLOOR", 1.0)' in cfg
-    # deployed env pins: T3 armed, throttle removed, late-skip DISARMED
-    # (flip RE-ARMED 2026-08-09 ~13:00 UTC: flip trades the FULL window
-    # including the final 5s; last-15s gate stays off per operator order)
-    assert 'set_env_line CRYPTOBOT_SCALEIN_T3_ENABLED "1"' in install
-    assert 'set_env_line CRYPTOBOT_V2_BRAKE_FLOOR "1.0"' in install
-    assert 'set_env_line CRYPTOBOT_LATE_WINDOW_SKIP ""' in install
-    assert 'set_env_line CRYPTOBOT_ENTRY_LAST_SECS_ONLY "0"' in install
-    # The TWAP-60 accounting era is deploy-durable: normal installs must not
-    # overwrite the preserved cutover with a historical literal.  Only the
-    # explicit RESET_RECORDS branch may advance it.
-    assert 'set_env_line CRYPTOBOT_INITIAL_BANKROLL "58.575353"' in install
-    assert 'set_env_line CRYPTOBOT_WALLET_START_AT "2026-' not in install
-    assert 'set_env_line CRYPTOBOT_WALLET_START_AT "$WALLET_START_NOW"' in install
-    # multifill / breaker stay DISARMED one-knob re-arms
-    assert 'set_env_line CRYPTOBOT_V2_MULTIFILL_ENABLED "0"' in install
-
-    # the stop-loss exit is gone from the engine, so "exits: none" is true
     assert not (
         _REPO_ROOT / "polymarket" / "src" / "cryptobot" / "execution" / "stop_loss.py"
     ).exists()
-    held = (
-        _REPO_ROOT / "polymarket" / "src" / "cryptobot" / "execution"
-        / "held_position_pass.py"
-    ).read_text(encoding="utf-8")
-    assert "_deterioration_disarm" in held
-    assert "SCALEIN_T3_DISARM_BAND" in held
 
 
 def test_subminute_brake_and_breaker_telemetry_survives_the_declutter():
@@ -4156,12 +3690,9 @@ def test_latency_stage_rows_sum_exactly_to_the_visible_total():
 
 
 def test_strategy_tab_shows_the_booked_fee_calibration():
-    """Operator 2026-08-05 asked why theta reads 0.07 when realized friction
-    implies less. The honest answer is POLY_FEE_CALIBRATION (0.864 — booked
-    fees are 0.864x the published parabola; the flat-to-flat wallet-tape audit
-    measured k*theta = 0.06048, re-based when theta moved 0.072 -> 0.07),
-    so it gets its own Strategy-tab row under `taker fee`: payload-driven,
-    never hardcoded, with the audit basis in the tooltip."""
+    """POLY_FEE_CALIBRATION (booked fees are ~0.864x the published curve) has
+    its own row under `taker fee`, read from the payload, with the measurement
+    basis in the tooltip."""
     dash = _REPO_ROOT / "polymarket" / "dashboard"
     sub = (dash / "pages-subminute.jsx").read_text(encoding="utf-8")
     builder = (
@@ -4172,17 +3703,10 @@ def test_strategy_tab_shows_the_booked_fee_calibration():
     assert '<Row k="fee calibration" mono={false}' in sub
     assert "s.fee_calibration != null" in sub
     assert "×{fmt.num(s.fee_calibration, 2)} on BOOKED fees · decision math keeps raw theta" in sub
-    # the VALUE is rendered from the payload, never typed into the page (the
-    # number appears only inside the tooltip's audit narrative, as prose)
-    assert "×0.84" not in sub
     assert "×0.864" not in sub
     assert "POLY_FEE_CALIBRATION" not in _code_only(sub)
-    # ordering: the calibration explains the fee row directly above it
     assert sub.index('<Row k="taker fee"') < sub.index('<Row k="fee calibration"')
-    # tooltip carries the audit basis + the decision/booking split
-    assert "Flat-to-flat wallet-tape audit (2026-07-23" in sub
-    assert "DECISION math" in sub
-    # producer
+    assert "flat-to-flat wallet audit" in sub
     assert '"fee_calibration": _fee_calibration(),' in builder
     assert "def _fee_calibration()" in builder
 

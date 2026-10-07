@@ -353,8 +353,7 @@ function LatencyPage({ live }) {
   const windowMin = lat.window_min != null ? lat.window_min : 30;
   const orders = lat.orders && lat.orders.per_order ? lat.orders : null;
   const vf = lat.venue_floor || null;
-  const venue = window.CB.venueOf(live);
-  const venueName = venue === 'predictfun' ? 'predict.fun' : 'Polymarket';
+  const venueName = 'Polymarket';
   // Blocks added 2026-07-25 — absent on payloads from an older scanner, in
   // which case the page falls back to the tick-level view rather than lying.
   const decision = lat.decision || null;
@@ -387,9 +386,7 @@ function LatencyPage({ live }) {
   // the tooltip, null-branch and all, so no console ever renders "nullms".
   const floorTitle = takerDelay != null
     ? `${venueName} reports a mandatory ${takerDelay}ms uncancellable taker delay inside the marketable-order POST round trip. No language, region or rewrite beats it.`
-    : venue === 'predictfun'
-      ? `predict.fun documents NO uncancellable taker delay; the floor here is the measured order POST round-trip (${floorLo != null && floorHi != null ? `${floorLo}-${floorHi}ms observed band` : 'band unavailable'}), not a venue-enforced wait.`
-      : `No uncancellable taker delay is reported for this ${venueName} payload; the venue-floor telemetry is incomplete.`;
+    : `No uncancellable taker delay is reported for this ${venueName} payload; the venue-floor telemetry is incomplete.`;
   const wsAgeP50 = stat(freshness, 'ws_age', 'p50');
 
   // Decision latency is the only budget the code owns. Judge it against the
