@@ -1,48 +1,38 @@
-"""WS book mirror — a daemon thread that mirrors the Polymarket CLOB order
-book over the public *market* WebSocket channel so the decision path can read
-a fresh snapshot from a local cache instead of paying the inline
-``POST /books`` round-trip (observed 1-3s spikes → stale-book decisions and
-FAK rejects).
+"""WebSocket book mirror: a daemon thread that mirrors the Polymarket CLOB
+order book from the public market channel, so the decision path can read a
+book from a local cache instead of making an inline ``POST /books`` call.
 
-Why this exists (audit #12 closeout)
-------------------------------------
-``polymarket_clob.BookSnapshot.fetched_at_ts`` on the REST path is the CALLER's
-local fetch time, not a venue liveness signal, so ``gates.book_top_ask_age_s``
-is always ~0 and ``BOOK_STALENESS_S`` is a no-op there. The market channel
-pushes a server ``timestamp`` on every ``book`` / ``price_change`` message, so
-this mirror finally stamps ``fetched_at_ts`` from the VENUE clock — making book
-staleness real for the first time.
+On the REST path ``BookSnapshot.fetched_at_ts`` is our local fetch time, so a
+book's age is always ~0. The market channel stamps every ``book`` and
+``price_change`` message with a server ``timestamp``, so this mirror sets
+``fetched_at_ts`` from the venue clock and book age becomes meaningful.
 
-Contract (identical to ``scheduler.book_prefetch.BookPrefetcher`` so it drops
-into the same ``TickDeps.book_prefetch`` seam):
-  * ``note_tokens(tokens)`` — the pipeline pushes the current window's token
-    set; the thread (re)subscribes to exactly that set, and any token that just
-    LEFT the set is evicted from the cache (``evict_unsubscribed``, default on).
-  * ``get(token, *, now_ts)`` — returns the cached ``BookSnapshot`` iff the
-    mirror is LIVE: the recv loop received a frame (book / price_change / ping /
-    any message) within ``max_age_ms``. Freshness is keyed on RECV-LIVENESS, not
-    the venue book's last-change ts, so a quiet-but-connected ``*-updown-*`` book
-    (which legitimately holds the same ladder for seconds) keeps serving instead
-    of forcing REST every checkpoint. A socket that stops delivering frames
-    (half-open, or disconnected → cache+liveness cleared) ages out and serves
-    ``None``. ``fetched_at_ts`` still carries the VENUE timestamp so the tick's
-    ``book_ws_age_ms_max`` telemetry can measure venue-book age against it, and
-    ``max_book_age_ms`` (default 0 = off) can gate on that same quantity.
+Same interface as ``scheduler.book_prefetch.BookPrefetcher``, so it plugs into
+``TickDeps.book_prefetch``:
 
-⚠️ Recv-liveness is a CONNECTION-level signal and cannot, on its own, tell you a
-particular token is fresh — every frame on the socket re-stamps it, including
-pings and other tokens' subscription acks. That is why eviction-on-unsubscribe
-(not liveness) is what keeps a rolled-off window from pricing a live order.
+  * ``note_tokens(tokens)``: the pipeline passes the current window's tokens;
+    the thread subscribes to exactly that set, and any token that left the set
+    is evicted from the cache (``evict_unsubscribed``, on by default).
+  * ``get(token, *, now_ts)``: returns the cached ``BookSnapshot`` only while
+    the mirror is live, i.e. the recv loop got a frame (any message, pings
+    included) within ``max_age_ms``. Liveness is per connection, not per book,
+    so a quiet but connected book keeps serving instead of forcing REST. A
+    socket that stops delivering frames (half-open, or disconnected, which
+    clears the cache) ages out and serves ``None``. ``fetched_at_ts`` still
+    holds the venue timestamp, for the ``book_ws_age_ms_max`` telemetry and
+    the optional ``max_book_age_ms`` gate (0 = off).
 
-Fail-safe semantics: on ANY error / disconnect the cache is cleared and
-``get`` returns ``None``, so the pipeline falls through to the REST batch
-exactly as today. The mirror never places, cancels, or gates an order — it is
-a read-only latency cache with a kill switch (``CRYPTOBOT_BOOK_WS_ENABLED``,
-default off).
+Connection liveness cannot show that a particular token is fresh: every frame
+refreshes it, including pings and other tokens' acks. Evicting unsubscribed
+tokens is what keeps an old window's book from pricing a live order.
 
-The ``websockets`` dependency is imported LAZILY inside the connection loop so
-this module imports (and unit-tests) cleanly on a host without the library and
-without opening any socket.
+On any error or disconnect the cache is cleared and ``get`` returns ``None``,
+so the pipeline uses the REST batch. The mirror never places, cancels or gates
+an order; it is a read-only cache, off by default
+(``CRYPTOBOT_BOOK_WS_ENABLED``).
+
+``websockets`` is imported lazily inside the connection loop, so the module
+imports and unit-tests cleanly without the library and without a socket.
 """
 
 from __future__ import annotations
@@ -62,19 +52,17 @@ from cryptobot_polymarket.clob import _snapshot_from_payload
 logger = logging.getLogger(__name__)
 
 
-# Public market channel — book snapshots + price_change deltas; NO auth
-# required (only the `user` channel needs an L2 API key). Overridable via env
-# for staging/replays.
+# Public market channel (book snapshots and price_change deltas). No auth
+# needed; only the ``user`` channel needs an API key. Overridable via env.
 DEFAULT_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 
 
 def _venue_ts(msg: dict, *, recv_ts: float) -> float:
     """Best-effort server timestamp (seconds) from a market-channel message.
 
-    Polymarket stamps ``timestamp`` in epoch MILLIseconds (13 digits). We
-    normalize ms→s, pass through second-scale values, and fall back to the
-    local receive time when the field is absent/garbage so a snapshot is
-    never stamped with an obviously-wrong (0 / far-future) age.
+    Polymarket sends ``timestamp`` in epoch milliseconds. Convert ms to s, pass
+    second-scale values through, and fall back to the local receive time when
+    the field is missing or garbage, so a snapshot never gets an absurd age.
     """
     raw = msg.get("timestamp")
     if raw is None:
@@ -85,28 +73,29 @@ def _venue_ts(msg: dict, *, recv_ts: float) -> float:
         return float(recv_ts)
     if val <= 0:
         return float(recv_ts)
-    # ms epoch (>~ Sat 2001 in ms) → seconds; keep already-second values as-is.
+    # Epoch ms -> seconds; values already in seconds pass through.
     if val > 1e12:
         return val / 1000.0
     return val
 
 
 def _levels_as_payload(level_map: dict[float, float]) -> list[dict[str, float]]:
-    """Turn a {price: size} map into the ``[{"price","size"}]`` shape the
-    shared ``_snapshot_from_payload`` parser consumes (it re-sorts + drops
-    non-positive levels defensively)."""
+    """Turn a {price: size} map into the ``[{"price","size"}]`` shape that
+    ``_snapshot_from_payload`` parses (it re-sorts and drops non-positive
+    levels).
+    """
     return [{"price": p, "size": s} for p, s in level_map.items() if s > 0]
 
 
 class ClobBookWsMirror:
     """Daemon thread mirroring the CLOB market channel into a snapshot cache.
 
-    ``get`` / ``note_tokens`` match ``BookPrefetcher`` so the pipeline seam is
-    unchanged. Everything network-facing lives on the daemon thread; the
-    pipeline only ever touches the lock-guarded cache.
+    ``get`` / ``note_tokens`` match ``BookPrefetcher``. All network work
+    happens on the daemon thread; the pipeline only touches the lock-guarded
+    cache.
     """
 
-    # Telemetry tag surfaced by BookSourceChain.get_tagged (W2).
+    # Source tag reported by BookSourceChain.get_tagged.
     source_name = "ws"
 
     def __init__(
@@ -123,34 +112,23 @@ class ClobBookWsMirror:
     ) -> None:
         self._url = url
         self._max_age_s = max(0.05, float(max_age_ms) / 1000.0)
-        # ORPHAN FIX (2026-07-25). Measured on the live box: the venue pushes
-        # ~822 msg/s with a p50 1ms inter-frame gap on the open *-updown-*
-        # windows, yet this mirror served books with a p50 age of 6,935ms and a
-        # MAX of 114,498ms — a ~7000x gap that is entirely consumer-side. Root
-        # cause: `_cache` was evicted ONLY on disconnect (_clear_cache) or when a
-        # token's ask side emptied (_rebuild). When a window rolled, the pipeline
-        # noted a new token set, `_stream_once` re-subscribed, and the PREVIOUS
-        # window's tokens stopped updating but STAYED in `_cache` forever — and
-        # `get()`'s only gate was connection-level recv-liveness, which any frame
-        # (a ping, another token's ack) re-stamps. So a two-windows-old ladder
-        # priced live FAKs. The `_stream_once` comment claiming orphans "age out
-        # of the freshness window" described a window that did not exist.
-        #
-        # `evict_unsubscribed` drops a token's cache + ladders the moment it
-        # leaves the subscribed set, so an orphan serves None (→ REST) instead of
-        # a stale ladder. Default ON: it can only ever REMOVE stale data, and the
-        # fallback is the well-tested REST batch. Kill switch is
+        # Evict a token's cache entry and ladders as soon as it leaves the
+        # subscribed set, so an old window's token serves None (and the tick
+        # uses REST) instead of a stale ladder. Without this, rolled-off tokens
+        # stayed cached forever, and since ``get()`` only checks connection
+        # liveness they kept pricing live orders: books were measured seconds
+        # to minutes old while the venue pushed ~800 msg/s. On by default since
+        # it can only remove stale data; disable with
         # CRYPTOBOT_BOOK_WS_EVICT_UNSUBSCRIBED=0.
         self._evict_unsubscribed = bool(evict_unsubscribed)
-        # Per-token venue-book age gate (0 = disabled = pre-2026-07-25 behavior).
-        # This is the SAFETY NET, not the fix — with eviction on, ages collapse
-        # and this should rarely fire. Arm it only after watching the ws_age
-        # telemetry: at the pre-fix p50 of ~6.9s a ~400ms gate would reject
-        # essentially every WS hit, which is equivalent to (and slower than)
-        # simply setting CRYPTOBOT_BOOK_WS_ENABLED=0.
+        # Per-token venue-book age limit (0 = off). A safety net that rarely
+        # fires with eviction on. Check the ws_age telemetry before arming it:
+        # if books are seconds old, a ~400ms limit rejects nearly every hit,
+        # which is just a slower way of turning the mirror off.
         self._max_book_age_s = max(0.0, float(max_book_age_ms) / 1000.0)
-        # Injectable for tests: a zero-arg callable returning a context-manager
-        # websocket connection. Default lazily imports ``websockets``.
+        # Injectable for tests: a zero-argument callable returning a
+        # context-manager websocket connection. The default imports
+        # ``websockets`` lazily.
         self._connect_factory = connect_factory
         self._backoff_base_s = max(0.05, float(reconnect_backoff_s))
         self._backoff_max_s = max(self._backoff_base_s, float(reconnect_backoff_max_s))
@@ -158,27 +136,25 @@ class ClobBookWsMirror:
 
         self._lock = threading.Lock()
         self._cache: dict[str, BookSnapshot] = {}
-        # Retained per-token price ladders so price_change deltas merge onto the
-        # last full book rather than needing a fresh snapshot every tick.
+        # Per-token price ladders, so price_change deltas apply to the last
+        # full book.
         self._asks: dict[str, dict[float, float]] = {}
         self._bids: dict[str, dict[float, float]] = {}
         self._tokens: tuple[str, ...] = ()
         self._tokens_version = 0
-        # Tokens the stall watchdog evicted, awaiting a full `book` frame before
-        # deltas may rebuild them (see `evict`). Empty unless the watchdog acts
-        # => every code path below is byte-identical without it.
+        # Tokens the stall watchdog evicted, waiting for a full ``book`` frame
+        # before deltas may rebuild them (see ``evict``). Empty unless the
+        # watchdog acts.
         self._resync: set[str] = set()
-        # Monotonic time of the LAST frame the recv loop received (any message,
-        # including pings / sub-acks). get()'s freshness gate keys off this
-        # recv-liveness rather than the venue book's last-change ts, so a quiet
-        # connected book keeps serving. None until the first frame arrives and
-        # reset to None on disconnect (_clear_cache) so a dead socket serves
-        # nothing.
+        # Monotonic time of the last frame received (any message, including
+        # pings and subscription acks). ``get()`` checks freshness against
+        # this, so a quiet connected book keeps serving. None until the first
+        # frame, and reset to None on disconnect (_clear_cache) so a dead
+        # socket serves nothing.
         self._last_recv_monotonic: Optional[float] = None
-        # Fast-trigger EVENT rung (operator 2026-07-30): optional notifier fired
-        # once per frame that changed the ASK ladder, so core can re-evaluate an
-        # entry within ~20ms of the push instead of waiting for the next 1Hz tick
-        # boundary (~500ms mean). None => never called => byte-identical.
+        # Optional fast-trigger callback, fired once per frame that changed the
+        # ask ladder, so an entry can be re-evaluated within ~20ms instead of
+        # waiting for the next 1 Hz tick. None means never called.
         self._on_ask_update: Optional[Callable[[str, float], None]] = None
 
         self._stop = threading.Event()
@@ -189,41 +165,40 @@ class ClobBookWsMirror:
     def set_ask_update_callback(
         self, callback: Optional[Callable[[str, float], None]]
     ) -> None:
-        """Register the ask-side update notifier (``None`` clears it).
+        """Register the ask-update callback (``None`` clears it).
 
-        Contract for the callback — it runs ON THE RECV THREAD, which feeds every
-        book read in the process:
-          * it MUST be O(1) and non-blocking (queue-and-return);
-          * it MUST NOT call back into this mirror (``get`` takes ``self._lock``,
-            a plain Lock, so re-entering from inside a callback that we fired
-            while holding it would deadlock the recv loop — which is why we fire
-            AFTER releasing it);
-          * a fire is NOT a promise that ``get`` will serve the token: the
-            rebuild may have dropped it (ask side emptied) and ``get`` still
-            applies its own recv-liveness / max-book-age gates.
+        The callback runs on the recv thread, which feeds every book read in
+        the process, so:
+
+          * it must be O(1) and non-blocking (queue and return);
+          * it must not call back into this mirror (it is fired after the lock is
+            released, but ``get`` takes the same plain Lock);
+          * a call does not mean ``get`` will serve the token: the rebuild may have
+            dropped it, and ``get`` still applies its own freshness checks.
         """
         self._on_ask_update = callback
 
     def _fire_ask_update(self, token: str, venue_ts: float) -> None:
-        """Notify the ask-update callback. Called with ``self._lock`` RELEASED."""
+        """Call the ask-update callback. Must be called with ``self._lock``
+        released.
+        """
         cb = self._on_ask_update
         if cb is None:
             return
         try:
             cb(token, venue_ts)
         except Exception:  # noqa: BLE001 — a bad consumer must never kill the WS
-            # Load-bearing: an escaping exception unwinds _handle_message ->
-            # _stream_once -> _run, whose finally clears the whole cache and
-            # backs off. One bad callback would take the mirror down to REST.
+            # Must not raise: an exception here would unwind to _run, whose
+            # finally clears the whole cache, so one bad callback would push
+            # every read to REST.
             logger.debug("ask-update callback raised", exc_info=True)
 
     def note_tokens(self, tokens: list[str]) -> None:
-        """Record the current window's token set; the thread (re)subscribes.
+        """Record the current window's token set; the thread resubscribes.
 
-        Also EVICTS any token that just left the set (see ``_evict_unsubscribed``
-        in ``__init__``). Without this a rolled-off window's ladder stayed cached
-        and — because ``get()``'s gate is connection-level — kept pricing live
-        orders; measured max served age was 114s.
+        Also evicts any token that left the set (see ``_evict_unsubscribed`` in
+        ``__init__``); otherwise an old window's ladder stays cached and keeps
+        pricing orders.
         """
         deduped = tuple(dict.fromkeys(str(t) for t in tokens if t))
         with self._lock:
@@ -237,42 +212,40 @@ class ClobBookWsMirror:
                     self._asks.pop(gone, None)
                 for gone in [t for t in self._bids if t not in keep]:
                     self._bids.pop(gone, None)
-                # A rolled-off token gets a fresh `book` on its next
-                # subscription anyway; dropping it here keeps `_resync` bounded
-                # by the live window instead of growing for the process's life.
+                # A rolled-off token gets a fresh ``book`` when it is next
+                # subscribed anyway; dropping it here keeps ``_resync`` bounded
+                # to the live window.
                 self._resync -= {t for t in self._resync if t not in keep}
             self._tokens = deduped
             self._tokens_version += 1
 
     def get(self, token: str, *, now_ts: float) -> Optional[BookSnapshot]:
-        """Return the cached snapshot for ``token`` iff the mirror is LIVE.
+        """Return the cached snapshot for ``token`` while the mirror is live.
 
-        Freshness is keyed on RECV-LIVENESS — the monotonic age of the last
-        frame the recv loop received (``_last_recv_monotonic``, re-stamped by
-        every message) — NOT the venue book's last-change ts. A ``*-updown-*``
-        book can hold the same ladder for many seconds while the socket stays
-        healthy; that quiet ladder is VALID and keeps serving. Only a socket that
-        stopped delivering frames (half-open → recv times out with no message; or
-        disconnected → ``_clear_cache`` reset liveness to None) ages past
-        ``max_age`` and serves nothing, so the tick falls back to REST.
+        Freshness is the age of the last frame received
+        (``_last_recv_monotonic``, set by every message), not the book's last
+        change. An up/down book can hold the same ladder for many seconds on a
+        healthy socket, and that ladder is valid. Only a socket that stopped
+        delivering frames (half-open, or disconnected, which resets liveness to
+        None) ages past ``max_age`` and serves nothing, so the tick falls back
+        to REST.
 
-        ``now_ts`` is unused for the freshness decision (kept for the
-        ``BookPrefetcher``-compatible seam); the snapshot still carries the VENUE
-        timestamp in ``fetched_at_ts`` for the ``book_ws_age_ms_max`` telemetry.
+        ``now_ts`` is not used for freshness (kept for the ``BookPrefetcher``
+        interface); ``fetched_at_ts`` still holds the venue timestamp for the
+        ``book_ws_age_ms_max`` telemetry.
         """
         with self._lock:
             snap = self._cache.get(token)
             last_recv = self._last_recv_monotonic
         if snap is None or last_recv is None:
             return None
-        # Recv-liveness gate: served only while the socket is still delivering
-        # frames. A quiet book (venue ts old, socket live) passes; a frozen /
-        # half-open socket (no frame within max_age) does not.
+        # Serve only while the socket is delivering frames. A quiet book on a
+        # live socket passes; a frozen or half-open socket does not.
         if (time.monotonic() - float(last_recv)) > self._max_age_s:
             return None
-        # Per-token venue-book age gate (safety net; 0 = disabled). Measured on
-        # the SAME quantity the tick reports as book_ws_age_ms_max, so the knob
-        # and the telemetry agree by construction.
+        # Optional per-token book-age limit (0 = off). Uses the same quantity
+        # the tick reports as book_ws_age_ms_max, so the setting and the
+        # telemetry agree.
         if self._max_book_age_s > 0.0:
             venue_ts = getattr(snap, "fetched_at_ts", None)
             if venue_ts is None:
@@ -281,42 +254,38 @@ class ClobBookWsMirror:
                 return None
         return snap
 
-    # -- watchdog-facing API (2026-08-06, operator order) --------------------
-    # The freshness cap was lifted (CRYPTOBOT_BOOK_WS_MAX_AGE_MS pinned to
-    # 600000) because on these books snapshot age = market QUIETNESS, not feed
-    # lag. That leaves one gray zone the mirror cannot self-diagnose: a socket
-    # that is CONNECTED (recv-liveness keeps re-stamping off pings / other
-    # tokens) while updates for one subscribed token silently stop. Connection
-    # death already clears the cache and a rolled-off token is evicted, so the
-    # only detector left is an out-of-band REST cross-check — which is what
-    # ``scheduler.book_ws_watchdog`` does with these two methods. Both are
-    # read-only w.r.t. the recv loop's own logic and are NEVER called from the
-    # tick/order path.
+    # -- watchdog-facing API --------------------------------------------------
+    # The live deploy sets no freshness cap, because on these books snapshot
+    # age reflects how quiet the market is, not feed lag. That leaves one case
+    # the mirror cannot detect itself: a connected socket (pings keep it live)
+    # where updates for one token silently stop. Disconnects already clear the
+    # cache and rolled-off tokens are evicted, so
+    # ``scheduler.book_ws_watchdog`` uses these two methods to cross-check
+    # against REST. Neither is ever called from the tick or order path.
 
     def serving_snapshots(self) -> dict[str, BookSnapshot]:
-        """Shallow copy of the tokens currently in the serving set.
+        """Shallow copy of the tokens currently cached.
 
-        ``BookSnapshot`` is frozen, so the copy is safe to inspect off-thread.
-        The dict is what ``get`` reads, minus its liveness gates — the watchdog
-        wants "what COULD be served", including entries the gates would reject.
+        ``BookSnapshot`` is frozen, so the copy is safe to read on another
+        thread. This is what ``get`` reads before its freshness checks; the
+        watchdog wants everything that could be served.
         """
         with self._lock:
             return dict(self._cache)
 
     def evict(self, token: str) -> bool:
-        """Drop ``token``'s snapshot + ladders; return True if one was cached.
+        """Drop ``token``'s snapshot and ladders; return True if one was
+        cached.
 
-        Used by the stall watchdog on a verified WS/REST divergence: the next
-        entry-path read then falls through to REST truth instead of a ladder we
-        no longer believe.
+        Used by the stall watchdog on a confirmed WS/REST mismatch, so the next
+        read falls through to REST.
 
-        ⚠️ The token stays SUBSCRIBED, so unlike ``note_tokens`` eviction the
-        very next frame can rebuild it — and a ``price_change`` delta applied to
-        empty ladders would rebuild a PARTIAL book (only the levels that
-        happened to change), which is worse than no book at all. So eviction
-        also arms a resync: deltas for the token are dropped until a full
-        ``book`` frame re-seeds the ladders. Until then ``get`` serves None and
-        the tick uses REST, which is the intended fail-safe.
+        The token stays subscribed, so the next frame could rebuild it, and a
+        ``price_change`` delta applied to empty ladders would build a partial
+        book (only the levels that changed), which is worse than none. Eviction
+        therefore also marks the token for resync: its deltas are dropped until
+        a full ``book`` frame re-seeds the ladders. Until then ``get`` serves
+        None and the tick uses REST.
         """
         with self._lock:
             found = self._cache.pop(token, None) is not None
@@ -349,20 +318,17 @@ class ClobBookWsMirror:
     # -- message handling (unit-tested directly, no socket) ------------------
 
     def _is_unsubscribed(self, token: str) -> bool:
-        """True when ``token`` is no longer in the subscribed set (caller holds
+        """True when ``token`` is no longer subscribed (caller holds
         ``_lock``).
 
-        Without this, eviction is not airtight: `_apply_book` /
-        `_apply_price_change` accept ANY token the socket delivers, so the very
-        next frame RESURRECTS whatever `note_tokens` just evicted — and if the
-        venue merges subscriptions rather than replacing them (the pre-2026-07-25
-        `_stream_once` comment asserted "the venue merges", which was never
-        verified) the eviction would be a complete no-op. Filtering on write
-        makes eviction deterministic regardless of which semantic the venue
-        actually implements, and closes the resurrect-during-resubscribe-RTT
-        window too.
+        ``_apply_book`` / ``_apply_price_change`` accept any token the socket
+        sends, so without this check the next frame would bring back a token
+        ``note_tokens`` just evicted, and if the venue merges subscriptions
+        rather than replacing them eviction would do nothing at all. Filtering
+        on write makes eviction reliable either way, including during the
+        resubscribe round trip.
 
-        Empty ``_tokens`` = pre-first-note startup, when everything is accepted.
+        An empty ``_tokens`` (before the first note_tokens) accepts everything.
         """
         return bool(
             self._evict_unsubscribed and self._tokens and token not in self._tokens
@@ -373,21 +339,21 @@ class ClobBookWsMirror:
             self._cache = {}
             self._asks = {}
             self._bids = {}
-            # A reconnect re-subscribes and the venue replays a full `book` for
-            # every token, so a pending watchdog resync is satisfied by
-            # construction; keeping it armed would only suppress deltas that
-            # arrive before that snapshot.
+            # A reconnect resubscribes and the venue sends a full ``book`` for
+            # every token, which satisfies any pending watchdog resync; keeping
+            # it would only drop deltas that arrive before that book.
             self._resync = set()
-            # Recv-liveness goes false on disconnect/error so get() serves
-            # nothing until the reconnected loop receives a fresh frame — a
-            # half-open socket must never keep serving a stale ladder.
+            # Clear liveness on disconnect or error, so get() serves nothing
+            # until the reconnected loop receives a frame.
             self._last_recv_monotonic = None
 
     def _rebuild(self, token: str, *, venue_ts: float) -> None:
-        """Rebuild + store the frozen snapshot for ``token`` from its ladders.
+        """Rebuild and store the frozen snapshot for ``token`` from its
+        ladders.
 
-        Reuses the REST parser so depth math + the empty-ask→drop rule are
-        byte-identical to the batch/GET path (snapshots are interchangeable).
+        Uses the REST parser, so depth math and the empty-ask rule are
+        identical to the batch path and snapshots from either source are
+        interchangeable.
         """
         payload = {
             "asks": _levels_as_payload(self._asks.get(token, {})),
@@ -395,8 +361,8 @@ class ClobBookWsMirror:
         }
         snap = _snapshot_from_payload(payload, token_id=token, now_ts=venue_ts)
         if snap is None:
-            # Book went empty on the ask side → drop it so a stale populated
-            # snapshot can't linger (get would otherwise keep serving it).
+            # Ask side is empty: drop the snapshot so a stale one cannot keep
+            # serving.
             self._cache.pop(token, None)
         else:
             self._cache[token] = snap
@@ -425,25 +391,24 @@ class ClobBookWsMirror:
         with self._lock:
             if self._is_unsubscribed(token):
                 return None
-            # A full `book` frame re-seeds both ladders wholesale, which is
-            # exactly what a watchdog eviction was waiting for.
+            # A full ``book`` frame re-seeds both ladders, which is what a
+            # watchdog eviction was waiting for.
             self._resync.discard(token)
             self._asks[token] = asks
             self._bids[token] = bids
             self._rebuild(token, venue_ts=venue_ts)
-        # A `book` frame always replaces the ask ladder wholesale. Fired with the
-        # lock RELEASED and AFTER the rebuild, so the callback observes the
-        # committed snapshot and cannot deadlock on self._lock.
+        # A ``book`` frame always replaces the ask ladder. Fired after the
+        # rebuild with the lock released, so the callback sees the new snapshot
+        # and cannot deadlock on self._lock.
         self._fire_ask_update(token, venue_ts)
         return token
 
     def _apply_price_change(self, msg: dict, *, recv_ts: float) -> Optional[str]:
-        """Apply one ``price_change`` frame — MARKET-scoped, not token-scoped.
+        """Apply one ``price_change`` frame. These are scoped to the market,
+        not to one token.
 
-        ⚠️ Wire format, verified live on the box 2026-08-06 (25s sample on the
-        open ``*-updown-5m-*`` books: 10,536 ``price_change`` frames, top-level
-        ``asset_id`` ABSENT in 10,536 of them, ``price_changes`` list present in
-        10,536):
+        Wire format (sampled live on open up/down books; top-level ``asset_id``
+        was absent in every frame)::
 
             {"market": "0x...", "event_type": "price_change", "timestamp": "...",
              "price_changes": [
@@ -452,20 +417,16 @@ class ClobBookWsMirror:
                 {"asset_id": "<NO tok>",  "price": "0.99", "size": "7933.84",
                  "side": "SELL", ...}]}
 
-        One frame therefore carries changes for BOTH tokens of the market and
-        the token id lives on each CHANGE, never at the top level. The pre-fix
-        code read the token from the top level only, so ``token`` was ``""`` and
-        EVERY delta was dropped: the mirror advanced solely on full ``book``
-        frames (measured book-frame gaps p50 0.06-0.19s but max 2.7-7.1s), which
-        is exactly the 5-9s ws_age + wrong top-of-book the stall watchdog kept
-        evicting on. Those evictions were TRUE positives.
+        One frame carries changes for both tokens of the market, and the token
+        id is on each change. Reading it only from the top level drops every
+        delta, leaving the mirror updated only by full ``book`` frames, which
+        can be seconds apart.
 
-        The legacy token-scoped shape (top-level ``asset_id`` + ``changes``) is
-        still accepted — every change without its own ``asset_id`` falls back to
-        the frame's token — so a venue that sends either form works.
+        The token-scoped shape (top-level ``asset_id`` plus ``changes``) is
+        still accepted: a change without its own ``asset_id`` uses the frame's.
 
-        Returns one touched token (truthiness = "a delta landed"), keeping the
-        ``Optional[str]`` seam of ``_apply_book``.
+        Returns one touched token (truthy means a delta was applied), matching
+        ``_apply_book``.
         """
         changes = msg.get("changes")
         if not isinstance(changes, list):
@@ -473,7 +434,7 @@ class ClobBookWsMirror:
         if not isinstance(changes, list):
             return None
         frame_token = str(msg.get("asset_id") or msg.get("token_id") or "")
-        # Group first so each token's ladder is rebuilt exactly once per frame.
+        # Group first so each token's ladder is rebuilt once per frame.
         by_token: dict[str, list[dict]] = {}
         for ch in changes:
             if not isinstance(ch, dict):
@@ -493,10 +454,9 @@ class ClobBookWsMirror:
                 if self._is_unsubscribed(token):
                     continue
                 if token in self._resync:
-                    # Watchdog-evicted: a delta on empty ladders would rebuild a
-                    # PARTIAL book. Serve nothing (→ REST) until a full `book`
-                    # frame arrives. Empty set on every un-evicted token, so this
-                    # branch is never taken in the default configuration.
+                    # Evicted by the watchdog: a delta on empty ladders would
+                    # build a partial book. Serve nothing (REST is used) until
+                    # a full ``book`` frame arrives.
                     continue
                 asks = self._asks.setdefault(token, {})
                 bids = self._bids.setdefault(token, {})
@@ -517,28 +477,26 @@ class ClobBookWsMirror:
                 touched = token
                 if ask_dirty:
                     dirty_asks.append(token)
-        # Bid-only deltas do NOT wake the fast-trigger event rung — an entry is
-        # priced off the ask. Note this inherits the side classification above
-        # verbatim (a missing/garbage `side` falls to bids), so the flag and the
-        # ladder can never disagree about what changed. Fired outside the lock,
-        # once per token whose ask ladder actually moved.
+        # Bid-only changes do not fire the fast trigger, since entries are
+        # priced off the ask. Uses the same side classification as the ladder
+        # update (a missing or garbage ``side`` counts as a bid), so the two
+        # always agree. Fired outside the lock, once per token whose ask ladder
+        # changed.
         for token in dirty_asks:
             self._fire_ask_update(token, venue_ts)
         return touched
 
     def _handle_message(self, raw, *, recv_ts: Optional[float] = None) -> None:
-        """Parse one raw frame (str/bytes/dict or a list of them) and apply it.
+        """Parse one raw frame (str, bytes, dict, or a list of them) and apply
+        it.
 
-        Best-effort: an unparseable / unknown message is ignored rather than
-        killing the stream.
+        An unparseable or unknown message is ignored rather than ending the
+        stream.
         """
         if recv_ts is None:
             recv_ts = time.time()
-        # Recv-liveness: stamp the monotonic time of THIS received frame BEFORE
-        # parsing (even an unparseable / unknown frame proves the socket is still
-        # delivering). get()'s freshness gate keys off this, so a quiet-but-
-        # connected book keeps serving while a socket that stops delivering
-        # frames ages out.
+        # Record liveness before parsing: even an unparseable frame proves the
+        # socket is delivering. ``get()`` checks freshness against this.
         with self._lock:
             self._last_recv_monotonic = time.monotonic()
         if isinstance(raw, (bytes, bytearray)):
@@ -557,15 +515,15 @@ class ClobBookWsMirror:
                 self._apply_book(msg, recv_ts=recv_ts)
             elif etype == "price_change":
                 self._apply_price_change(msg, recv_ts=recv_ts)
-            # PONG / subscription-ack / unknown → ignore.
+            # PONG, subscription ack or unknown: ignore.
 
     # -- connection loop -----------------------------------------------------
 
     def _open_connection(self):
         if self._connect_factory is not None:
             return self._connect_factory()
-        # Lazy import: keeps module import + unit tests independent of the lib
-        # and of any socket. The sync API landed in websockets 13.
+        # Lazy import keeps module import and unit tests free of the library
+        # and of sockets. The sync API needs websockets >= 13.
         from websockets.sync.client import connect
 
         return connect(
@@ -581,7 +539,9 @@ class ClobBookWsMirror:
         ws.send(json.dumps({"assets_ids": list(tokens), "type": "market"}))
 
     def _stream_once(self) -> None:
-        """One connect→subscribe→consume session. Returns on stop or error."""
+        """One connect -> subscribe -> consume session. Returns on stop or
+        error.
+        """
         conn = self._open_connection()
         with conn as ws:
             local_version = -1
@@ -590,21 +550,17 @@ class ClobBookWsMirror:
                     tokens = self._tokens
                     version = self._tokens_version
                 if version != local_version:
-                    # Token set changed (new window) → (re)subscribe the full
-                    # set. Tokens that left the set stop updating; `note_tokens`
-                    # has already EVICTED their cache entries, so they serve None
-                    # (→ REST) rather than a frozen ladder.
-                    #
-                    # The pre-2026-07-25 comment here claimed orphans "age out of
-                    # the freshness window" — there was no per-token freshness
-                    # window (get() gated only on connection-level recv-liveness),
-                    # so they never aged out at all. That was the 114s book.
+                    # The token set changed (new window): subscribe to the full
+                    # set. Tokens that left it were already evicted by
+                    # ``note_tokens``, so they serve None (REST) rather than a
+                    # frozen ladder.
                     self._subscribe(ws, tokens)
                     local_version = version
                 try:
                     raw = ws.recv(timeout=self._recv_timeout_s)
                 except TimeoutError:
-                    # No message this interval — loop to re-check stop/tokens.
+                    # No message this interval; loop to re-check stop and
+                    # tokens.
                     continue
                 self._handle_message(raw, recv_ts=time.time())
 
@@ -613,15 +569,15 @@ class ClobBookWsMirror:
         while not self._stop.is_set():
             try:
                 self._stream_once()
-                # Clean return (stop requested) — exit without backoff.
+                # Clean return (stop requested): exit without backoff.
                 if self._stop.is_set():
                     break
                 backoff = self._backoff_base_s
             except Exception:  # noqa: BLE001 — any WS error → fall back to REST
                 logger.debug("book WS mirror stream error", exc_info=True)
             finally:
-                # On ANY disconnect/error the mirror must serve nothing so the
-                # pipeline falls through to the REST batch (never a stale book).
+                # On any disconnect or error, serve nothing so the pipeline
+                # uses the REST batch, never a stale book.
                 self._clear_cache()
             if self._stop.wait(timeout=backoff):
                 break
@@ -629,10 +585,11 @@ class ClobBookWsMirror:
 
 
 def _level_pair(lvl: object) -> tuple[Optional[float], float]:
-    """Extract (price, size) floats from a raw level/change dict.
+    """Extract (price, size) floats from a raw level or change dict.
 
-    Returns ``(None, 0.0)`` when price is missing/garbage; size defaults to 0
-    (a delta with size 0 = level removal)."""
+    Returns ``(None, 0.0)`` when price is missing or garbage; size defaults to
+    0 (a delta with size 0 removes the level).
+    """
     if not isinstance(lvl, dict):
         return None, 0.0
     try:

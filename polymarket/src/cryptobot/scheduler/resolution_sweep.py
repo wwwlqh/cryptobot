@@ -1,27 +1,25 @@
-"""F3 resolution sweep — settles PENDING rows whose window has expired.
+"""Resolution sweep: settles PENDING rows whose market window has ended.
 
-Runs every 5 minutes (Cron `0,5,10,...,55`); each invocation:
-  1. SELECT id, coin, sleeve, side, fill_price, window_start_ts, window_end_ts
-     FROM ledger WHERE outcome='PENDING' AND window_end_ts <= now
-  2. For each row, fetch Polymarket/Gamma final outcome when wired
-  3. Compute pnl_net using cash-sized P&L from the actual ledger fill/VWAP,
-     charging the calibrated entry-leg fee dispatched on the ROW's venue
-     column (execution.grade_fees — 2026-07-23 calibrated fee grading; fees
-     are booked on WIN and LOSS alike, never config.VENUE-dispatched, so a
-     mixed-history DB grades every row under the venue that charged it)
-  4. UPDATE outcome/won_up/resolution_price/resolution_source/resolution_ts/pnl_net
+Runs every 5 minutes. Each run:
 
-Failure modes:
-  - Gamma says open/not found/bad payload/http error -> row stays PENDING for
-    the next sweep cycle rather than guessing from an oracle spot price
-  - legacy oracle resolver returns None (Chainlink down) -> row
-    stays PENDING for next sweep cycle
-  - resolver raises ResolutionError(out_of_bounds / excessive_deviation) ->
-    row marked CANCELLED with pnl_net=0; CRITICAL log row written to
-    pipeline_health (security defense per U7a)
+  1. selects ledger rows with outcome='PENDING' and window_end_ts <= now;
+  2. fetches each market's final outcome from Polymarket (Gamma);
+  3. computes pnl_net from the actual fill or VWAP, charging the calibrated
+     entry fee (execution.grade_fees) on wins and losses alike;
+  4. updates outcome, won_up, resolution_price, resolution_source,
+     resolution_ts and pnl_net.
 
-Idempotency: the sweep predicates on outcome='PENDING', so running it
-twice on the same row produces one settlement, not two.
+Failure handling:
+
+  - Gamma reports the market open, missing, malformed or unreachable: the
+    row stays PENDING for the next run (no guessing from a spot price);
+  - the legacy oracle resolver returns None: the row stays PENDING;
+  - the resolver raises ResolutionError (out_of_bounds or
+    excessive_deviation): the row is CANCELLED with pnl_net=0 and a CRITICAL
+    pipeline_health row is written.
+
+Idempotent: only PENDING rows are selected, so running twice settles a row
+once.
 """
 
 from __future__ import annotations
@@ -70,7 +68,9 @@ def _implied_live_fill_price(
     live_size: float,
     cap_price: float,
 ) -> Optional[float]:
-    """Infer average fill for cash-sized FAK buys with price improvement."""
+    """Infer the average fill for a cash-sized FAK buy that got price
+    improvement.
+    """
     if live_size <= 0:
         return None
     try:
@@ -90,20 +90,17 @@ def _implied_live_fill_price(
 
 
 def _decide_won_up(coin: str, strike: float, resolution_price: float) -> bool:
-    """For the 5m/15m up-or-down crypto markets, YES wins when the
-    resolution price strictly exceeds the strike (window-open spot).
+    """For the 5m/15m up-or-down markets, YES wins when the resolution price is
+    strictly above the strike.
 
-    ``strike`` MUST be the live spot AT WINDOW-OPEN — the same anchor
-    the model trains against and Polymarket Chainlink settles on. Callers
-    are expected to pass ``window_open_spot`` from the ledger row; only
-    legacy rows (pre-divergence-#13-fix) fall back to ``strike_price``,
-    which captured spot at decision time and produced systematically
-    biased outcomes (the bug this comparator now closes).
+    ``strike`` must be the spot at window open, the anchor the model trains on
+    and Polymarket settles against. Callers pass the row's
+    ``window_open_spot``; only old rows without it fall back to
+    ``strike_price`` (the spot at decision time, which biases outcomes).
 
-    For even-older rows that pre-date both columns, callers MAY fall
-    back to ``yes_pre1_anchor`` only when the value is clearly a spot
-    (far outside ``[0, 1]``) — values inside that band are Polymarket
-    probabilities and unsafe to compare against ``resolution_price``.
+    For rows older still, callers may use ``yes_pre1_anchor`` only when it is
+    clearly a spot price (far outside [0, 1]); values inside that range are
+    probabilities and must not be compared with ``resolution_price``.
     """
     return resolution_price > strike
 
@@ -117,15 +114,14 @@ def _log_pipeline(conn: sqlite3.Connection, *, stage: str, status: str, message:
 
 
 def _live_pending_skip_health(now_ts: float, window_end_ts: int) -> tuple[str, float]:
-    """Return ``(health_status, age_s)`` for a LIVE PENDING row the sweep must
-    skip because it cannot yet settle (no reconciled fill / no usable price).
+    """Return ``(health_status, age_s)`` for a live PENDING row the sweep has
+    to skip because it cannot settle yet (no reconciled fill or no usable
+    price).
 
-    Mirrors the unresolvable-market escalation (Audit P1 #12): past
-    ``MAX_PENDING_SETTLE_AGE_S`` a stuck LIVE row holds its bet_size in the
-    group exposure cap with NO auto relief and shows as a phantom open
-    position, so escalate to CRITICAL (surfaced by Telegram/systemd alerting)
-    rather than re-logging WARN and skipping forever. We never auto-cancel: a
-    real on-chain fill may just be missing its price.
+    Past ``MAX_PENDING_SETTLE_AGE_S`` such a row keeps its stake inside the
+    group exposure cap and shows as a phantom open position, so it is escalated
+    to CRITICAL (which alerts) instead of logging WARN forever. Never
+    auto-cancelled: a real on-chain fill may just be missing its price.
     """
     age_s = float(now_ts) - float(window_end_ts)
     health = "CRITICAL" if age_s > config.MAX_PENDING_SETTLE_AGE_S else "WARN"
@@ -141,13 +137,13 @@ def run_resolution_sweep(
     reference_spot_fetch: PriceFetcher | None = None,
     slippage_haircut_by_sleeve: Optional[dict[str, float]] = None,
 ) -> dict:
-    """Run one F3 sweep cycle. Returns counters for observability."""
+    """Run one sweep. Returns counters for observability."""
     import time as _time
 
     if now_ts is None:
         now_ts = _time.time()
 
-    # now_ts is fixed for the whole sweep — format the SQL resolution_ts once.
+    # now_ts is fixed for the whole sweep, so format resolution_ts once.
     resolution_ts = datetime.fromtimestamp(now_ts, tz=timezone.utc).strftime(
         "%Y-%m-%d %H:%M:%S"
     )
@@ -219,13 +215,12 @@ def run_resolution_sweep(
                     and age_s > config.MAX_PENDING_SETTLE_AGE_S
                 )
                 if stale_unresolvable and str(row["mode"]).upper() == "LIVE":
-                    # Audit P1 #12: a LIVE PENDING row Polymarket can no longer
-                    # resolve (permanent 404 / http_error / bad_payload) holds
-                    # its bet_size in the group exposure cap indefinitely with
-                    # no auto relief. Escalate to CRITICAL so an operator
-                    # resolves/cancels it. We do NOT auto-cancel: the market
-                    # may actually have resolved and only the fetch is failing,
-                    # so an auto-cancel could discard a real WIN/LOSS.
+                    # A live PENDING row Polymarket can no longer resolve
+                    # (permanent 404, HTTP error, bad payload) holds its stake
+                    # in the group exposure cap with nothing to release it.
+                    # Escalate to CRITICAL so an operator settles or cancels
+                    # it. Not auto-cancelled: the market may have resolved and
+                    # only the fetch is failing.
                     health = "CRITICAL"
                     message = (
                         f"row id={row['id']} LIVE PENDING unresolvable "
@@ -250,8 +245,8 @@ def run_resolution_sweep(
                 skipped += 1
                 continue
         else:
-            # Legacy/test path: resolve from an oracle spot price, then compare
-            # to the recorded window-open strike.
+            # Legacy and test path: resolve from an oracle spot price and
+            # compare it to the recorded window-open strike.
             reference_spot = None
             if reference_spot_fetch is not None:
                 reference_spot = reference_spot_fetch(coin, win_end)
@@ -280,15 +275,13 @@ def run_resolution_sweep(
                 continue
 
             if result is None:
-                # Upstream down - row stays PENDING for next cycle.
+                # Upstream down: the row stays PENDING for the next run.
                 skipped += 1
                 continue
 
-            # Resolve strike. Divergence #13 fix (2026-05-21) elevates
-            # window_open_spot to the primary anchor: same anchor the model
-            # trains against and Polymarket settles on. For legacy rows pre-#13
-            # we fall back to strike_price (decision-time spot) so old PENDING
-            # rows can still settle without manual repair.
+            # Strike: prefer window_open_spot, the anchor the model trains on
+            # and Polymarket settles against. Old rows without it fall back to
+            # strike_price so they can still settle.
             window_open_raw = row["window_open_spot"]
             strike_raw = row["strike_price"]
             if window_open_raw is not None:
@@ -317,13 +310,12 @@ def run_resolution_sweep(
                     continue
             won_up = _decide_won_up(coin, strike, result.price)
             if result.price == strike:
-                # Exact strike tie on the legacy oracle-spot fallback path.
-                # _decide_won_up uses strict `>` so a tie books YES=LOSS /
-                # NO=WIN with NO PUSH/refund path here. Real prints rarely tie,
-                # but the venue's on-chain rule may settle a flat as DOWN/refund,
-                # so a tie can mis-settle vs Polymarket. Log it so the rare event
-                # is observable for manual reconciliation. The Polymarket-resolved
-                # branch above is unaffected (it trusts poly_result.won_up).
+                # Exact tie on the legacy oracle path. _decide_won_up uses
+                # strict ``>``, so a tie books YES=LOSS / NO=WIN with no
+                # refund, while the venue might settle a flat close
+                # differently. Log it so the rare case can be checked by hand.
+                # The Polymarket-resolved branch above is unaffected (it uses
+                # poly_result.won_up).
                 _log_pipeline(
                     conn,
                     stage="resolve",
@@ -338,30 +330,21 @@ def run_resolution_sweep(
             result_price = result.price
             result_source = result.source
         side = row["side"]
-        # Divergence #6 (2026-05-18 audit): for honest realized PnL,
-        # prefer the multi-level VWAP we actually paid over the top_ask
-        # snapshot at decision time. ~46% of live bets walked the book
-        # by an average ~52 bps, undercounting losses on the dashboard.
-        # `fill_price` is retained (column unchanged, used by the
-        # backtest-parity test that feeds its own fill values) — only
-        # the realized `pnl_net` becomes walked_vwap-aware.
+        # Use the multi-level VWAP actually paid rather than the top-of-book
+        # ask at decision time; many bets walk more than one level, and using
+        # top_ask would understate losses. ``fill_price`` itself is unchanged
+        # (the backtest-parity test feeds its own values); only pnl_net uses
+        # walked_vwap.
         fill_price_topask = float(row["fill_price"])
         walked = row["walked_vwap"]
         effective_fill = (
             float(walked) if walked is not None else fill_price_topask
         )
-        # Audit hook: log every NULL walked_vwap so operators can scan
-        # pipeline_health for the frequency of the fallback path. Two
-        # populations land here:
-        #   * legacy rows recorded before the `walked_vwap` column existed
-        #     (these stay NULL forever and are expected)
-        #   * rows created after the schema migration that ended up with
-        #     NULL because the take-side code wrote the top-ask only (this
-        #     SHOULD be investigated; the live ledger is supposed to write
-        #     the walked VWAP on every fresh tick post-#6).
-        # We can't distinguish the two from the row alone without a
-        # creation-timestamp lookup, so emit the WARN unconditionally and
-        # let operators correlate against the schema-migration ts.
+        # Log every NULL walked_vwap so the fallback's frequency is visible in
+        # pipeline_health. Rows written before the column existed are expected
+        # to be NULL; a new row with NULL means the order path skipped the VWAP
+        # and is worth investigating. The row alone cannot tell which case it
+        # is, so always warn.
         if walked is None:
             _log_pipeline(
                 conn,
@@ -374,13 +357,12 @@ def run_resolution_sweep(
                 ),
             )
         bet_size = float(row["bet_size"] or 0.0)
-        # Audit w19oxqf24 finding #7 (P1): for a LIVE row, bet_size is the
-        # INTENDED stake and walked_vwap is the DRY walker's ESTIMATED VWAP. The
-        # GTC limit order can fill partially or at a different VWAP, and the
-        # reconciler (persistence/reconciliation.py) writes the realized values
-        # into live_filled_size / live_filled_price. Settle a LIVE row from the
-        # ACTUAL fill — stake = live_filled_size * live_filled_price, fill price
-        # = live_filled_price — not the requested stake/estimated price.
+        # For a live row, bet_size is the intended stake and walked_vwap is the
+        # walker's estimate. The order can fill partially or at another price,
+        # and the reconciler (persistence/reconciliation.py) records the real
+        # values in live_filled_size / live_filled_price. Settle from those:
+        # stake = live_filled_size * live_filled_price, price =
+        # live_filled_price.
         row_mode = (row["mode"] or "DRY").upper()
         live_fill_price_for_write: float | None = None
         if row_mode == "LIVE":
@@ -389,21 +371,15 @@ def run_resolution_sweep(
             live_size_f = float(live_size) if live_size is not None else 0.0
             live_price_f = float(live_price) if live_price is not None else 0.0
             if live_size_f <= 0.0:
-                # Not yet reconciled to a real fill. Refuse to settle against
-                # the optimistic placeholder — leave PENDING so the
-                # order-reconciliation job (D-LIVE-17) can land the actual
-                # fill first. reconcile_open_orders flips to outcome='CANCELLED'
-                # only when the CLOB reports the order CANCELLED/CANCELED/EXPIRED
-                # with zero fill. A live entry that stays OPEN forever, or whose
-                # status fetch is unreachable, would NOT auto-cancel and would
-                # re-skip here every cycle. In the current config this is bounded
-                # because live entries are FAK (the CLOB resolves them promptly
-                # to filled-or-cancelled). FIX 3 (2026-07-09): a row that DOES
-                # strand here past MAX_PENDING_SETTLE_AGE_S (unreachable order or
-                # a wedged reconciler) now escalates to CRITICAL like the
-                # unresolvable-market path above, instead of re-logging WARN and
-                # skipping forever with its bet_size stuck in the group cap. We
-                # do NOT auto-cancel: a real on-chain fill may just be un-priced.
+                # No reconciled fill yet. Do not settle against the
+                # placeholder; leave the row PENDING so order reconciliation
+                # can record the real fill first. reconcile_open_orders only
+                # cancels a row when the CLOB reports the order
+                # CANCELLED/CANCELED/EXPIRED with zero fill. Live entries are
+                # FAK, so the CLOB resolves them quickly; a row still stuck
+                # here after MAX_PENDING_SETTLE_AGE_S (order unreachable, or
+                # reconciler stuck) escalates to CRITICAL. Never
+                # auto-cancelled: a real fill may just be missing its price.
                 health, age_s = _live_pending_skip_health(now_ts, win_end)
                 message = (
                     f"LIVE row id={row['id']} has no reconciled fill "
@@ -428,17 +404,14 @@ def run_resolution_sweep(
                 skipped += 1
                 continue
             if live_price_f <= 0.0:
-                # FIX 2 (2026-07-09): the reconciler now persists
-                # live_filled_price on partial fills, but rows already stranded
-                # with size-but-no-price must still heal. Fall back to the taker
-                # price ACTUALLY PAID, already recorded on the row: prefer
-                # walked_vwap (multi-level VWAP), else fill_price (top-ask).
-                # Both are real prices paid. The legacy bet_size/live_filled_size
-                # inference is WRONG for a PARTIAL fill — bet_size is the
-                # INTENDED stake, not cash spent, so the ratio exceeds 1.0, is
-                # rejected, and the row skips forever (LIVE row 571). Keep the
-                # implied path only as a last resort when BOTH recorded prices
-                # are unusable.
+                # The reconciler records live_filled_price on partial fills,
+                # but older rows may have a size and no price. Fall back to the
+                # price actually paid that is already on the row: walked_vwap,
+                # else fill_price. Inferring price from bet_size /
+                # live_filled_size is wrong for a partial fill (bet_size is the
+                # intended stake, so the ratio exceeds 1.0 and is rejected), so
+                # that is only a last resort when neither recorded price is
+                # usable.
                 recorded_price: float | None = None
                 if walked is not None and float(walked) > 0.0:
                     recorded_price = float(walked)
@@ -465,11 +438,11 @@ def run_resolution_sweep(
                         row, live_size=live_size_f, cap_price=effective_fill
                     )
                     if implied_price is None:
-                        # FIX 3: no reconciled price AND no recorded price to fall
-                        # back on — escalate a genuinely stuck LIVE row past
-                        # MAX_PENDING_SETTLE_AGE_S to CRITICAL (bet_size stranded
-                        # in the group cap) instead of skipping forever. No
-                        # auto-cancel: a real fill may just be un-priced.
+                        # No reconciled price and no recorded price to fall
+                        # back on: escalate a row stuck past
+                        # MAX_PENDING_SETTLE_AGE_S to CRITICAL instead of
+                        # skipping forever. No auto-cancel: a real fill may
+                        # just be missing its price.
                         health, age_s = _live_pending_skip_health(now_ts, win_end)
                         message = (
                             f"LIVE row id={row['id']} has reconciled size but "
@@ -510,14 +483,12 @@ def run_resolution_sweep(
                         ),
                     )
             effective_fill = live_price_f
-            # Realized USD actually spent = shares * price-per-share.
+            # USD actually spent = shares * price per share.
             bet_size = live_size_f * live_price_f
-        # Per-bet P&L is cash-sized: bet_size is filled USD, while the
-        # venue payoff formula is per share. Convert cash to shares
-        # through effective_fill so a losing $10 bet loses $10 plus its
-        # entry-leg fee, not fill_price * $10. The ledger fill/VWAP is
-        # already the actual price paid, so do not apply the strategy
-        # slippage_haircut again here.
+        # PnL is cash-sized: bet_size is filled USD while the payoff formula is
+        # per share, so convert through effective_fill. A losing $10 bet then
+        # loses $10 plus its entry fee. The fill/VWAP is already the real price
+        # paid, so the strategy's slippage_haircut is not applied again.
         pnl_net = _graded_cash_pnl(side, effective_fill, won_up, bet_size)
         outcome = "WIN" if pnl_net > 0 else "LOSS"
 
@@ -542,11 +513,10 @@ def run_resolution_sweep(
         )
         settled += 1
 
-    # Reject re-quote telemetry: back-fill resolved_outcome (UP/DOWN) for
-    # rejected-FAK rows whose market has now settled. Uses the SAME Gamma
-    # resolution fetcher the ledger settlement uses (closed=true finds expired
-    # 5m markets Gamma otherwise hides). Observation only — never places an
-    # order; a failure here must not abort the ledger sweep.
+    # Reject re-quote telemetry: fill in resolved_outcome (UP/DOWN) for
+    # rejected FAK rows whose market has now settled, using the same Gamma
+    # fetcher as settlement (closed=true finds expired 5m markets). Observation
+    # only; a failure here must not abort the sweep.
     reject_requotes_resolved = 0
     if polymarket_resolution_fetch is not None:
         try:
@@ -562,17 +532,13 @@ def run_resolution_sweep(
         except Exception:  # noqa: BLE001 — telemetry backfill is best-effort
             logger.exception("reject_requote outcome backfill raised")
 
-    # Display-only backfill of the market outcome onto stop-closed rows. A
-    # stop-loss fill books the position outcome='CANCELLED' with a realized
-    # (round-trip) pnl_net the instant it fires, so the settlement loop above
-    # (WHERE outcome='PENDING') never touches it and its won_up / resolution
-    # price stay NULL — the market's actual outcome is unknown on the row. This
-    # pass fills ONLY the resolution display fields (won_up + resolution
-    # price/source); pnl_net, outcome, the exit_* columns, AND resolution_ts are
-    # NEVER touched (booked-once is sacred, and stamping resolution_ts would
-    # perturb capital.py's order-sensitive DD peak replay — see
-    # backfill_stop_loss_resolutions). Uses the SAME Gamma fetcher as ledger
-    # settlement; bounded per sweep, idempotent (won_up IS NULL), best-effort.
+    # Fill in the market outcome on stop-loss rows, for display. A stop-loss
+    # exit was booked as outcome='CANCELLED' with its realized pnl_net, so the
+    # settlement loop above never sees it and its won_up / resolution price
+    # stay NULL. This pass sets only won_up and resolution price/source;
+    # pnl_net, outcome, exit_* and resolution_ts are never touched (see
+    # backfill_stop_loss_resolutions). Bounded per sweep, idempotent (won_up IS
+    # NULL), best-effort.
     stop_resolutions_backfilled = 0
     if polymarket_resolution_fetch is not None:
         try:
@@ -584,18 +550,16 @@ def run_resolution_sweep(
         except Exception:  # noqa: BLE001 — display-only backfill is best-effort
             logger.exception("stop-loss resolution backfill raised")
 
-    # Disk hygiene: signals table grows ~12 rows/tick (one per non-qualifying
-    # coin × sleeve evaluation). At 1Hz this is ~1M rows/day; prune anything
-    # older than SIGNALS_RETENTION_DAYS on every sweep cycle so the disk gate
-    # never fires from observational rows alone.
+    # The signals table gets one row per non-qualifying evaluation, about a
+    # million rows a day at 1 Hz. Prune rows older than SIGNALS_RETENTION_DAYS
+    # on every sweep so observational rows never trip the disk gate.
     pruned = prune_signals(conn, retention_days=config.SIGNALS_RETENTION_DAYS, now_ts=now_ts)
-    # A6 hygiene: pipeline_health previously had NO retention; the A0
-    # stage='latency' trace rows make bounding it worthwhile.
+    # Bound pipeline_health too; the per-tick latency traces grow it quickly.
     pruned_health = prune_pipeline_health(
         conn, retention_days=config.PIPELINE_HEALTH_RETENTION_DAYS, now_ts=now_ts
     )
-    # B1 hygiene: per-offset scan latches (~130k rows/day when the
-    # sub-minute flag is on) — only ever consulted for the current window.
+    # Per-offset scan latches (~130k rows/day with sub-minute sleeves on); only
+    # the current window's latches are ever read.
     pruned_latches = prune_subminute_scan_latches(
         conn, retention_days=3, now_ts=now_ts
     )
@@ -620,42 +584,32 @@ def backfill_stop_loss_resolutions(
     now_ts: float,
     max_rows: int = 128,
 ) -> int:
-    """Backfill the market outcome onto stop-closed ledger rows — display only.
+    """Write the market outcome onto stop-loss ledger rows, for display only.
 
-    A successful stop-loss sell UPDATEs the SINGLE position row to
-    ``outcome='CANCELLED'`` with a realized round-trip ``pnl_net`` (booked
-    exactly once), and the F3 settlement sweep skips it because it predicates on
-    ``outcome='PENDING'``. As a result the market's actual resolution is never
-    recorded on the row: ``won_up`` and the resolution price stay NULL, so the
-    dashboard cannot show the "if held" counterfactual.
+    A stop-loss exit updated the position row to ``outcome='CANCELLED'`` with
+    its realized ``pnl_net``, and the settlement sweep skips non-PENDING rows,
+    so the market's actual result was never recorded: ``won_up`` and the
+    resolution price stay NULL and the dashboard cannot show the "if held"
+    result.
 
-    This pass fetches that resolution for EXPIRED stop rows and writes ONLY the
-    resolution display fields — ``won_up`` + ``resolution_price`` /
-    ``resolution_source`` + the ``polymarket_resolution_*`` mirror. It NEVER
-    touches ``pnl_net``, ``outcome``, or the ``exit_*`` columns; the booked-once
-    loss and its sacred invariants are untouched.
+    This pass fetches the resolution for expired stop-loss rows and writes only
+    ``won_up``, ``resolution_price`` / ``resolution_source`` and the
+    ``polymarket_resolution_*`` fields. It never touches ``pnl_net``,
+    ``outcome`` or the ``exit_*`` columns.
 
-    ``resolution_ts`` is left NULL here (defense in depth). capital.py replays
-    each wallet's equity curve in equity-change order to find the PEAK that gates
-    the LIVE drawdown halt + graduated brake (``get_wallet_snapshots`` /
-    ``get_capital_snapshot``); realized capital is order-independent but the peak
-    is NOT. A booked-once stop loss already realized its ``pnl_net`` at
-    ``exit_ts`` (before market resolution), so a stop row's equity-change moment
-    is ``exit_ts``, not ``resolution_ts``. The load-bearing fix is in capital.py:
-    its replay sort key (``_equity_change_sort_key``) keys stop rows on the
-    immutable ``exit_ts``, so the peak is invariant whether ``resolution_ts`` is
-    NULL or already backfilled — defending the gate at the consumer means no
-    writer here (or elsewhere) can perturb it. We still avoid stamping
-    resolution_ts so the two states stay visibly identical; the dashboard renders
-    the stop row off ``exit_kind`` + ``won_up`` and streams it every SSE delta
-    (``outcome != 'PENDING'``), so it never needs resolution_ts.
+    ``resolution_ts`` is left NULL. capital.py orders stop-loss rows by their
+    ``exit_ts`` when replaying equity for the drawdown peak
+    (``_equity_change_sort_key``), so the peak would not change either way, but
+    leaving it NULL keeps backfilled and untouched rows identical. The
+    dashboard shows stop rows from ``exit_kind`` and ``won_up`` and does not
+    need resolution_ts.
 
-    Discriminates strictly on ``exit_kind='stop_loss'`` so legacy voided
-    CANCELLED rows (cutover resets / orphan closes, ``exit_kind IS NULL``) are
-    left alone. Bounded to ``max_rows`` per sweep, idempotent (the ``won_up IS
-    NULL`` predicate excludes already-backfilled rows on both the SELECT and the
-    guarded UPDATE), and best-effort (a per-row fetch failure leaves the row for
-    a later sweep). The caller commits."""
+    Only rows with ``exit_kind='stop_loss'`` are touched, so voided CANCELLED
+    rows (``exit_kind IS NULL``) are left alone. At most ``max_rows`` per
+    sweep; idempotent (``won_up IS NULL`` on both the SELECT and the UPDATE);
+    best-effort (a failed fetch leaves the row for a later sweep). The caller
+    commits.
+    """
     try:
         rows = conn.execute(
             "SELECT id, coin, interval_min, window_start_ts "
@@ -696,11 +650,9 @@ def backfill_stop_loss_resolutions(
             if poly_result.up_price is not None
             else float(won_up)
         )
-        # Guarded UPDATE re-asserts the discriminator + idempotency predicate so
-        # a concurrent stop-book or a prior backfill can never be clobbered, and
-        # NO pnl_net/outcome/exit_*/resolution_ts column is in the SET list
-        # (resolution_ts stays NULL — defense in depth; capital.py already keys
-        # the DD peak replay on exit_ts for stop rows, see the docstring).
+        # The UPDATE repeats the exit_kind and won_up IS NULL conditions so it
+        # cannot overwrite a row changed in the meantime, and sets no pnl_net,
+        # outcome, exit_* or resolution_ts column.
         conn.execute(
             "UPDATE ledger SET won_up = ?, resolution_price = ?, "
             "resolution_source = ?, "
@@ -726,10 +678,11 @@ def prune_signals(
     retention_days: int,
     now_ts: float | None = None,
 ) -> int:
-    """Delete `signals` rows older than `retention_days`. Returns row count.
+    """Delete ``signals`` rows older than ``retention_days``; returns the
+    count.
 
-    Called by the F3 sweep cycle. Safe to invoke standalone; runs in its own
-    transaction so a partial sweep failure doesn't roll back the deletion.
+    Called by the sweep. Safe to call on its own; runs in its own transaction
+    so a later sweep failure does not roll back the delete.
     """
     import time as _time
     if retention_days <= 0:
@@ -754,22 +707,17 @@ def prune_pipeline_health(
     retention_days: int,
     now_ts: float | None = None,  # noqa: ARG001 — kept for call-site symmetry
 ) -> int:
-    """Delete `pipeline_health` rows older than `retention_days` (A6).
+    """Delete ``pipeline_health`` rows older than ``retention_days`` (<= 0
+    disables).
 
-    Called by the F3 sweep cycle; retention_days<=0 disables.
+    Unlike ``prune_signals`` the cutoff uses the database's own clock
+    (``datetime('now')``), because rows are stamped by that column default. A
+    synthetic ``now_ts`` (tests and backfills use future times) would otherwise
+    delete rows the same sweep just wrote.
 
-    Unlike `prune_signals`, the cutoff uses the DB's OWN clock
-    (``datetime('now')``), not the caller's ``now_ts``: pipeline_health rows
-    are stamped by the column default ``datetime('now')``, so a synthetic
-    ``now_ts`` (tests/backfills sweep with future timestamps) would compute a
-    future cutoff and delete rows the very same sweep just wrote. Retention
-    is a wall-clock policy — keep both sides on the same clock.
-
-    Scope (review finding): boot rows (config-sha generation log used for
-    post-hoc ledger attribution) and CRITICAL rows (dd_halt / breaker-trip
-    forensics) are EXEMPT — the retention exists for the high-volume
-    observational rows (stage='latency' traces, WARN spam), not the audit
-    trail that previously persisted forever.
+    Boot rows (the config-hash log used to attribute ledger rows) and CRITICAL
+    rows (drawdown halts, breaker trips) are kept; retention is for the
+    high-volume rows (latency traces, WARN noise).
     """
     if retention_days <= 0:
         return 0
@@ -787,15 +735,13 @@ def prune_subminute_scan_latches(
     retention_days: int,
     now_ts: float | None = None,
 ) -> int:
-    """Delete `subminute_scan_latches` rows for long-settled windows.
+    """Delete ``subminute_scan_latches`` rows for long-settled windows.
 
-    Review finding: with the sub-minute flag on, claim_subminute_scan
-    inserts ~130k latch rows/day and nothing deleted them — the exact
-    disk-creep class the A6 work fixes elsewhere. A latch is only ever
-    consulted for its own (current) window, so keying the cutoff on
+    With sub-minute sleeves on, claim_subminute_scan writes ~130k latch rows a
+    day. A latch is only read for its own window, so cutting off on
     ``window_start_ts`` (epoch seconds, caller clock) is exact and safe.
-    NOTE: ``subminute_fills`` is deliberately NOT pruned — ramp_state
-    enforces the rung-1 cumulative cap via a lifetime SUM over it.
+    ``subminute_fills`` is not pruned; the fill-rate breaker and the dashboard
+    read it.
     """
     import time as _time
     if retention_days <= 0:
@@ -810,5 +756,5 @@ def prune_subminute_scan_latches(
         )
         return int(cur.rowcount or 0)
     except sqlite3.OperationalError:
-        # Legacy DB that pre-dates the table and never booted the new code.
+        # Old database without the table.
         return 0

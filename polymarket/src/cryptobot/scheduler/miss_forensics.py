@@ -1,73 +1,63 @@
-"""On-chain miss forensics — WHY each venue-rejected FAK actually missed.
+"""On-chain miss forensics: why each venue-rejected FAK order missed.
 
-Operator order 2026-07-30: every missed trade (a venue `no_liquidity` FAK
-reject) must be classified from CHAIN evidence — a faster TAKER beat us to the
-resting ask, or the MAKER cancelled it — and the verdict must reach the
-dashboard. Book re-reads cannot answer this: `reject_requotes` only records
-what the book looked like ~1s LATER, so "the ask is gone" is equally
-consistent with traded-away and with pulled. That ambiguity is exactly what
-produced (and then refuted) the "68% maker-cancel" inference. The trade tape
-is the only witness that distinguishes them.
+Every missed trade (a ``no_liquidity`` FAK reject) is classified from chain
+evidence: either a faster taker took the resting ask, or the maker cancelled
+it. The verdict is shown on the dashboard. Re-reading the book cannot tell
+these apart: ``reject_requotes`` records the book about a second later, and
+"the ask is gone" fits both cases. Only the trade tape can.
 
-METHOD (productionizes the 2026-07-30 manual forensic, which classified 45/45)
+Method
 ----------------------------------------------------------------------------
-For each reject we know the exact token we sent (`live_order_attempts` carries
-`poly_token_id` / `poly_market_id` for the attempt — the recorder is tokenless
-and Gamma has purged these markets, so this join is the ONLY token source):
+For each reject we know the exact token we sent: ``live_order_attempts`` stores
+``poly_token_id`` / ``poly_market_id`` (Gamma purges these markets soon after
+they close, so this join is the only reliable source).
 
-  1. COMPLEMENT TOKEN. An ask on token T is the same liquidity as a bid on its
-     complement C, so a third party can consume it in TWO shapes. We resolve
-     the (Up, Down) token pair from ``clob.polymarket.com/markets/{condition}``
-     — the CLOB retains markets Gamma has purged.
+  1. Complement token. An ask on token T is the same liquidity as a bid on
+     its complement C, so a third party can take it in two ways. The
+     (Up, Down) pair comes from ``clob.polymarket.com/markets/{condition}``,
+     which keeps markets Gamma has purged.
 
-  2. MINT-MATCH RULE. A print counts as consuming OUR ask when it is either
-     a taker BUY of T at price p, or a taker SELL of C at 1-p. Testing only
-     one shape silently halves the evidence. Our own funder's prints are
-     excluded (a sibling attempt on the same window can fill).
+  2. Mint-match rule. A print consumed our ask if it is a taker BUY of T at
+     price p, or a taker SELL of C at 1-p. Checking only one shape misses
+     about half the evidence. Our own wallet's prints are excluded.
 
-  3. SETTLEMENT-LAG CORRECTION. data-api's `timestamp` IS the Polygon block
-     timestamp, and a block lands ~+3s AFTER the venue matched the order
-     (calibrated on 106 of our OWN fills: range +2..+4, median +3, never <=+1).
-     Our reject row is stamped after the CLOB round-trip. So a print seen at
-     tape dt corresponds to a VENUE MATCH at dt - lag relative to our arrival.
-     Skipping this correction reads every rival print as ~3s LATE and inverts
-     the verdict. The lag is re-calibrated from our own recent fills (see
-     :func:`calibrate_lag_s`) and the value used is persisted per row in
-     ``miss_forensics.lag_s_used`` so a historical verdict stays auditable
-     even after the constant moves.
+  3. Settlement-lag correction. data-api's ``timestamp`` is the Polygon block
+     time, which lands ~3s after the venue matched (calibrated on our own
+     fills: +2..+4s, median +3, never <= +1). Our reject is stamped after the
+     CLOB round trip. A print at tape dt therefore matched at dt - lag
+     relative to our arrival; without the correction every rival print looks
+     ~3s late and the verdict flips. The lag is re-calibrated from our recent
+     fills (:func:`calibrate_lag_s`) and stored per row in
+     ``miss_forensics.lag_s_used`` so old verdicts stay checkable.
 
-  4. LEVEL BAND. "At our level" is bounded on BOTH sides — from the ask we saw
-     up to our limit (+-0.5c). The upper bound is obvious (we would not pay
-     more); the lower bound is the one that is easy to omit and expensive to
-     omit, because a print far BELOW our ask is a different level of the book
-     (typically the mint-matched complement of a trade deep on the other side)
-     and counting it CONVICTS a miss that no speed could have won. See
-     :func:`level_band` for the measured cost of dropping it.
+  4. Level band. "At our level" is bounded on both sides: from the ask we saw
+     up to our limit (+-0.5c). The lower bound matters most: a print far below
+     our ask is a different level of the book, and counting it would blame a
+     miss on speed when no speed could have won. See :func:`level_band`.
 
-  5. VERDICTS, over venue-match dt in [-5s, +10s] of our reject:
-       * ``FASTER_TAKER``  — a print inside the level band: the quote was REAL
-                             and someone else took it.
-       * ``REPRICED_ONLY`` — prints exist, but all OUTSIDE the band: the level
-                             we wanted was never traded.
-       * ``MAKER_CANCEL``  — no print at all in the window: the resting order
-                             was withdrawn.
-       * ``PENDING``       — transient RPC/HTTP failure or budget exhaustion;
-                             retried on the next run.
-       * ``UNRESOLVED``    — the venue no longer exposes both tokens for this
-                             condition; terminal (nothing more to try).
+  5. Verdicts, over venue-match dt in [-5s, +10s] of our reject:
+       * ``FASTER_TAKER``:  a print inside the level band. The quote was real
+                            and someone else took it.
+       * ``REPRICED_ONLY``: prints exist but all outside the band. Our level
+                            never traded.
+       * ``MAKER_CANCEL``:  no print in the window. The resting order was
+                            withdrawn.
+       * ``PENDING``:       transient RPC/HTTP failure or budget exhausted;
+                            retried on the next run.
+       * ``UNRESOLVED``:    the venue no longer exposes both tokens for this
+                            condition; terminal.
 
-  6. RIVAL MAKER. For a FASTER_TAKER we fetch the beat-us print's receipt and
-     read the OrderFilled log's indexed `maker` topic — the owner of the
-     resting order we lost. The exchange address + OrderFilled topic0 are
-     GROUND-TRUTHED from our OWN recent fill receipts rather than hardcoded
-     (see :func:`derive_chain_signature`), so a venue contract migration
-     cannot silently produce zero matches.
+  6. Rival maker. For FASTER_TAKER we fetch the winning print's receipt and
+     read the OrderFilled log's indexed ``maker`` topic: the owner of the
+     order we lost. The exchange address and OrderFilled topic0 are derived
+     from our own fill receipts rather than hardcoded
+     (:func:`derive_chain_signature`), so a contract migration cannot
+     silently produce zero matches.
 
-The job is strictly off the decision path: it only ever reads `subminute_fills`
-/ `live_order_attempts` and writes `miss_forensics`. Every exception is
-swallowed with a WARN, the RPC/HTTP call counts are hard-capped per run, and a
-failed row simply stays PENDING for the next fire. Polymarket-only — the same
-core runs a predict.fun paper unit, whose tape is not on Polygon.
+The job never touches the decision path: it reads ``subminute_fills`` and
+``live_order_attempts`` and writes only ``miss_forensics``. Every exception is
+logged and swallowed, RPC/HTTP calls are capped per run, and a failed row stays
+PENDING for the next run.
 """
 
 from __future__ import annotations
@@ -104,8 +94,8 @@ RETRYABLE_VERDICTS = (VERDICT_PENDING,)
 #: A print within half a cent of the level band counts as "at our level" — the
 #: venue's own price strings carry more precision than the book we quoted off.
 PRICE_TOL = 0.005
-#: Stand-in gap between limit and ask when a legacy row recorded no quote_ask
-#: (live rows always do; the limit is the ask plus the anchored FAK pad).
+# Stand-in gap between limit and ask when an old row has no quote_ask (live
+# rows always have one; the limit is the ask plus the FAK pad).
 _ASK_FALLBACK = 0.01
 #: Venue-match dt window vs the reject, in seconds. Asymmetric on purpose: a
 #: print BEFORE us proves we lost the race, and a few seconds AFTER still
@@ -218,9 +208,9 @@ def collect_prints(
 ) -> list[ChainPrint]:
     """Lag-correct, mint-match and window-filter a raw data-api trade list.
 
-    Our own funder's prints are dropped: under multifill a sibling attempt on
-    the same window can genuinely fill, and counting our own fill as a rival
-    would manufacture a FASTER_TAKER out of our own success.
+    Our own wallet's prints are dropped: another of our attempts on the same
+    market can fill, and counting it as a rival would turn our own success into
+    a FASTER_TAKER.
     """
     own = str(funder or "").lower()
     out: list[ChainPrint] = []
@@ -259,27 +249,24 @@ def collect_prints(
 
 
 def level_band(limit_price: Any, quote_ask: Any) -> tuple[float, float]:
-    """The price band that IS "the ask we tried to take", inclusive.
+    """The price band that counts as "the ask we tried to take", inclusive.
 
-    BOUNDED ON BOTH SIDES, and the lower bound is the load-bearing half. The
-    upper bound is our limit: we would not have paid more. The LOWER bound is
-    the ask we actually saw, because a print far below it is a DIFFERENT level
-    of the book, not the resting order we lost — most often the mint-matched
-    complement leg of a trade deep on the other side.
+    Bounded on both sides, and the lower bound matters most. The upper bound is
+    our limit (we would not have paid more). The lower bound is the ask we
+    actually saw, because a print far below it is a different level of the
+    book, usually the mint-matched complement of a trade deep on the other
+    side.
 
-    Dropping the lower bound does not merely add noise, it systematically
-    CONVICTS: every deep print becomes "our level traded", so FASTER_TAKER
-    absorbs the REPRICED_ONLY and MAKER_CANCEL buckets. Measured on the 48
-    live rejects since the 5m re-enable, the unbounded rule returned 91.7%
-    FASTER_TAKER / 8.3% REPRICED / 0 MAKER_CANCEL, "convicting" on prints at
-    0.056 and 0.180 against limits of 0.810 and 0.850; the banded rule returns
-    the hand-verified 84% / 13% / 2%.
+    Dropping the lower bound does not just add noise, it biases every verdict
+    toward FASTER_TAKER. On 48 live rejects the unbounded rule gave 91.7%
+    FASTER_TAKER / 8.3% REPRICED / 0 MAKER_CANCEL, counting prints at 0.056 and
+    0.180 against limits of 0.810 and 0.850; the banded rule gives the
+    hand-checked 84% / 13% / 2%.
 
-    ``quote_ask`` may be NULL on an old row — fall back to a tick under the
-    limit (the limit is the ask plus the FAK pad). ``min(ask, limit)`` keeps the
-    band from inverting if a row ever recorded an ask above its own limit. The
-    tolerance is :data:`PRICE_TOL`, read here rather than threaded through the
-    caller: it is a property of the venue's price strings, not of a call site.
+    ``quote_ask`` may be NULL on an old row; then the band starts a tick under
+    the limit. ``min(ask, limit)`` keeps the band from inverting if a row ever
+    has an ask above its limit. The tolerance is :data:`PRICE_TOL`, a property
+    of the venue's price strings rather than of any caller.
     """
     lim = float(limit_price)
     ask = float(quote_ask) if quote_ask is not None else lim - _ASK_FALLBACK
@@ -454,14 +441,11 @@ def complement_of(token_id: str, pair: tuple[str, str]) -> Optional[str]:
 
 
 def make_fetch_json(client: Optional[Any] = None) -> Callable[..., Any]:
-    """The default transport, over a POOLED client when one is supplied.
+    """The default transport, using a pooled client when one is given.
 
-    Bare ``httpx.get``/``httpx.post`` construct a client per call — a fresh
-    TCP+TLS handshake and socket for every row (``execution/notify.py`` ~L47
-    documents the same anti-pattern and the fix). main.py hands in the
-    process-wide read client so this job rides its keep-alive pool. None (tests,
-    or a caller with no client) falls back to module-level httpx calls, which is
-    why the fallback exists at all.
+    Bare ``httpx.get``/``httpx.post`` open a new connection (TCP + TLS) per
+    call. main.py passes the process-wide read client so this job reuses its
+    keep-alive pool; with None (tests) it falls back to module-level httpx.
     """
     import httpx
 
@@ -491,21 +475,18 @@ def _http_status(exc: BaseException) -> Optional[int]:
 
 
 class _Budget:
-    """Hard per-run call caps + a shared rate limiter.
+    """Per-run call caps plus a shared rate limiter.
 
     A venue outage must cost this job a bounded number of calls and then stop,
-    leaving the remaining rows PENDING — never a retry storm against the same
-    endpoint the trading path depends on. Two counters, two caps: a call that
-    would exceed either raises :class:`_BudgetExhausted` and the batch stops.
+    leaving the rest PENDING, never a retry storm against endpoints the trading
+    path also uses. Two counters, two caps: a call that would exceed either
+    raises :class:`_BudgetExhausted` and the batch ends.
 
-    Pacing uses the codebase's own :class:`TokenBucket` rather than a retry sleep
-    ladder. That is the material difference: the ladder paced RETRIES ONLY (i.e.
-    only after something already failed) and did nothing about the steady rate,
-    while the bucket bounds the rate itself and honours a server 429 via
-    ``notify_server_429`` — the endpoints here are the SAME public data-api/CLOB
-    hosts the trading path reads, so an IP-level rate strike is a trading
-    outage. A transient failure is simply surfaced: the row is stored PENDING and
-    retried on the next fire (300s), which is the documented recovery path.
+    Pacing uses the shared :class:`TokenBucket`, which bounds the steady rate
+    and backs off on a server 429 via ``notify_server_429``. These are the same
+    public data-api/CLOB hosts the trading path reads, so an IP-level rate
+    limit would also stop trading. A transient failure just leaves the row
+    PENDING for the next run (every 300s).
     """
 
     def __init__(

@@ -1,17 +1,18 @@
-"""Parse `dry_run_recommended.json` into typed Sleeve dataclasses.
+"""Parse the strategy config JSON into typed Sleeve dataclasses.
 
-Each sleeve mirrors the `Config` shape in `backtest/optimize.py:80-110` but
-applies cryptobot's runtime overrides:
-  - `max_walk_price` is forcibly set to `config.MAX_WALK_PRICE` (R-NEW-4)
-  - `bankroll` is read from the JSON's top-level `bankroll` field and pinned
-    to the research backtest base; live sizing uses config.INITIAL_BANKROLL
+Runtime overrides applied on load:
+
+  - ``max_walk_price`` is always ``config.MAX_WALK_PRICE``;
+  - ``bankroll`` comes from the JSON's top-level ``bankroll`` (the backtest
+    base); live sizing uses config.INITIAL_BANKROLL.
 
 Refuses to start if:
-  - required fields are missing
-  - `sum(alloc)` exceeds 1.0 (over-allocation)
-  - `entry_minute_set` is empty
-  - the JSON's default `concurrent_exposure_cap_fraction` differs from
-    `config.SHARED_EXPOSURE_CAP` (D20 boot-time drift detection)
+
+  - required fields are missing;
+  - a sleeve's ``alloc`` exceeds 1.0;
+  - ``entry_minute_set`` is empty;
+  - the JSON's ``concurrent_exposure_cap_fraction`` differs from
+    ``config.SHARED_EXPOSURE_CAP`` (drift check).
 """
 
 from __future__ import annotations
@@ -31,7 +32,7 @@ _VALID_COINS: frozenset[str] = frozenset({"btc", "eth", "sol", "xrp"})
 
 @dataclass(frozen=True)
 class Sleeve:
-    """One sleeve's runtime config — direct port of the backtest's `Config`."""
+    """One sleeve's runtime config."""
 
     label: str
     alloc: float
@@ -48,21 +49,18 @@ class Sleeve:
     capital_frac: float
     max_walk_price: float    # OVERRIDDEN to config.MAX_WALK_PRICE
     slippage_haircut: float
-    # Retired-LUT coverage gate. Kept because it is a field of the DEPLOYED
-    # live artifact and is rendered by the dashboard sleeve panel
-    # (observability/snapshot_builder.py); nothing scores against it any more.
+    # A field of the deployed config that the dashboard's sleeve panel shows;
+    # nothing scores against it.
     min_lut_n: int
     signal_source: str       # always "hgb" since 2026-07-31
     hour_bucket_set: str
     dow_set: str
-    # Chunk-CV adds partial_ret_z gating on v6 (both null in current
-    # staging configs; runtime branch added in U4 of the deploy plan).
+    # Optional partial_ret_z gating bounds (null in the live config).
     partial_ret_z_floor: Optional[float] = None
     partial_ret_z_ceiling: Optional[float] = None
-    # HGB-sleeve fields. Declared optional because the dataclass predates the
-    # hgb-only era; the loader now REQUIRES the model-defining ones
-    # (threshold / feature_groups / ask_bucket) since every sleeve is hgb.
-    # The HGB scoring path (strategy/hgb_*) consumes them.
+    # Model fields. Optional in the dataclass, but the loader requires the ones
+    # that define the model (threshold, feature_groups, ask_bucket). Used by
+    # the scoring path.
     threshold: Optional[float] = None          # pred_edge >= threshold gate
     feature_groups: Optional[str] = None       # e.g. "rf,price,identity,time"
     ask_bucket: Optional[str] = None           # "name:lo:hi"
@@ -72,18 +70,14 @@ class Sleeve:
     stake_frac: Optional[float] = None         # forensic mirror of capital_frac
     max_bet_usd: Optional[float] = None
     max_bet_usd_by_coin: dict[str, float] = field(default_factory=dict)
-    # Per-coin stake MULTIPLIER (not a cap): scales the target notional per coin
-    # before the max-bet clamp. Mirrors the backtest portfolio's coin weights
-    # (e.g. {"BTC": 0.95, "ETH": 0.85, "XRP": 0.20}). Empty dict => uniform (1.0
-    # for every coin), so legacy sleeves are unaffected.
+    # Per-coin stake multiplier (not a cap): scales the target notional per
+    # coin before the max-bet clamp, like the backtest portfolio's coin
+    # weights. An empty dict means 1.0 for every coin.
     coin_stake_mult: dict[str, float] = field(default_factory=dict)
-    # B1/B2 sub-minute checkpoint add-on (checkpoint-grid combo port).
-    # Offsets in SECONDS from window open at which this sleeve may enter
-    # (e.g. step5 = 5,10,...,295 plus step1last = 270..299 for a 5m window).
-    # Empty (default) = a normal minute-boundary sleeve; non-empty makes
-    # this a sub-minute sleeve: entry qualification switches from
-    # entry_minute_set to these offsets, dedup/slots become per-offset, and
-    # the sleeve is dropped entirely at load time when
+    # Entry offsets in seconds from window open (e.g. 270..299 for the last 30s
+    # of a 5m window). Non-empty makes this a sub-minute sleeve: entries
+    # qualify on these offsets instead of entry_minute_set, dedup and slots are
+    # per offset, and the sleeve is dropped at load time when
     # config.SUBMINUTE_ENABLED is off.
     checkpoint_offset_set: tuple[int, ...] = ()
 
@@ -95,7 +89,7 @@ class Sleeve:
         return self.max_bet_usd
 
     def coin_stake_mult_for(self, coin: Optional[str] = None) -> float:
-        """Per-coin stake multiplier (1.0 if no weight is configured for it)."""
+        """Per-coin stake multiplier (1.0 if none is configured)."""
         if coin is not None and self.coin_stake_mult:
             return float(self.coin_stake_mult.get(str(coin).strip().upper(), 1.0))
         return 1.0
@@ -108,8 +102,8 @@ class Sleeve:
             * self.capital_frac
             * config.BET_SIZE_MULTIPLIER
         )
-        # Per-coin stake weight (e.g. BTC 0.95 / ETH 0.85 / XRP 0.20) BEFORE the
-        # max-bet clamp, matching the backtest portfolio's coin weighting.
+        # Apply the per-coin weight before the max-bet clamp, as the backtest
+        # does.
         target *= self.coin_stake_mult_for(coin)
         cap = self.max_bet_usd_for(coin)
         if cap is not None:
@@ -118,39 +112,32 @@ class Sleeve:
 
     @property
     def target_bet_size(self) -> float:
-        """USD notional per bet for this sleeve under the $100 backtest base."""
+        """USD notional per bet under the configured bankroll."""
         return self.target_bet_size_for(config.INITIAL_BANKROLL)
 
 
 @dataclass(frozen=True)
 class WalletGroup:
-    """One virtual exposure-cap group (D-LIVE-2 / D-LIVE-4).
+    """One virtual exposure-cap group.
 
-    The 2026-05-24 per-strategy LIVE deploy plan splits the single $200
-    Polymarket funder into two virtual $100 groups in software. The
-    `cap_usd` value is the static USD ceiling per group; the effective
-    cap shrinks proportionally at gate-evaluation time when the live
-    funder balance drops below `SUM(all_group_caps)` (D-LIVE-4 formula
-    lives in `execution/gates.py`, not the loader).
+    Splits a single Polymarket funder into groups in software. ``cap_usd`` is
+    the group's static USD ceiling; the gate shrinks it proportionally when the
+    live funder balance falls below the sum of all group caps (formula in
+    ``execution/gates.py``).
     """
 
     group_id: str
     members: tuple[str, ...]
     cap_usd: float
-    # Phase 5 (exp044 plan 2026-05-29-001 option B1): when True, the group's
-    # member wallets compound on ONE shared equity, share ONE drawdown halt,
-    # and share ONE exposure cap — faithful to exp044's single-wallet
-    # backtest. OPT-IN: default False so isolated wallets and non-shared
-    # groups (legacy lut/pairs/all_4 topologies) stay byte-for-byte unchanged.
+    # When True, the group's member wallets compound on one shared equity and
+    # share one drawdown halt and one exposure cap, as in a single-wallet
+    # backtest. Default False keeps wallets isolated.
     shared_equity: bool = False
-    # 2026-07-05 backtest-exposure mode: when True, the group's concurrent
-    # exposure ceiling TRACKS live equity (grows with the account) instead of
-    # the static ``cap_usd``, and the fixed funder-balance floor is retired so
-    # the 35% drawdown halt (``MAX_DRAWDOWN_HALT_FRAC``) is the SOLE risk stop —
-    # matching the backtest, which sizes/deploys on full equity and stops only
-    # at max-DD. ``cap_usd`` stays the display/fallback anchor. OPT-IN: default
-    # False keeps the fixed-cap topology (freeze floor + static ceiling)
-    # byte-for-byte unchanged. See ``funder_balance_floor_usd`` +
+    # When True, the group's exposure ceiling follows live equity instead of
+    # the static ``cap_usd``, and there is no fixed funder-balance floor, so
+    # the drawdown halt (``MAX_DRAWDOWN_HALT_FRAC``) is the only risk stop, as
+    # in the backtest. ``cap_usd`` remains the display value and fallback.
+    # Default False keeps the fixed cap. See ``funder_balance_floor_usd`` and
     # ``execution/gates.py:_gate_group_exposure``.
     cap_tracks_equity: bool = False
 
@@ -160,7 +147,7 @@ class WalletGroup:
 
 @dataclass(frozen=True)
 class V6Portfolio:
-    """Container for the loaded sleeves + the originating artifact fingerprint."""
+    """The loaded sleeves plus the config's fingerprint."""
 
     sleeves: tuple[Sleeve, ...]
     bankroll: float
@@ -171,17 +158,14 @@ class V6Portfolio:
     config_sha256: str
     run_id: str
     label_source: str = ""
-    # Per-strategy LIVE deploy plan §U3 (D-LIVE-2, D-LIVE-4).
+    # Exposure-cap groups and per-wallet default modes.
     wallet_groups: tuple[WalletGroup, ...] = ()
     wallet_default_modes: dict[str, str] = field(default_factory=dict)
 
     @property
     def market_sleeves(self) -> tuple[Sleeve, ...]:
-        """Every sleeve that can place a market order.
-
-        Identical to ``sleeves`` since the 2026-07-31 pair-sleeve retirement;
-        kept as the name seven call sites (db/connection, capital,
-        operator_control, snapshot_builder, main) already speak.
+        """Every sleeve that can place an order (the same as ``sleeves``;
+        several callers use this name).
         """
         return self.sleeves
 
@@ -197,12 +181,12 @@ class V6Portfolio:
         return float(value) if value is not None else None
 
     def wallet_group_for(self, wallet_id: str) -> Optional[str]:
-        """Resolve the group_id that owns `wallet_id`, or None if ungrouped.
+        """Return the group_id that owns ``wallet_id``, or None if ungrouped.
 
-        Used by `record_bet` to stamp the `wallet_group` column on every
-        ledger row + by `_gate_group_exposure` to read the group cap.
-        Backwards-compat: when `wallet_groups=()` (legacy artifact), every
-        lookup returns None and the group cap gate never fires.
+        ``record_bet`` uses it to stamp ``wallet_group`` on each ledger row,
+        and ``_gate_group_exposure`` to find the group cap. With no groups
+        configured, every lookup returns None and the group cap gate never
+        fires.
         """
         for group in self.wallet_groups:
             if group.has_member(wallet_id):
@@ -216,12 +200,11 @@ class V6Portfolio:
         return None
 
     def shared_equity_group_for(self, wallet_id: str) -> Optional[WalletGroup]:
-        """Return the `WalletGroup` owning `wallet_id` IF it is a
-        shared-equity group, else None (Phase 5).
+        """Return the ``WalletGroup`` owning ``wallet_id`` if it is a
+        shared-equity group, else None.
 
-        Isolated wallets, ungrouped wallets, and members of non-shared
-        groups (legacy lut/pairs/all_4) all return None — those callers
-        keep the per-wallet isolated semantics unchanged.
+        Isolated wallets, ungrouped wallets and members of non-shared groups
+        all return None and keep per-wallet accounting.
         """
         for group in self.wallet_groups:
             if group.shared_equity and group.has_member(wallet_id):
@@ -229,28 +212,22 @@ class V6Portfolio:
         return None
 
     def all_group_caps_sum_usd(self) -> float:
-        """SUM(cap_usd) across every group; denominator of the D-LIVE-4
-        proportional shrinkage formula."""
+        """Sum of cap_usd across groups; the denominator of the proportional
+        cap shrink.
+        """
         return sum(g.cap_usd for g in self.wallet_groups)
 
     def funder_balance_floor_usd(self) -> float:
         """Minimum funder balance the bot needs to keep operating.
 
-        Two topologies, two formulas:
-          * `wallet_groups`: SUM(cap_usd) — every group's cap must be
-            simultaneously fundable.
-          * isolated wallets (`wallet_groups=()`): SUM(per-wallet live
-            initial bankroll * exposure_cap_frac) — each wallet's max pending
-            exposure must be coverable concurrently. Correctness finding
-            #22 (CORR-006): previously this was always
-            `all_group_caps_sum_usd()`, so the all_4 isolated topology
-            (with empty wallet_groups) silently bypassed the
-            funder-balance gate. Now the isolated path computes a
-            structurally-equivalent floor.
+          * With ``wallet_groups``: the sum of cap_usd, so every group's cap is
+            fundable at once.
+          * With isolated wallets (no groups): the sum of each wallet's initial
+            bankroll * exposure_cap_frac, so every wallet's maximum pending
+            exposure is covered at once.
 
-        2026-07-05 backtest-exposure mode: a `cap_tracks_equity` group has no
-        fixed funder floor (35% DD is the sole stop), so it contributes 0 —
-        retiring the freeze while non-tracking groups keep their cap floor.
+        A ``cap_tracks_equity`` group contributes 0, since the drawdown halt is
+        its only stop.
         """
         if self.wallet_groups:
             return sum(
@@ -266,9 +243,10 @@ class V6Portfolio:
         return floor
 
     def default_mode_for(self, wallet_id: str) -> str:
-        """`wallet_default_modes` is consulted by `seed_wallet_modes` on
-        first boot to seed `wallet_mode_state`. Defaults to 'DRY' when the
-        wallet has no explicit entry — safest possible default."""
+        """Default mode for a wallet, used by ``seed_wallet_modes`` on first
+        boot to fill ``wallet_mode_state``. Wallets without an entry default
+        to 'DRY'.
+        """
         return self.wallet_default_modes.get(wallet_id, "DRY")
 
 
@@ -292,13 +270,11 @@ def _optional_float(
     lo: Optional[float] = None,
     hi: Optional[float] = None,
 ) -> Optional[float]:
-    """Read `cfg[key]` as Optional[float]. Absent or null → None.
+    """Read ``cfg[key]`` as Optional[float]; absent or null gives None.
 
-    Numeric values are coerced to float and (optionally) range-checked.
-    Strings or non-numeric types raise. Used for new chunk-CV fields
-    (partial_ret_z_floor/ceiling, max_combined_edge, fill-price bands)
-    that are null in some staging configs and need to remain Optional
-    in the dataclass.
+    Numbers are coerced to float and optionally range-checked; strings and
+    other types raise. For optional fields such as the partial_ret_z bounds and
+    fill-price bands.
     """
     if key not in cfg:
         return None
@@ -322,14 +298,11 @@ def _optional_float(
 
 
 def _parse_ask_bucket(raw: object, label: str) -> tuple[tuple[float, float], ...]:
-    """Parse an exp044 `ask_bucket` string into (lo, hi) range tuples.
+    """Parse an ``ask_bucket`` string into (lo, hi) range tuples.
 
-    Grammar mirrors `training.pmdata_target._parse_buckets` (relocated there
-    2026-08-01 from the deleted `training.residual_matrix`) and the equivalent
-    `training.pmdata_target._ask_bucket_ok`, which is what the live-scorer pool
-    build actually calls: `name:lo:hi`,
-    optionally `|`-joined for multiple ranges (exp044 uses a single range:
-    `all:0:1`, `mid:0.4:0.6`). Returns () for None so non-hgb sleeves are inert.
+    Grammar matches ``training.pmdata_target._parse_buckets`` and
+    ``_ask_bucket_ok``: ``name:lo:hi``, optionally ``|``-joined for several
+    ranges (e.g. ``all:0:1``). Returns () for None.
     """
     if raw is None:
         return ()
@@ -354,18 +327,17 @@ def _parse_ask_bucket(raw: object, label: str) -> tuple[tuple[float, float], ...
 def _parse_checkpoint_offsets(
     raw: object, label: str, interval_min: int
 ) -> tuple[int, ...]:
-    """Parse the optional ``checkpoint_offset_set`` sleeve key (B1/B2).
+    """Parse the optional ``checkpoint_offset_set`` sleeve key.
 
     Accepts either:
-      * a list of ints (explicit offsets in seconds), or
-      * a compact range-spec string ``"start:end:step[,start:end:step...]"``
-        with INCLUSIVE ends — e.g. the 5m step5+step1last grid is
-        ``"5:295:5,270:299:1"``.
 
-    Validation is fail-closed: every offset must satisfy
-    ``1 <= offset < interval_min*60`` (offset 0 is the window boundary —
-    that's the baseline sleeves' territory; >= interval end is a market
-    that no longer exists). Returns a sorted de-duplicated tuple.
+      * a list of ints (offsets in seconds), or
+      * a range string ``"start:end:step[,start:end:step...]"`` with inclusive
+        ends, e.g. ``"270:299:1"``.
+
+    Every offset must satisfy ``1 <= offset < interval_min*60`` (0 is the
+    window boundary; anything at or past the interval end is a closed market).
+    Returns a sorted, de-duplicated tuple.
     """
     if raw is None:
         return ()
@@ -436,20 +408,16 @@ def _parse_sleeve(raw: dict) -> Sleeve:
     if alloc_raw is None or not isinstance(alloc_raw, (int, float)) or alloc_raw <= 0:
         raise ValueError(f"v6_loader: sleeve {label!r} alloc must be positive")
     if float(alloc_raw) > 1.0 + 1e-9:
-        # Under per-strategy isolated wallets each sleeve's alloc is its
-        # standalone portfolio scale (e.g. all_4 scale_v6_5m=0.842), so the
-        # old shared-bankroll `sum(alloc) <= 1` semantic is dead. Per-sleeve
-        # values are still capped at 1.0 — anything above means the operator
-        # would size > 100% of the wallet realized capital per bet before
-        # multiplying by capital_frac, which is almost certainly a typo.
+        # Each sleeve's alloc is its own scale, so there is no ``sum(alloc) <=
+        # 1`` rule, but a single value above 1.0 would size more than 100% of
+        # the wallet per bet before capital_frac and is almost certainly a
+        # typo.
         raise ValueError(
             f"v6_loader: sleeve {label!r} alloc={alloc_raw} exceeds 1.0"
         )
 
-    # 2026-07-31 (exp044 phase 2): the lut|rf|blend scorers went with the
-    # decision_table/LUT chain, so "hgb" is the ONLY servable signal_source.
-    # A legacy artifact is now rejected at boot rather than parsed into a
-    # sleeve nothing can score.
+    # "hgb" is the only supported signal_source; anything else is rejected at
+    # boot rather than loaded as a sleeve nothing can score.
     signal_source = str(_required(cfg, "signal_source", label))
     if signal_source != "hgb":
         raise ValueError(
@@ -458,8 +426,8 @@ def _parse_sleeve(raw: dict) -> Sleeve:
             "with the pair sleeves on 2026-07-31)"
         )
 
-    # Model-defining keys. Required, so a sleeve can never silently run
-    # without features (fail-closed).
+    # Model-defining keys are required, so a sleeve can never run without
+    # features.
     feature_groups = cfg.get("feature_groups")
     if feature_groups is not None and not isinstance(feature_groups, str):
         raise ValueError(f"v6_loader: sleeve {label!r} feature_groups must be a string")
@@ -492,9 +460,9 @@ def _parse_sleeve(raw: dict) -> Sleeve:
                 f"v6_loader: sleeve {label!r} max_bet_usd_by_coin[{coin_key}] must be >= 0"
             )
         max_bet_usd_by_coin[coin_key] = float(value)
-    # Per-coin stake MULTIPLIER (scales the notional, not a cap). Fail-closed,
-    # same validation as max_bet_usd_by_coin so a typo'd coin key raises rather
-    # than silently falling back to 1.0.
+    # Per-coin stake multiplier (scales the notional, not a cap). Validated
+    # like max_bet_usd_by_coin, so a mistyped coin key raises instead of
+    # defaulting to 1.0.
     raw_coin_stake_mult = cfg.get("coin_stake_mult", {})
     if raw_coin_stake_mult is None:
         raw_coin_stake_mult = {}
@@ -513,12 +481,10 @@ def _parse_sleeve(raw: dict) -> Sleeve:
             raise ValueError(
                 f"v6_loader: sleeve {label!r} coin_stake_mult[{coin_key}] must be >= 0"
             )
-        # Symmetric ceiling: coin_stake_mult scales target notional BEFORE the
-        # max-bet clamp (target_bet_size_for), and the live artifact ships no
-        # per-coin cap (max_bet_usd_by_coin: {}), so a fat-finger like 10
-        # instead of 1.0 would place a 10x-oversized real-money bet with no
-        # backstop. Backtest portfolio weights are all <= 1.0, so cap at 1.0
-        # to fail closed at boot — mirrors the alloc guard above.
+        # Cap at 1.0: the multiplier applies before the max-bet clamp and the
+        # live config has no per-coin cap, so a typo like 10 instead of 1.0
+        # would place a 10x bet with nothing to stop it. Backtest weights are
+        # all <= 1.0.
         if float(value) > 1.0 + 1e-9:
             raise ValueError(
                 f"v6_loader: sleeve {label!r} coin_stake_mult[{coin_key}]={value} "
@@ -535,9 +501,8 @@ def _parse_sleeve(raw: dict) -> Sleeve:
             raise ValueError(f"v6_loader: hgb sleeve {label!r} requires a threshold")
         if not ask_bucket_ranges:
             raise ValueError(f"v6_loader: hgb sleeve {label!r} requires an ask_bucket")
-        # HGB may intentionally leave book_consumption_max null for the
-        # edge-preserving top-up regime: the walker stops on realized VWAP
-        # edge instead of a fixed depth-consumption fraction.
+        # book_consumption_max may be null: the edge-preserving walker then
+        # stops on realized VWAP edge instead of a fixed depth fraction.
 
     max_edge_val = float(_required(cfg, "max_edge", label))
 
@@ -555,7 +520,7 @@ def _parse_sleeve(raw: dict) -> Sleeve:
         max_fill_price=float(_required(cfg, "max_fill_price", label)),
         min_agreement=int(_required(cfg, "min_agreement", label)),
         capital_frac=float(_required(cfg, "capital_frac", label)),
-        # R-NEW-4: override the JSON's max_walk_price with config.MAX_WALK_PRICE.
+        # Always use config.MAX_WALK_PRICE, not the JSON's value.
         max_walk_price=config.MAX_WALK_PRICE,
         slippage_haircut=float(_required(cfg, "slippage_haircut", label)),
         min_lut_n=int(_required(cfg, "min_lut_n", label)),
@@ -621,20 +586,18 @@ def _parse_wallet_float_map(
 def _parse_wallet_groups(
     raw: object, *, valid_wallet_ids: set[str]
 ) -> tuple[WalletGroup, ...]:
-    """Parse the new `wallet_groups` top-level field (D-LIVE-2, D-LIVE-4).
+    """Parse the optional ``wallet_groups`` top-level field.
 
-    Backwards-compat:
-      * `raw is None` (legacy artifact) → empty tuple. Every wallet is
-        ungrouped; `wallet_group_for()` returns None and the group cap
-        gate never fires.
-      * The new shape is `{group_id: {"members": [...], "cap_usd": N}}`
-        per D-LIVE-24 (flat cap_usd, no `bankroll × cap_frac` fraction).
+      * ``raw is None`` -> empty tuple: every wallet is ungrouped,
+        ``wallet_group_for()`` returns None and the group cap gate never fires.
+      * Shape: ``{group_id: {"members": [...], "cap_usd": N}}``.
 
     Validation:
-      * Every member must be a known wallet_id.
-      * Every wallet appears in at most ONE group.
-      * `cap_usd > 0`.
-      * `group_id` must be a non-empty string.
+
+      * every member must be a known wallet_id;
+      * each wallet appears in at most one group;
+      * ``cap_usd > 0`` (unless ``cap_tracks_equity``);
+      * ``group_id`` is a non-empty string.
     """
     if raw is None:
         return ()
@@ -673,18 +636,18 @@ def _parse_wallet_groups(
             seen_members.add(m)
             members.append(m)
 
-        # 2026-07-05: opt-in backtest-exposure flag. Absent → False (fixed cap).
+        # Optional; absent means a fixed cap.
         cap_tracks_equity_raw = body.get("cap_tracks_equity", False)
         if not isinstance(cap_tracks_equity_raw, bool):
             raise ValueError(
                 f"v6_loader: wallet_groups.{group_id}.cap_tracks_equity must be a bool"
             )
 
-        # cap_usd is REQUIRED (> 0) for a fixed-cap group. Under
-        # cap_tracks_equity it is OPTIONAL: the concurrent-exposure ceiling IS
-        # live equity (nothing hardcoded), so cap_usd is only the fail-closed
-        # fallback used if the balance fetch fails — absent → 0.0, which blocks
-        # placement (and funder_balance_unknown also fires on that tick).
+        # cap_usd is required (> 0) for a fixed-cap group. With
+        # cap_tracks_equity it is optional: the ceiling is live equity, and
+        # cap_usd is only the fallback if the balance fetch fails. Absent means
+        # 0.0, which blocks placement (and funder_balance_unknown fires on that
+        # tick).
         cap_raw = body.get("cap_usd")
         if cap_tracks_equity_raw:
             cap_usd = (
@@ -703,7 +666,7 @@ def _parse_wallet_groups(
                     f"v6_loader: wallet_groups.{group_id}.cap_usd must be > 0"
                 )
 
-        # Phase 5: opt-in shared-equity flag. Absent (legacy artifacts) → False.
+        # Optional; absent means False.
         shared_equity_raw = body.get("shared_equity", False)
         if not isinstance(shared_equity_raw, bool):
             raise ValueError(
@@ -726,11 +689,11 @@ def _parse_wallet_groups(
 def _parse_wallet_default_modes(
     raw: object, *, valid_wallet_ids: set[str]
 ) -> dict[str, str]:
-    """Parse the new `wallet_default_modes` top-level field (D-LIVE-1).
+    """Parse the optional ``wallet_default_modes`` top-level field.
 
-    Backwards-compat: `raw is None` (legacy artifact) → empty dict, and
-    `seed_wallet_modes` defaults every wallet to DRY. Keys outside
-    `valid_wallet_ids` are rejected to catch typos at boot.
+    ``raw is None`` gives an empty dict, and ``seed_wallet_modes`` then
+    defaults every wallet to DRY. Unknown wallet ids are rejected to catch
+    typos at boot.
     """
     if raw is None:
         return {}
@@ -755,28 +718,20 @@ def _parse_wallet_default_modes(
 
 
 def _canonical_json_sha256(data: object) -> str:
-    """sha256 of a canonical-JSON re-serialization of the artifact.
-
-    Canonical = sorted keys + compact separators. Lets the operator detect
-    silent swaps that preserved the file mtime but changed the content.
-
-    Takes the ALREADY-PARSED ``data`` object (not raw bytes) so the
-    fingerprint provably describes the exact object that built the
-    portfolio — the previous re-parse of raw_bytes was a redundant second
-    json.loads that could, in principle, diverge from the parse that built
-    the sleeves. The resulting hash value is byte-identical to before.
+    """sha256 of the config re-serialized as canonical JSON (sorted keys,
+    compact separators), so a changed file is detectable even if its mtime
+    was kept. Hashes the already-parsed ``data``, so the fingerprint
+    describes exactly the object that built the portfolio.
     """
     canon = json.dumps(data, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(canon).hexdigest()
 
 
 def load_sleeves(path: Path | str | None = None) -> V6Portfolio:
-    """Read `dry_run_recommended.json` and build the portfolio.
+    """Read the strategy config and build the portfolio.
 
-    Returns a `V6Portfolio` whose `sleeves` order matches the JSON order
-    (v6_5m first, v6_15m second). The `config_sha256` is logged at boot
-    via `pipeline_health` (U14) so post-hoc analysis can attribute ledger
-    rows to a specific config generation.
+    Sleeves keep the JSON's order. ``config_sha256`` is logged at boot in
+    ``pipeline_health`` so ledger rows can be traced to a config version.
     """
     p = Path(path) if path is not None else config.V6_CONFIG_PATH
     raw_bytes = p.read_bytes()
@@ -787,30 +742,20 @@ def load_sleeves(path: Path | str | None = None) -> V6Portfolio:
         raise ValueError(f"v6_loader: {p} missing non-empty 'sleeves' list")
 
     sleeves = tuple(_parse_sleeve(s) for s in sleeves_raw)
-    # Per-strategy isolated wallets: each sleeve's `alloc` is its standalone
-    # portfolio scale (all_4: v6_5m=0.842, v6_15m=0.676). The legacy
-    # `sum(alloc) <= 1.0` guard assumed sleeves shared one bankroll and is
-    # no longer meaningful — the per-sleeve `alloc <= 1.0` check inside
-    # `_parse_sleeve` is the live invariant. See deploy plan U1.
 
-    # B2 flag-gating: sub-minute checkpoint sleeves ship in the artifact but
-    # are dropped ENTIRELY when config.SUBMINUTE_ENABLED is off — the
-    # baseline portfolio then behaves exactly like the pre-port bot (no
-    # extra wallets, groups, caps, or signal rows). The dropped labels are
-    # stripped from every wallet-scoped raw map BEFORE parsing so the
-    # fail-closed "unknown wallet id" validation keeps protecting the
-    # remaining config. NOTE: config_sha256 is computed over the EFFECTIVE
-    # (post-drop) config — flag-on and flag-off deploys attribute ledger
-    # rows to distinct shas, which is the honest behavior.
+    # Sub-minute sleeves are dropped entirely when config.SUBMINUTE_ENABLED is
+    # off. Their labels are removed from every wallet-keyed map before parsing,
+    # so the "unknown wallet id" check still guards the rest of the config.
+    # config_sha256 is computed over the effective (post-drop) config, so
+    # flag-on and flag-off runs record different hashes.
     if not config.SUBMINUTE_ENABLED:
         _dropped = {s.label for s in sleeves if s.checkpoint_offset_set}
         if _dropped:
             sleeves = tuple(s for s in sleeves if s.label not in _dropped)
             if not sleeves:
-                # v2 step1last ships a checkpoint-ONLY config (no baseline
-                # minute sleeves). With SUBMINUTE_ENABLED off every sleeve is
-                # dropped and there is nothing to run — fail CLOSED with an
-                # actionable message rather than booting an empty portfolio.
+                # The config holds only sub-minute sleeves, so with
+                # SUBMINUTE_ENABLED off nothing would run. Fail with a clear
+                # message instead of booting empty.
                 raise ValueError(
                     "v6_loader: every sleeve is a sub-minute checkpoint sleeve "
                     "and CRYPTOBOT_SUBMINUTE_ENABLED is off — nothing to run. "
@@ -845,9 +790,8 @@ def load_sleeves(path: Path | str | None = None) -> V6Portfolio:
                         else:
                             _groups_raw.pop(_gid)
 
-    # 2026-07-31: `pair_sleeves` is no longer parsed at all — the pair
-    # candidate/commit path is gone. A legacy artifact that still carries a
-    # NON-EMPTY list is rejected rather than silently running half a strategy.
+    # ``pair_sleeves`` is not supported; a config with a non-empty list is
+    # rejected rather than running half a strategy.
     pair_sleeves_raw = data.get("pair_sleeves") or []
     if pair_sleeves_raw:
         raise ValueError(
@@ -898,10 +842,8 @@ def load_sleeves(path: Path | str | None = None) -> V6Portfolio:
             f"config.MAX_DRAWDOWN_HALT_FRAC={config.MAX_DRAWDOWN_HALT_FRAC}"
         )
 
-    # Per-strategy LIVE plan §U3 (D-LIVE-2, D-LIVE-4): wallet_groups +
-    # wallet_default_modes are additive on the artifact. Legacy artifacts
-    # without these fields parse cleanly — wallet_groups defaults to ()
-    # and the group cap gate never fires.
+    # wallet_groups and wallet_default_modes are optional; without them every
+    # wallet is ungrouped and the group cap gate never fires.
     wallet_groups = _parse_wallet_groups(
         data.get("wallet_groups"), valid_wallet_ids=wallet_ids
     )
