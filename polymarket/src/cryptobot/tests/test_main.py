@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from cryptobot.tests._artifact_skips import needs_twap_model
 
 
 @pytest.fixture(autouse=True)
@@ -25,6 +26,7 @@ def test_main_importable():
     from cryptobot.main import main  # noqa: F401
 
 
+@needs_twap_model
 def test_main_once_smoke(tmp_path: Path, monkeypatch):
     """Boot + run one tick + exit. Spot fetch may fail offline; boot must
     survive that (TickRunner catches per-tick errors).
@@ -43,6 +45,7 @@ def test_main_once_smoke(tmp_path: Path, monkeypatch):
     assert rc == 0
 
 
+@needs_twap_model
 def test_main_once_with_sse_publisher_exits_cleanly(tmp_path: Path, monkeypatch):
     """Latency item #1: the SSE publish runs on a dedicated daemon publisher
     thread (latest-wins depth-1 queue) instead of inline in on_tick. This
@@ -78,6 +81,7 @@ def test_main_once_with_sse_publisher_exits_cleanly(tmp_path: Path, monkeypatch)
             assert not t.is_alive(), "publisher must stop on shutdown"
 
 
+@needs_twap_model
 def test_main_once_notify_dispatcher_exits_cleanly(tmp_path: Path, monkeypatch):
     """Latency finding (stop-fill notify / venue-degradation alert): _notify
     enqueues to a bounded daemon dispatcher instead of running send_event's
@@ -164,6 +168,7 @@ def test_boot_refuses_remote_bind_without_remote_opt_in(tmp_path: Path, monkeypa
     assert rc == 1
 
 
+@needs_twap_model
 def test_boot_writes_partial_ret_warmup_warn_row(tmp_path: Path, monkeypatch):
     """Review-pass #25 closeout: a single pipeline_health WARN at boot
     distinguishes the ~30-min warmup window (100% SKIP:no_feature
@@ -241,6 +246,7 @@ def test_boot_refuses_invalid_poly_signature_topology(
     set_config(None)
 
 
+@needs_twap_model
 def test_boot_allows_sig_zero_without_funder(tmp_path: Path, monkeypatch):
     """SIG=0 (EOA) with empty POLY_FUNDER is the dev/on-chain trader path
     and must boot cleanly — the funder is auto-derived from the private
@@ -302,6 +308,7 @@ def test_boot_writes_critical_row_on_unknown_relayer_url(
     assert rows, "expected CRITICAL boot row when relayer_url is not known"
 
 
+@needs_twap_model
 def test_unknown_relayer_url_override_allows_boot(
     tmp_path: Path, monkeypatch
 ):
@@ -329,6 +336,7 @@ def test_unknown_relayer_url_override_allows_boot(
     assert rc == 0
 
 
+@needs_twap_model
 def test_boot_survives_orphan_reconcile_db_exception(
     tmp_path: Path, monkeypatch, caplog
 ):

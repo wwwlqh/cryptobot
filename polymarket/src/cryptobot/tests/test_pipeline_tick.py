@@ -32,7 +32,7 @@ from cryptobot.execution.pipeline import (
 from cryptobot.scheduler.book_prefetch import BookPrefetcher, BookSourceChain
 from cryptobot.strategy.partial_ret import PartialRetEngine
 from cryptobot.tests._fixtures import seed_for_tests
-from cryptobot.tests._stub_scorer import install_fake_scorer
+from cryptobot.tests._stub_scorer import engine_window_open, install_fake_scorer
 from cryptobot.strategy.score import ScoreResult
 from cryptobot.strategy.portfolio_loader import V6Portfolio
 
@@ -1208,11 +1208,10 @@ def _live_subminute_tick(
             lut_n_cum=0,
             partial_ret_z_1h=0.1,
             skip_reason=None,
-            orb_range_ret=0.01,
-            orb_entry_ret=0.01,
         )
 
-    monkeypatch.setattr(pipeline, "score_cell_hgb", score_fn or _default_score)
+    monkeypatch.setattr(pipeline, "_score_cell_for", score_fn or _default_score)
+    monkeypatch.setattr(pipeline, "_window_open_price", engine_window_open)
 
     eng = PartialRetEngine()
     for coin, spot in stub.spot_data.items():
@@ -1229,8 +1228,6 @@ def _live_subminute_tick(
         fetch_market=_blow_up_market if blow_up_on_fetch else stub.fetch_market,
         fetch_book=_blow_up_book if blow_up_on_fetch else stub.fetch_book,
         get_disk_free_mb=stub.disk_free,
-        checkpoint_rf_artifact=SimpleNamespace(model_sha1="live"),
-        checkpoint_hgb_artifact=SimpleNamespace(),
         book_prefetch=(
             SimpleNamespace(
                 note_tokens=lambda _t: None,

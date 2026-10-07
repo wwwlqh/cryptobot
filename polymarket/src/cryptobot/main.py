@@ -43,7 +43,6 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from cryptobot.strategy.hgb_loader import HgbArtifact
     from cryptobot.strategy.partial_ret import PartialRetEngine
-    from cryptobot.strategy.rf_loader import RfArtifact
 
 logger = logging.getLogger(__name__)
 
@@ -67,8 +66,6 @@ def _build_deps_factory(
     clob_client: httpx.Client,
     order_client: Optional[object] = None,
     notify: Optional[Callable[..., None]] = None,
-    checkpoint_rf: Optional["RfArtifact"] = None,
-    checkpoint_hgb: Optional["HgbArtifact"] = None,
     twap_hgb: Optional["HgbArtifact"] = None,
     twap_mirror: Optional[object] = None,
     live_balance_fetcher: Optional[Callable[[], Optional[float]]] = None,
@@ -123,8 +120,6 @@ def _build_deps_factory(
             get_disk_free_mb=_disk_free_mb,
             order_client=order_client,
             notify=notify,
-            checkpoint_rf_artifact=checkpoint_rf,
-            checkpoint_hgb_artifact=checkpoint_hgb,
             twap_hgb_artifact=twap_hgb,
             twap_mirror=twap_mirror,
             # A3 latency: cached balance (BalanceCache.get) — zero network
@@ -321,8 +316,6 @@ def main(argv: list[str] | None = None) -> int:
     from cryptobot.scheduler.tick import TickRunner, start_scheduler
     from cryptobot.scheduler.resolution_sweep import run_resolution_sweep
     from cryptobot.strategy.partial_ret import PartialRetEngine
-    from cryptobot.strategy.hgb_loader import validate_sleeves_against_manifest
-    from cryptobot.strategy.rf_loader import warm_step_luts
     from cryptobot.strategy.portfolio_loader import load_sleeves
 
     # Step 2: DB
@@ -562,97 +555,39 @@ def main(argv: list[str] | None = None) -> int:
 
     # Step 6: model artifacts (boot-blocking).
     #
-    # 2026-07-31 (exp044 phase 2): the baseline rf_v1 joblib and the
-    # decision_table LUT are NO LONGER loaded. The pair sleeves that consumed
-    # the LUT and the lut|rf|blend scorer that consumed rf_v1 are gone, so both
-    # were pure boot cost (rf_v1 alone is 62 MB). checkpoint_v1 below is the
-    # only scoring artifact.
-    #
-    # Fail-closed: the runtime sleeves' serve-time bet-selection knobs
-    # (threshold / ask_bucket / book_consumption_max / side_filter) are not
-    # baked into the joblib pipeline, so a config typo would otherwise pass
-    # every boot check and serve a band the backtest never validated
-    # (alignment finding #4). Assert they match the manifest the model was
-    # selected on — since the 2026-07-31 exp044 retirement every hgb sleeve is
-    # served by checkpoint_v1, so the CHECKPOINT manifest is the one contract
-    # (a baseline minute-entry hgb sleeve is rejected outright in there).
-    if any(s.signal_source == "hgb" for s in portfolio.sleeves):
-        if config.TWAP_SYMMETRIC_ENABLED:
-            from cryptobot.strategy.twap_loader import (
-                validate_twap_coin_universe,
-                validate_twap_sleeves,
-            )
+    # The sleeves' serve-time selection knobs (threshold, ask band, book
+    # consumption, side filter) are not baked into the model file, so a config
+    # typo would otherwise pass every boot check. Refuse to boot unless they
+    # match the manifest the model was selected on.
+    from cryptobot.strategy.twap_loader import (
+        load_twap_symmetric_model,
+        validate_twap_coin_universe,
+        validate_twap_sleeves,
+    )
 
-            twap_manifest = json.loads(
-                Path(config.TWAP_SYMMETRIC_MANIFEST_PATH).read_text(
-                    encoding="utf-8"
-                )
-            )
-            validate_twap_sleeves(portfolio.sleeves, twap_manifest)
-            live_contract = json.loads(
-                Path(config.V6_CONFIG_PATH).read_text(encoding="utf-8")
-            )
-            configured_coins = {
-                str(coin).upper()
-                for coin in live_contract.get("coin_universe", [])
-            }
-            validate_twap_coin_universe(
-                config.COINS, configured_coins, twap_manifest
-            )
-        else:
-            checkpoint_manifest = json.loads(
-                Path(config.CHECKPOINT_MANIFEST_PATH).read_text(encoding="utf-8")
-            )
-            validate_sleeves_against_manifest(
-                portfolio.sleeves, checkpoint_manifest
-            )
-    # checkpoint_v1: per-checkpoint-second RF + HGB for the sub-minute sleeves
-    # (2026-07-05 parity fix). Loaded ONLY when a checkpoint sleeve exists — the
-    # v6 loader drops those sleeves unless SUBMINUTE_ENABLED, so the baseline
-    # deploy never loads or depends on the artifact. Fail-closed at boot.
-    checkpoint_rf = None
-    checkpoint_hgb = None
-    twap_hgb = None
-    if config.TWAP_SYMMETRIC_ENABLED:
-        from cryptobot.strategy.twap_loader import load_twap_symmetric_model
+    twap_manifest = json.loads(
+        Path(config.TWAP_SYMMETRIC_MANIFEST_PATH).read_text(encoding="utf-8")
+    )
+    validate_twap_sleeves(portfolio.sleeves, twap_manifest)
+    live_contract = json.loads(Path(config.V6_CONFIG_PATH).read_text(encoding="utf-8"))
+    configured_coins = {
+        str(coin).upper() for coin in live_contract.get("coin_universe", [])
+    }
+    validate_twap_coin_universe(config.COINS, configured_coins, twap_manifest)
+    twap_hgb = load_twap_symmetric_model()
+    logger.info("TWAP model loaded for both intervals")
 
-        twap_hgb = load_twap_symmetric_model()
-        logger.info(
-            "TWAP symmetric trend scorer armed for both intervals "
-            "(exact RTDS boundary anchors required)"
-        )
-    elif any(getattr(s, "checkpoint_offset_set", ()) for s in portfolio.sleeves):
-        from cryptobot.strategy.checkpoint_loader import load_checkpoint_models
-        checkpoint_rf, checkpoint_hgb = load_checkpoint_models()
-        logger.info(
-            "checkpoint_v1 loaded (%d RF slices) for sub-minute sleeves",
-            len(checkpoint_rf.estimators),
-        )
-    # 2026-07-25 latency audit: build the exact step-function LUTs for the
-    # univariate checkpoint RF forests on a daemon thread. score_cell_hgb calls
-    # predict_proba once per cell (~5.3 cells/tick) — measured ~36ms of every
-    # order tick. Slices serve the unchanged sklearn path until their LUT
-    # lands, so this is non-blocking and fail-safe.
-    if config.RF_STEP_LUT_ENABLED:
-        if checkpoint_rf is not None:
-            warm_step_luts(checkpoint_rf)
-    else:
-        logger.info("RF step-LUT DISABLED (CRYPTOBOT_RF_STEP_LUT=0) — sklearn path")
     partial_ret_engine = PartialRetEngine()
-    twap_mirror = None
-    if config.TWAP_SYMMETRIC_ENABLED:
-        from cryptobot_polymarket.price_to_beat import fetch_price_to_beat
-        from cryptobot_polymarket.twap_mirror import ChainlinkTwapRtdsMirror
+    # Chainlink TWAP mirror: the opening price each window settles against.
+    from cryptobot_polymarket.price_to_beat import fetch_price_to_beat
+    from cryptobot_polymarket.twap_mirror import ChainlinkTwapRtdsMirror
 
-        twap_mirror = ChainlinkTwapRtdsMirror(
-            url=config.TWAP_RTDS_URL,
-            opening_price_fetcher=fetch_price_to_beat,
-        )
-        twap_mirror.start()
-        logger.info(
-            "Chainlink TWAP RTDS mirror started "
-            "(5m=60s, 15m=60s, official Price To Beat fallback armed)",
-        )
+    twap_mirror = ChainlinkTwapRtdsMirror(
+        url=config.TWAP_RTDS_URL,
+        opening_price_fetcher=fetch_price_to_beat,
+    )
+    twap_mirror.start()
+    logger.info("Chainlink TWAP mirror started (60s boundary TWAP, Price To Beat fallback)")
 
     # Persistent HTTP clients — one per upstream host. Reused across every
     # tick so TLS handshakes amortize over the whole run (#11). Closed in
@@ -1035,8 +970,6 @@ def main(argv: list[str] | None = None) -> int:
         clob_client=clob_client,
         order_client=order_client,
         notify=_notify,
-        checkpoint_rf=checkpoint_rf,
-        checkpoint_hgb=checkpoint_hgb,
         twap_hgb=twap_hgb,
         twap_mirror=twap_mirror,
         live_balance_fetcher=(

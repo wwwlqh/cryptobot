@@ -90,12 +90,11 @@ from cryptobot.execution.walk_book import walk_book_edge_preserving
 from cryptobot.execution import sizing_v2
 from cryptobot.strategy import spec_v2
 from cryptobot.strategy.partial_ret import PartialRetEngine
-from cryptobot.strategy.score import ScoreResult, score_cell_hgb, score_cell_twap
+from cryptobot.strategy.score import ScoreResult, score_cell_twap
 from cryptobot.strategy.portfolio_loader import Sleeve, V6Portfolio
 
 if TYPE_CHECKING:  # avoid runtime import cycle but keep type information
     from cryptobot.strategy.hgb_loader import HgbArtifact
-    from cryptobot.strategy.rf_loader import RfArtifact
 
 logger = logging.getLogger(__name__)
 _ET = ZoneInfo("America/New_York")
@@ -645,14 +644,8 @@ class TickDeps:
     # Stub-able for tests; defaults to time.monotonic-anchored real-clock
     # readiness lookup against `live_readiness_reports`.
     live_readiness_loader: Optional[Callable[..., bool]] = None
-    # checkpoint_v1: per-checkpoint-second RF + HGB for the sub-minute sleeves
-    # (2026-07-05 parity fix). Loaded at boot only when a checkpoint sleeve
-    # exists (i.e. SUBMINUTE_ENABLED); None otherwise, so baseline scoring is
-    # byte-identical. score_cell_hgb routes to these when offset_sec is set.
-    checkpoint_rf_artifact: Optional["RfArtifact"] = None
-    checkpoint_hgb_artifact: Optional["HgbArtifact"] = None
-    # Direct TWAP-symmetric HGB (no RF stage). Present only when the exact
-    # Chainlink RTDS strategy is enabled.
+    # The TWAP HGB model and the Chainlink TWAP mirror that supplies each
+    # window's opening price.
     twap_hgb_artifact: Optional["HgbArtifact"] = None
     twap_mirror: Optional[object] = None
     # A8 latency: boundary book prefetcher (scheduler/book_prefetch.py). When
@@ -721,333 +714,6 @@ def _ask_from_books(
     return book, _finite_float_or_none(book.top_ask)
 
 
-# ---------------------------------------------------------------------------
-# Per-second score memo (fast-trigger precompute, operator 2026-07-30).
-#
-# The fast rungs fire up to ~16x/s inside a qualifying second and every fire
-# re-runs the SAME cheap pre-score the 1Hz tick already ran at second S (Phase A
-# passes NaN asks for the identical (coin, sleeve, offset_sec, window_start,
-# spot) tuple). Memoising `_score_cell_for` therefore turns the tick's
-# boundary-time Phase A into the fast rungs' precompute for free — no separate
-# warming pass, no second copy of the scoring code, and the tick's own Pass-3
-# rescore is served too whenever a fire re-reads an UNCHANGED ladder.
-#
-# WHY THIS IS PARITY-EXACT, not "probably fine". The key is a COMPLETE
-# determinant of the output, so an equal key can only mean an equal result:
-#
-#   * every scalar argument is in the key;
-#   * the sleeve is pinned by IDENTITY (key `id()` + an identity re-check on
-#     serve, so id() recycling is unrepresentable). In production that alone is
-#     complete: `portfolio_loader.Sleeve` is `@dataclass(frozen=True)`, so a
-#     loaded sleeve cannot change — a re-load mints a new object, which misses.
-#     The key ALSO carries the six attributes the scorer actually reads
-#     (interval / interval_min / signal_source / slippage_haircut /
-#     ask_bucket_ranges / side_filter) so a MUTABLE duck-typed stand-in (test
-#     fixtures use SimpleNamespace) cannot be served a stale row either;
-#   * the checkpoint artifacts are pinned by identity (they are internally
-#     memoised and immutable once loaded; a reload mints a new object);
-#   * `config.POLY_FEE_THETA` is in the key (the scorer fee-adjusts with it);
-#   * the PartialRetEngine — the ONLY mutable input — is read by the scorer
-#     through EXACTLY three accessors (`current_z`, `entry_partial_ret`,
-#     `range_partial_ret`), so the key carries those three RETURN VALUES rather
-#     than a state version. An engine mutation between two calls in the same
-#     second is then a MISS (recompute), never a stale serve.
-#
-# Anything that cannot be fingerprinted is simply not memoised (key None):
-# a duck-typed engine stand-in without the accessors, a sleeve missing an
-# attribute, or a `current_z` of None (the no-feature skip path, which is cheap
-# anyway and whose None z would stop pinning `rv_1h_at_open`).
-#
-# WHERE THE BOUNDARY PRECOMPUTE COMES FROM. No separate warming pass exists and
-# none is wanted: `run_scanner_tick` feeds the engine and then runs Phase A for
-# EXACTLY the cells `fast_entry_candidate_sleeves` yields (both derive the
-# qualifying offset from `_sleeve_entry_gate` / `_qualifying_offset_sec`), with
-# the same spot object and NaN asks. So second S's tick IS the precompute, and it
-# is paid on the 1Hz thread rather than on the WS event path. A fire that BEATS
-# the tick within a second simply computes its own entry — the fingerprint makes
-# that a miss, not a wrong answer.
-#
-# Gated on `config.FAST_TRIGGER_ENABLED` — the memo exists to serve the fast
-# rungs, so the master-off runtime stays byte-identical (and the flag doubles as
-# the kill switch that is already wired into the deploy env).
-#
-# ⚠️ HONEST SCOPE. `model_p` for an hgb sleeve DOES depend on the ask
-# (`build_feature_vector` feeds ask / other_ask / book_spread / rf_edge into the
-# HGB), so "precompute model_p at the boundary and only do edge arithmetic at
-# event time" is NOT available on this strategy. What is precomputable is the
-# ask-INDEPENDENT prefix — z, the two ORB returns, the RF slice probability and
-# the feature-column list — plus the whole score whenever a fire re-reads an
-# unchanged ladder. Both model calls underneath are ALSO already memoised on
-# their own artifacts (`rf_loader._proba_cache` + its step-LUT fast path,
-# `hgb_loader._proba_cache`), so this memo's measured prize is small
-# (~0.1-0.3ms/fire): it removes the per-fire Python around those caches, not the
-# inference itself. Treat it as parity-preserving hygiene, not the headline win.
-#
-# READS ARE FAST-RUNG-ONLY, WRITES ARE FROM EVERYWHERE — deliberately asymmetric.
-# The 1Hz tick can never HIT its own memo anyway: within one tick no key repeats
-# (Phase A keys on NaN asks, Pass 3 on the live ones, and each cell is a distinct
-# coin/sleeve), and the next tick is a new wall second, which drops the memo. So
-# letting the tick read would be pure risk for zero gain — instead the tick only
-# POPULATES (a dict store that cannot change its own result), which is exactly
-# what makes second S's tick the fast rungs' precompute. The consequence worth
-# stating plainly: THE TICK PATH IS BYTE-IDENTICAL WITH THIS FEATURE ON, always,
-# not just when the master flag is off.
-_SCORE_MEMO: "dict[tuple, _ScoreMemoEntry]" = {}
-_SCORE_MEMO_LOCK = threading.Lock()
-#: Per-thread "this call stack is a fast rung" flag (set by
-#: :func:`run_fast_entry_scan`). Thread-local rather than a parameter because the
-#: scoring the fast rung wants served happens two frames down inside
-#: ``_resolve_net_cells``, which is shared verbatim with the tick.
-_SCORE_MEMO_READS = threading.local()
-# One integer second's worth of cells: 4 coins x 2 sleeves x (pre-score +
-# rescore) x a few distinct ladders. Cleared wholesale when the wall second
-# advances, so this cap only bounds a pathological single second.
-_SCORE_MEMO_MAX = 256
-_SCORE_MEMO_SECOND: int = -1
-#: (hits, misses) since process start — read by the fast rung's placement line.
-_SCORE_MEMO_HITS: int = 0
-_SCORE_MEMO_MISSES: int = 0
-
-# Distinguishes "caller did not capture an anchor" from an explicitly missing
-# RTDS anchor (None).  The latter is a fail-closed scoring input and must not
-# trigger a second mirror read.
-_TWAP_OPEN_UNSET = object()
-
-
-@dataclass
-class _ScoreMemoEntry:
-    """One memoised score plus the object refs its key's ``id()``s point at.
-
-    ``refs`` is re-checked by IDENTITY on serve: CPython recycles ``id()`` values
-    after a GC, so a key alone could (in principle) match a different object at
-    the same address. The identity re-check makes that unrepresentable.
-    """
-
-    refs: tuple
-    result: "ScoreResult"
-
-
-def _ask_key(ask: float) -> Optional[float]:
-    """Hashable, NaN-free key component for one NUMERIC side ask.
-
-    Non-finite (the pre-score's "no book yet" NaN) collapses to ``None``: NaN is
-    never equal to itself, so a raw NaN in the key would make every pre-score a
-    miss, and `float('nan') is float('nan')` is False so identity cannot rescue
-    it either. Both scorers branch on `math.isfinite(ask)` and treat EVERY
-    non-finite value identically, so the collapse is information-preserving.
-
-    Callers must reject a NON-NUMERIC ask before calling (see
-    :func:`_score_memo_fingerprint`): ``None`` and ``nan`` diverge in the lut
-    scorer (``None`` raises inside the edge arithmetic, ``nan`` does not), so
-    collapsing both to the same key component would be a real divergence.
-    """
-    if not isinstance(ask, (int, float)):  # pragma: no cover — caller-rejected
-        return None
-    value = float(ask)
-    return value if math.isfinite(value) else None
-
-
-def _score_memo_fingerprint(
-    *,
-    coin: str,
-    sleeve: Sleeve,
-    entry_minute: int,
-    window_start_ts: int,
-    live_spot: float,
-    yes_ask: float,
-    no_ask: float,
-    offset_sec: Optional[int],
-    deps: TickDeps,
-    fee_rate_bps: Optional[float] = None,
-) -> tuple[Optional[tuple], Optional[tuple]]:
-    """``(key, refs)`` for :data:`_SCORE_MEMO`, or ``(None, None)`` when
-    memoisation is not PROVABLY safe (see the module note above)."""
-    engine = deps.partial_ret_engine
-    if not isinstance(yes_ask, (int, float)) or not isinstance(
-        no_ask, (int, float)
-    ):
-        # See _ask_key: a non-numeric ask and a NaN ask are NOT interchangeable
-        # downstream, so refuse to fingerprint rather than merge them.
-        return None, None
-    try:
-        interval = sleeve.interval
-        interval_min = int(sleeve.interval_min)
-        # The scorer's own em / range_sec derivation: a checkpoint cell
-        # (score_cell_hgb) scores at a FRACTIONAL minute off a 5s opening
-        # range. A cell without offset_sec cannot score at all since the
-        # 2026-07-31 retirement; the integer minute + 60s range stays here as
-        # the conservative fingerprint input for that fail-closed sentinel.
-        if offset_sec is not None:
-            em: float = offset_sec / 60.0
-            range_sec = 5
-        else:
-            em = float(entry_minute)
-            range_sec = 60
-        z = engine.current_z(
-            coin, interval_min=interval_min, live_spot=live_spot, entry_minute=em
-        )
-        if z is None:
-            # No z => the score is a cheap skip sentinel AND `rv_1h_at_open` is
-            # unpinned by the key. Refuse to memoise rather than reason about it.
-            return None, None
-        orb_entry = engine.entry_partial_ret(
-            coin, interval_min=interval_min, live_spot=live_spot
-        )
-        orb_range = engine.range_partial_ret(
-            coin, interval_min=interval_min, range_sec=range_sec
-        )
-        sleeve_attrs = (
-            interval,
-            interval_min,
-            sleeve.signal_source,
-            getattr(sleeve, "slippage_haircut", None),
-            tuple(getattr(sleeve, "ask_bucket_ranges", ()) or ()),
-            getattr(sleeve, "side_filter", None),
-        )
-        refs = (
-            sleeve,
-            deps.checkpoint_rf_artifact,
-            deps.checkpoint_hgb_artifact,
-        )
-        key = (
-            coin,
-            id(sleeve),
-            sleeve_attrs,
-            # RAW, never int()-collapsed: the scorers use `float(entry_minute)`
-            # for the feature row and `int(entry_minute)` only for the RF slice
-            # key, so 4 and 4.0 are genuinely interchangeable while 4.5 and 4.9
-            # are not.
-            entry_minute,
-            # int()-collapsed on purpose: `build_feature_vector` derives
-            # hour_utc / dow_utc from `int(window_start_ts)`, so the collapse is
-            # exactly what the scorer does with it.
-            int(window_start_ts),
-            offset_sec,
-            float(live_spot),
-            _ask_key(yes_ask),
-            _ask_key(no_ask),
-            float(z),
-            orb_entry if orb_entry is None else float(orb_entry),
-            orb_range if orb_range is None else float(orb_range),
-            tuple(id(r) for r in refs[1:]),
-            config.POLY_FEE_THETA,
-            # Fee inputs the scorer's venue-dispatched `_fee_adjusted_edge`
-            # actually consumes. POLY_FEE_THETA above pins the Polymarket
-            # parabola; `fee_rate_bps` pins the predict.fun tent. It is keyed
-            # only on the predict.fun venue so the Polymarket key — and hence
-            # its hit rate — is byte-identical to the pre-dispatch memo (poly
-            # markets carry a decorative feeRateBps the parabola ignores).
-            None if config.VENUE != "predictfun" else fee_rate_bps,
-        )
-    except Exception:  # noqa: BLE001 — an unfingerprintable input is a no-memo
-        return None, None
-    return key, refs
-
-
-def _score_memo_stats() -> tuple[int, int]:
-    """``(hits, misses)`` since process start — the placement line's pre-hit
-    telemetry."""
-    return _SCORE_MEMO_HITS, _SCORE_MEMO_MISSES
-
-
-@contextlib.contextmanager
-def score_memo_reads():
-    """Mark this thread's call stack as a fast rung, so scoring inside it may be
-    SERVED from the memo (see the :data:`_SCORE_MEMO` read/write asymmetry).
-
-    Re-entrant and exception-safe; restores the previous value rather than
-    clearing, so a nested scan cannot un-mark its caller. Public because the test
-    suite needs the same entry point the scan uses — there is no second way in.
-
-    Also opens a per-THREAD ``[hits, misses]`` tally for this scan. The process
-    globals cannot answer "what did THIS scan hit?": stages 1-5 are deliberately
-    outside ``_FAST_ENTRY_LOCK``, so the other rung's scoring lands inside any
-    difference taken around this one.
-    """
-    prev = getattr(_SCORE_MEMO_READS, "on", False)
-    prev_tally = getattr(_SCORE_MEMO_READS, "tally", None)
-    _SCORE_MEMO_READS.on = True
-    _SCORE_MEMO_READS.tally = [0, 0]
-    try:
-        yield
-    finally:
-        _SCORE_MEMO_READS.on = prev
-        _SCORE_MEMO_READS.tally = prev_tally
-
-
-def _score_memo_scan_tally() -> Optional[list]:
-    """This thread's ``[hits, misses]`` for the scan it is inside, or None when
-    called outside :func:`score_memo_reads` (the 1Hz tick, or a direct test
-    call)."""
-    return getattr(_SCORE_MEMO_READS, "tally", None)
-
-
-def _score_memo_roll_locked(second: int) -> None:
-    """Drop the memo when the wall second advanced. Caller holds the lock.
-
-    Called from BOTH get and put — load-bearing, because writes and reads are
-    asymmetric: the tick only PUTs, so if the roll lived in get alone the first
-    fast-rung read of a second would clear the very entries the tick had just
-    written for it (and the precompute would never serve).
-
-    The memo's inputs are only guaranteed co-temporal within one second (the tick
-    re-feeds the engine and re-fetches spot on the boundary). Correctness does
-    NOT rest on this — the fingerprint already does — it bounds staleness and
-    memory.
-    """
-    global _SCORE_MEMO_SECOND
-    if second != _SCORE_MEMO_SECOND:
-        _SCORE_MEMO.clear()
-        _SCORE_MEMO_SECOND = second
-
-
-def _score_memo_get(key: tuple, refs: tuple) -> Optional["ScoreResult"]:
-    """Serve ``key`` when the wall second still matches AND every ``id()`` in the
-    key still points at the object it was built from.
-
-    Counts into BOTH the process globals (lifetime telemetry) and the calling
-    scan's own thread-local tally (what the placement line reports).
-    """
-    global _SCORE_MEMO_HITS, _SCORE_MEMO_MISSES
-    second = int(time.time())
-    tally = _score_memo_scan_tally()
-    with _SCORE_MEMO_LOCK:
-        _score_memo_roll_locked(second)
-        entry = _SCORE_MEMO.get(key)
-        if entry is not None and (
-            len(entry.refs) != len(refs)
-            or any(a is not b for a, b in zip(entry.refs, refs))
-        ):  # pragma: no cover — id() recycling guard
-            entry = None
-        if entry is None:
-            _SCORE_MEMO_MISSES += 1
-            if tally is not None:
-                tally[1] += 1
-            return None
-        _SCORE_MEMO_HITS += 1
-        if tally is not None:
-            tally[0] += 1
-        return entry.result
-
-
-def _score_memo_put(key: tuple, refs: tuple, result: "ScoreResult") -> None:
-    second = int(time.time())
-    with _SCORE_MEMO_LOCK:
-        _score_memo_roll_locked(second)
-        if len(_SCORE_MEMO) >= _SCORE_MEMO_MAX:  # pragma: no cover — bound only
-            _SCORE_MEMO.clear()
-        _SCORE_MEMO[key] = _ScoreMemoEntry(refs=refs, result=result)
-
-
-def clear_score_memo() -> None:
-    """Drop every memoised score. Test/ops hook — the memo is otherwise
-    self-invalidating via the fingerprint + the wall-second clear."""
-    global _SCORE_MEMO_SECOND
-    with _SCORE_MEMO_LOCK:
-        _SCORE_MEMO.clear()
-        _SCORE_MEMO_SECOND = -1
-
-
 def _score_cell_for(
     *,
     coin: str,
@@ -1059,121 +725,32 @@ def _score_cell_for(
     no_ask: float,
     offset_sec: Optional[int],
     deps: TickDeps,
+    twap_open: Optional[float],
     fee_rate_bps: Optional[float] = None,
-    twap_open: object = _TWAP_OPEN_UNSET,
 ) -> "ScoreResult":
-    """Route one cell to its sleeve's scorer (``signal_source == "hgb"``).
+    """Score one cell with the TWAP model.
 
-    ONE dispatcher because the same branch, with its ~10 artifact kwargs, was
-    written out at three call sites: Phase A's cheap pre-score, the
-    authoritative rescore in ``_resolve_net_cells``, and the fast rung's cheap
-    pre-score. That is how a new artifact kwarg reaches two of three paths and
-    the third silently scores against a stale bundle.
-
-    NaN asks are how the cheap pre-score says "no book yet" — the scorers accept
-    them and the caller rescores with live asks once the books land.
-
-    Memoised per wall second on a COMPLETE input fingerprint when
-    ``config.FAST_TRIGGER_ENABLED`` (see the :data:`_SCORE_MEMO` note). Reads are
-    served ONLY inside :func:`score_memo_reads` (i.e. only to a fast rung); the
-    1Hz tick populates the memo but never serves from it, so the tick path stays
-    byte-identical. A served hit is the very ``ScoreResult`` object the boundary
-    tick computed for this second, so a mid-second fire re-derives nothing.
-
-    ``fee_rate_bps`` is the resolved market's predict.fun ``feeRateBps`` (None
-    on the cheap pre-score paths, which run before any market is resolved). It
-    reaches the venue-dispatched fee in ``_fee_adjusted_edge`` and is part of
-    the memo key on that venue.
+    ONE dispatcher shared by Phase A's cheap pre-score (NaN asks = "no book
+    yet"), the authoritative rescore in ``_resolve_net_cells`` and the fast
+    rung's pre-score, so the three can never score against different inputs.
+    ``entry_minute`` and ``fee_rate_bps`` are accepted for the test scorer stub.
     """
-    # The legacy memo fingerprints Binance-derived features.  TWAP scoring has
-    # a separately captured Chainlink anchor, so keep it off that cache rather
-    # than risk serving a result keyed on the wrong feature family.
-    memo_on = config.FAST_TRIGGER_ENABLED and not config.TWAP_SYMMETRIC_ENABLED
-    key = refs = None
-    if memo_on:
-        key, refs = _score_memo_fingerprint(
-            coin=coin, sleeve=sleeve, entry_minute=entry_minute,
-            window_start_ts=window_start_ts, live_spot=live_spot,
-            yes_ask=yes_ask, no_ask=no_ask, offset_sec=offset_sec, deps=deps,
-            fee_rate_bps=fee_rate_bps,
-        )
-        if key is not None and getattr(_SCORE_MEMO_READS, "on", False):
-            hit = _score_memo_get(key, refs)
-            if hit is not None:
-                return hit
-    result = _score_cell_uncached(
-        coin=coin, sleeve=sleeve, entry_minute=entry_minute,
-        window_start_ts=window_start_ts, live_spot=live_spot,
-        yes_ask=yes_ask, no_ask=no_ask, offset_sec=offset_sec, deps=deps,
-        fee_rate_bps=fee_rate_bps,
-        twap_open=twap_open,
-    )
-    if key is not None:
-        _score_memo_put(key, refs, result)
-    return result
-
-
-def _score_cell_uncached(
-    *,
-    coin: str,
-    sleeve: Sleeve,
-    entry_minute: int,
-    window_start_ts: int,
-    live_spot: float,
-    yes_ask: float,
-    no_ask: float,
-    offset_sec: Optional[int],
-    deps: TickDeps,
-    fee_rate_bps: Optional[float] = None,
-    twap_open: object = _TWAP_OPEN_UNSET,
-) -> "ScoreResult":
-    """The scorer dispatch itself — :func:`_score_cell_for` minus the memo.
-
-    Kept as its own function so the parity test can compare a from-scratch score
-    against the memoised one without reaching into the cache.
-    """
-    # 2026-07-31: score_cell_hgb is the ONLY scorer. The loader rejects a
-    # non-hgb sleeve at boot, so this is belt-and-braces — never a live branch.
     if sleeve.signal_source != "hgb":
         raise ValueError(
             f"pipeline: sleeve {sleeve.label!r} signal_source="
-            f"{sleeve.signal_source!r} has no scorer (lut|rf|blend retired "
-            "2026-07-31)"
+            f"{sleeve.signal_source!r} has no scorer"
         )
-    if config.TWAP_SYMMETRIC_ENABLED:
-        if twap_open is _TWAP_OPEN_UNSET:
-            twap_open = _window_open_price(
-                deps,
-                coin=coin,
-                sleeve=sleeve,
-                window_start_ts=window_start_ts,
-            )
-        return score_cell_twap(
-            coin=coin,
-            sleeve=sleeve,
-            window_start_ts=window_start_ts,
-            live_spot=live_spot,
-            open_twap=None if twap_open is None else float(twap_open),
-            yes_ask=yes_ask,
-            no_ask=no_ask,
-            partial_ret_engine=deps.partial_ret_engine,
-            offset_sec=offset_sec,
-            twap_hgb=deps.twap_hgb_artifact,
-            fee_rate_bps=fee_rate_bps,
-        )
-    return score_cell_hgb(
+    return score_cell_twap(
         coin=coin,
         sleeve=sleeve,
-        entry_minute=entry_minute,
         window_start_ts=window_start_ts,
         live_spot=live_spot,
+        open_twap=None if twap_open is None else float(twap_open),
         yes_ask=yes_ask,
         no_ask=no_ask,
         partial_ret_engine=deps.partial_ret_engine,
         offset_sec=offset_sec,
-        checkpoint_rf=deps.checkpoint_rf_artifact,
-        checkpoint_hgb=deps.checkpoint_hgb_artifact,
-        fee_rate_bps=fee_rate_bps,
+        twap_hgb=deps.twap_hgb_artifact,
     )
 
 
@@ -1184,15 +761,17 @@ def _window_open_price(
     sleeve: Sleeve,
     window_start_ts: int,
 ) -> Optional[float]:
-    """Return the strategy's actual open anchor for ledger/audit parity."""
-    if config.TWAP_SYMMETRIC_ENABLED:
-        if deps.twap_mirror is None:
-            return None
-        sample = deps.twap_mirror.get_opening_twap(
-            coin, sleeve.interval, window_start_ts
-        )
-        return None if sample is None else float(sample.value)
-    return deps.partial_ret_engine.window_open_spot(coin, sleeve.interval_min)
+    """The window's opening Chainlink TWAP, or None when it is not known yet.
+
+    This is the price Polymarket settles against, so it is both the model's
+    anchor and the strike recorded on the ledger row.
+    """
+    if deps.twap_mirror is None:
+        return None
+    sample = deps.twap_mirror.get_opening_twap(
+        coin, sleeve.interval, window_start_ts
+    )
+    return None if sample is None else float(sample.value)
 
 
 def _mark_skip(d: CellDecision, reason: str) -> None:
@@ -1500,36 +1079,6 @@ def run_fast_entry_scan(
 ) -> dict:
     """Re-evaluate this instant's qualifying sub-minute cells off-tick.
 
-    A thin wrapper whose ONLY job is to mark this call stack as a fast rung, so
-    the scoring two frames down inside ``_resolve_net_cells`` — code shared
-    verbatim with the tick — may be served from the per-second score memo. The
-    tick never enters this context, which is what makes the memo invisible to it
-    (see the :data:`_SCORE_MEMO` read/write asymmetry). Body:
-    :func:`_fast_entry_scan`.
-    """
-    with score_memo_reads():
-        return _fast_entry_scan(
-            conn,
-            portfolio,
-            now_ts=now_ts,
-            deps=deps,
-            trigger_src=trigger_src,
-            candidates=candidates,
-        )
-
-
-def _fast_entry_scan(
-    conn,
-    portfolio: V6Portfolio,
-    *,
-    now_ts: int,
-    deps: TickDeps,
-    trigger_src: str,
-    candidates: Optional[list[tuple[Sleeve, int]]] = None,
-) -> dict:
-    """The fast-entry scan body — always call it through
-    :func:`run_fast_entry_scan`, which arms the memo-read context.
-
     Called by BOTH fast rungs (250ms sweep job / WS ask-update worker) on their
     own scheduler-pool connection. Returns a counters dict for the caller's log
     line; never raises for an expected drop. ``candidates`` lets a caller that
@@ -1584,10 +1133,6 @@ def _fast_entry_scan(
     untouched.
     """
     t_scan = time.monotonic()
-    # Fallback only: the placement line reads this scan's thread-local tally,
-    # which `run_fast_entry_scan` opens. A direct call to this body (tests) has
-    # none, and then the process-global difference is the best available.
-    memo_h0, memo_m0 = _score_memo_stats()
     counters: dict[str, int] = {
         "cells": 0, "scored": 0, "bettable": 0, "committed": 0,
         "orders": 0, "contended": 0, "dd_halted": 0, "spot_cold": 0,
@@ -1662,12 +1207,8 @@ def _fast_entry_scan(
         # Same as the 1Hz tick's cheap pre-score: no market resolved yet, so no
         # fee_rate_bps. Stage 5 below runs `_resolve_net_cells`, which rescores
         # with the real per-market fee before anything can place.
-        twap_open = (
-            _window_open_price(
-                deps, coin=coin, sleeve=sleeve, window_start_ts=window_start
-            )
-            if config.TWAP_SYMMETRIC_ENABLED
-            else None
+        twap_open = _window_open_price(
+            deps, coin=coin, sleeve=sleeve, window_start_ts=window_start
         )
         score = _score_cell_for(
             coin=coin,
@@ -1679,9 +1220,7 @@ def _fast_entry_scan(
             no_ask=nan,
             offset_sec=offset_sec,
             deps=deps,
-            twap_open=(
-                twap_open if config.TWAP_SYMMETRIC_ENABLED else _TWAP_OPEN_UNSET
-            ),
+            twap_open=twap_open,
         )
         if score.skip_reason is not None:
             continue
@@ -1826,32 +1365,17 @@ def _fast_entry_scan(
             #   db_ms    the residual: SQLite (BEGIN IMMEDIATE, the reserve's own
             #            commit, the post-POST ledger/fill writes) + the gate
             #            stack. This is the number to attack next if it is large.
-            #   score    score-memo hits/misses for THIS scan (the precompute
-            #            hit rate: high => the boundary tick did the work). Read
-            #            off this scan's own thread-local tally, NOT a difference
-            #            of the process globals: stages 1-5 run outside
-            #            `_FAST_ENTRY_LOCK`, so the other rung's scoring would
-            #            land inside such a difference exactly on the busy
-            #            seconds this number is for. Counts FINGERPRINTABLE
-            #            scores only — a cell the memo refuses to key (no z,
-            #            duck-typed engine) is in neither bucket, so h+m < the
-            #            scan's total score calls is normal.
-            _memo_tally = _score_memo_scan_tally() or [
-                _score_memo_stats()[0] - memo_h0,
-                _score_memo_stats()[1] - memo_m0,
-            ]
             _post_ms = tick.ms_order_post + tick.ms_order_post_rej
             _total_ms = (time.monotonic() - t_trigger) * 1000.0
             logger.info(
                 "fast_entry placed src=%s n=%d trigger_to_post_ms=%.0f "
                 "pre_ms=%.0f ctx_ms=%.1f ctxhit=%d walk_ms=%.1f sign_ms=%.0f "
-                "post_ms=%.0f db_ms=%.0f score=%d/%d cells=%d bettable=%d",
+                "post_ms=%.0f db_ms=%.0f cells=%d bettable=%d",
                 trigger_src, tick.n_orders, _total_ms,
                 (t_trigger - t_scan) * 1000.0,
                 ctx_ms, int(ctx_hit), tick.ms_walk, tick.ms_order_sign,
                 _post_ms,
                 max(0.0, _total_ms - tick.ms_walk - tick.ms_order_sign - _post_ms),
-                _memo_tally[0], _memo_tally[1],
                 counters["cells"], counters["bettable"],
             )
     finally:
@@ -2888,15 +2412,8 @@ def run_scanner_tick(
             tick.cells_evaluated += 1
             spot = spots[coin]
             spot_age_s = max(0.0, float(now_ts) - float(spot.publish_time))
-            twap_open = (
-                _window_open_price(
-                    deps,
-                    coin=coin,
-                    sleeve=sleeve,
-                    window_start_ts=window_start,
-                )
-                if config.TWAP_SYMMETRIC_ENABLED
-                else None
+            twap_open = _window_open_price(
+                deps, coin=coin, sleeve=sleeve, window_start_ts=window_start
             )
 
             # Backtest samples each entry minute once. Live still runs at
@@ -2956,16 +2473,7 @@ def run_scanner_tick(
                         poly_token_id_no=None,
                         offset_sec=cell_offset_sec,
                         strike_price=spot.price,
-                        window_open_spot=(
-                            twap_open
-                            if config.TWAP_SYMMETRIC_ENABLED
-                            else _window_open_price(
-                                deps,
-                                coin=coin,
-                                sleeve=sleeve,
-                                window_start_ts=window_start,
-                            )
-                        ),
+                        window_open_spot=twap_open,
                     )
                 )
                 continue
@@ -2989,11 +2497,7 @@ def run_scanner_tick(
                 no_ask=no_ask,
                 offset_sec=cell_offset_sec,
                 deps=deps,
-                twap_open=(
-                    twap_open
-                    if config.TWAP_SYMMETRIC_ENABLED
-                    else _TWAP_OPEN_UNSET
-                ),
+                twap_open=twap_open,
             )
             if score.skip_reason is None:
                 # A2 latency: DEFER the market + book fetch. Qualifying cells
@@ -3037,16 +2541,7 @@ def run_scanner_tick(
                 fee_unknown=False,
                 offset_sec=cell_offset_sec,
                 strike_price=spot.price,
-                window_open_spot=(
-                    twap_open
-                    if config.TWAP_SYMMETRIC_ENABLED
-                    else _window_open_price(
-                        deps,
-                        coin=coin,
-                        sleeve=sleeve,
-                        window_start_ts=window_start,
-                    )
-                ),
+                window_open_spot=twap_open,
             )
             cell_decisions.append(decision)
 
@@ -3833,11 +3328,7 @@ def _resolve_net_cells(
             # The venue-dispatched gate fee (score._fee_adjusted_edge) reads it
             # on predict.fun; Polymarket ignores it (theta parabola).
             fee_rate_bps=fee_rate_bps,
-            twap_open=(
-                c.twap_open
-                if config.TWAP_SYMMETRIC_ENABLED
-                else _TWAP_OPEN_UNSET
-            ),
+            twap_open=c.twap_open,
         )
 
         # Divergence #13 fix: capture the window-open spot the model trains
@@ -3860,16 +3351,7 @@ def _resolve_net_cells(
             fee_unknown=fee_unknown_flag,
             offset_sec=c.offset_sec,
             strike_price=c.spot.price,
-            window_open_spot=(
-                c.twap_open
-                if config.TWAP_SYMMETRIC_ENABLED
-                else _window_open_price(
-                    deps,
-                    coin=c.coin,
-                    sleeve=c.sleeve,
-                    window_start_ts=c.window_start,
-                )
-            ),
+            window_open_spot=c.twap_open,
             trigger_src=c.trigger_src,
         )
         out.append(decision)

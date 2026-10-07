@@ -262,7 +262,7 @@ def test_scan_still_runs_when_only_one_side_fired(monkeypatch):
     _seed_attempted(s, "YES")
     seen: list = []
     monkeypatch.setattr(
-        P, "score_cell_hgb",
+        P, "_score_cell_for",
         lambda **kw: seen.append(kw) or SimpleNamespace(skip_reason="stop_here"),
     )
     counters = _scan(_portfolio(s), peek_spots=lambda **kw: _spots())
@@ -288,7 +288,7 @@ def test_scan_skips_a_cold_market_rather_than_paying_a_gamma_get(monkeypatch):
     """Cache-only for market metadata: a cold window is skipped, so the fast
     rungs can never multiply the tick's retry load on a failing endpoint."""
     monkeypatch.setattr(P, "_venue_market_cache_has", lambda *a, **k: False)
-    monkeypatch.setattr(P, "score_cell_hgb", _Boom("score_cell"))
+    monkeypatch.setattr(P, "_score_cell_for", _Boom("score_cell"))
     monkeypatch.setattr(P, "_resolve_net_cells", _Boom("_resolve_net_cells"))
     counters = _scan(peek_spots=lambda **kw: _spots())
     assert counters["cells"] == 1
@@ -305,7 +305,7 @@ def test_scan_abstains_on_a_cold_spot_bucket_instead_of_fetching(monkeypatch):
     stale_spot skips x6.9. `_deps()` leaves `fetch_spots=_Boom(...)`, so any
     reintroduced fallback fails here loudly.
     """
-    monkeypatch.setattr(P, "score_cell_hgb", _Boom("score_cell"))
+    monkeypatch.setattr(P, "_score_cell_for", _Boom("score_cell"))
     monkeypatch.setattr(P, "_resolve_net_cells", _Boom("_resolve_net_cells"))
     counters = _scan(peek_spots=lambda **kw: None)
     assert counters["cells"] == 1
@@ -329,7 +329,7 @@ def test_scan_scores_at_the_integer_offset(monkeypatch):
     s.signal_source = "hgb"
     captured: dict = {}
     monkeypatch.setattr(
-        P, "score_cell_hgb",
+        P, "_score_cell_for",
         lambda **kw: captured.update(kw) or SimpleNamespace(skip_reason="stop"),
     )
     _scan(_portfolio(s), peek_spots=lambda **kw: _spots(), src="fast_event")
@@ -342,7 +342,7 @@ def test_scan_drops_cells_the_rescore_left_unbettable(monkeypatch):
     """No signals rows at 4Hz: a non-bettable cell is dropped, not recorded."""
     s = _sleeve()
     monkeypatch.setattr(
-        P, "score_cell_hgb", lambda **kw: SimpleNamespace(skip_reason=None, side="YES")
+        P, "_score_cell_for", lambda **kw: SimpleNamespace(skip_reason=None, side="YES")
     )
     monkeypatch.setattr(
         P, "_resolve_net_cells",
@@ -361,7 +361,7 @@ def test_scan_drops_cells_the_rescore_left_unbettable(monkeypatch):
 def _stub_commit_stage(monkeypatch, commit, *, wallet_snaps=None):
     """Neutralize every DB read the commit stage makes, then install ``commit``."""
     monkeypatch.setattr(
-        P, "score_cell_hgb", lambda **kw: SimpleNamespace(skip_reason=None, side="YES")
+        P, "_score_cell_for", lambda **kw: SimpleNamespace(skip_reason=None, side="YES")
     )
     monkeypatch.setattr(
         P, "_resolve_net_cells",

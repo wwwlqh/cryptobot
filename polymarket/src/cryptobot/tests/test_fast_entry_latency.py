@@ -1,25 +1,12 @@
-"""Fast-entry latency work (operator 2026-07-30): the per-second score
-precompute, the per-second commit-stage cache, and the placement-line breakdown.
+"""Fast-entry latency: the per-second commit-stage cache and the placement-line
+breakdown.
 
-The forensic (n=45) showed 84% of misses were taken by a FASTER taker ~1s before
-we arrived, so every millisecond between the WS push and the POST leaving the box
-is the lever. This suite pins the two things that MUST hold for that work to be
-safe, plus the telemetry that will locate the remaining milliseconds:
+Pins the two things that must hold for the cache to be safe:
 
-  * **Precompute parity.** A memoised score is byte-identical to a from-scratch
-    score, and the memo's key is a COMPLETE determinant of the output: mutate ANY
-    input — spot, ask, engine state, artifact identity, a sleeve scoring
-    attribute, the fee theta — and the memo MISSES rather than serving stale.
-    Exercised through the REAL ``score_cell_hgb`` + the REAL
-    ``build_feature_vector`` + a REAL ``PartialRetEngine`` (only the two model
-    predicts are duck-typed) so the parity claim covers real feature math.
-    Reads are fast-rung-only, so the 1Hz tick is byte-identical with the feature
-    ON — pinned separately.
   * **Commit-stage staleness.** The cached preamble is dropped by a placement
     (the epoch) and by a fill/settlement (the ledger probe), the operator row is
     re-read on EVERY fire, and master-off never caches at all.
-  * **Flag-off byte-identity.** ``CRYPTOBOT_FAST_TRIGGER_ENABLED=0`` re-scores
-    from scratch every time and takes no cached context.
+  * **The drawdown halt still binds** when the preamble is served from cache.
 """
 
 from __future__ import annotations
@@ -58,59 +45,6 @@ _COIN = "BTC"
 # --------------------------------------------------------------------------- real-ish scoring rig
 
 
-class _FakeEstimator:
-    """RF slice stand-in: a deterministic P(Up) from the z it is handed."""
-
-    def __init__(self) -> None:
-        self.calls = 0
-
-    def predict_proba(self, frame):
-        import numpy as np
-
-        self.calls += 1
-        z = float(frame.iloc[0, 0])
-        p_up = 0.5 + 0.10 * math.tanh(z)
-        return np.array([[1.0 - p_up, p_up]])
-
-
-class _FakePipeline:
-    """HGB pipeline stand-in: a deterministic P(win) from the feature row."""
-
-    def __init__(self) -> None:
-        self.calls = 0
-
-    def predict_proba(self, frame):
-        import numpy as np
-
-        self.calls += 1
-        row = [float(v) for v in frame.iloc[0].tolist()]
-        # Any injective-enough mix of the row: the point is that a different
-        # feature row (i.e. a different ask) yields a different probability.
-        p = 0.5 + 0.25 * math.tanh(sum((i + 1) * v for i, v in enumerate(row)) / 10.0)
-        return np.array([[1.0 - p, p]])
-
-
-_FEATURE_COLUMNS = [
-    "model_p_side", "rf_edge", "ask", "other_ask", "book_spread",
-    "partial_ret_z_side", "abs_partial_ret_z", "coin_id", "interval_min",
-    "entry_minute", "side_up", "hour_utc", "dow_utc",
-]
-
-
-def _fake_rf(est: _FakeEstimator):
-    # No `_proba_cache` / `_step_lut` attributes: predict_proba's getattr guards
-    # degrade to an UNCACHED predict, so `est.calls` really counts model calls.
-    return SimpleNamespace(estimators={("btc", "5m", _OFFSET): est})
-
-
-def _fake_hgb(pipe: _FakePipeline):
-    return SimpleNamespace(
-        pipelines={"5m": pipe},
-        feature_columns={"5m": list(_FEATURE_COLUMNS)},
-        columns_for=lambda interval: list(_FEATURE_COLUMNS),
-    )
-
-
 def _hgb_sleeve(label: str = "fl_5m"):
     return SimpleNamespace(
         label=label, interval="5m", interval_min=5,
@@ -129,43 +63,16 @@ def _engine(anchor: float = _ANCHOR) -> PartialRetEngine:
 
 
 def _rig(**over):
-    """(deps, sleeve, est, pipe) wired for a real ``score_cell_hgb`` call."""
-    est, pipe = _FakeEstimator(), _FakePipeline()
+    """(deps, sleeve, None, None) for the commit-stage tests."""
     kw = dict(
         partial_ret_engine=_engine(),
         config_sha256="stub",
         fetch_spots=lambda **k: None,
         fetch_market=lambda *a, **k: None,
         get_disk_free_mb=lambda: 10_000.0,
-        checkpoint_rf_artifact=_fake_rf(est),
-        checkpoint_hgb_artifact=_fake_hgb(pipe),
     )
     kw.update(over)
-    return P.TickDeps(**kw), _hgb_sleeve(), est, pipe
-
-
-def _score_as_tick(deps, sleeve, *, yes_ask=0.70, no_ask=0.32, live_spot=_SPOT):
-    """Score the way the 1Hz tick does — OUTSIDE the memo-read context, so the
-    memo is populated but never served."""
-    return P._score_cell_for(
-        coin=_COIN, sleeve=sleeve, entry_minute=_ENTRY_MINUTE,
-        window_start_ts=_WINDOW_START, live_spot=live_spot,
-        yes_ask=yes_ask, no_ask=no_ask, offset_sec=_OFFSET, deps=deps,
-    )
-
-
-def _score(deps, sleeve, **kw):
-    """Score the way a fast rung does — inside the memo-read context."""
-    with P.score_memo_reads():
-        return _score_as_tick(deps, sleeve, **kw)
-
-
-def _score_fresh(deps, sleeve, *, yes_ask=0.70, no_ask=0.32, live_spot=_SPOT):
-    return P._score_cell_uncached(
-        coin=_COIN, sleeve=sleeve, entry_minute=_ENTRY_MINUTE,
-        window_start_ts=_WINDOW_START, live_spot=live_spot,
-        yes_ask=yes_ask, no_ask=no_ask, offset_sec=_OFFSET, deps=deps,
-    )
+    return P.TickDeps(**kw), _hgb_sleeve(), None, None
 
 
 @pytest.fixture(autouse=True)
@@ -174,202 +81,14 @@ def _clean(monkeypatch):
     monkeypatch.setattr(config, "SUBMINUTE_ENABLED", True)
     monkeypatch.setattr(config, "SUBMINUTE_KILL", False)
     monkeypatch.setattr(config, "COINS", ("BTC",))
-    P.clear_score_memo()
     P.clear_fast_commit_stage()
     yield
-    P.clear_score_memo()
     P.clear_fast_commit_stage()
     if P._FAST_ENTRY_LOCK.locked():  # pragma: no cover — regression guard
         P._FAST_ENTRY_LOCK.release()
 
 
-# --------------------------------------------------------------------------- precompute parity
-
-
-def test_the_rig_really_scores():
-    """Guard the guard: if the duck-typed artifacts stopped producing a real
-    score, every parity assertion below would pass vacuously."""
-    deps, sleeve, est, pipe = _rig()
-    got = _score(deps, sleeve)
-    assert got.skip_reason is None
-    assert 0.0 < got.model_p < 1.0
-    assert got.side in ("YES", "NO")
-    assert math.isfinite(got.edge)
-    assert got.partial_ret_z_1h not in (None, 0.0)   # a real, non-degenerate z
-    # One RF slice; ONE HGB predict because no_ask=0.32 is outside the sleeve's
-    # (0.55, 0.85] band, so the real ask-bucket filter drops the NO candidate.
-    assert (est.calls, pipe.calls) == (1, 1)
-
-
-def test_the_tick_populates_the_memo_but_never_serves_from_it():
-    """⚠️ The blast-radius clause. The 1Hz tick — 8 months of live history — must
-    be byte-identical with this feature ON, not merely when the master flag is
-    off. It cannot HIT anyway (no key repeats inside one tick, and the memo is
-    dropped at the second boundary), so reads are fast-rung-only and the tick's
-    role is purely to POPULATE second S for the fires that follow it."""
-    deps, sleeve, est, pipe = _rig()
-    first = _score_as_tick(deps, sleeve)
-    again = _score_as_tick(deps, sleeve)
-    assert again is not first                    # the tick re-scored...
-    assert again == first
-    assert (est.calls, pipe.calls) == (2, 2)     # ...paying the model both times
-    # ...but a fast rung IS served the entry the tick left behind.
-    assert _score(deps, sleeve) in (first, again)
-    assert (est.calls, pipe.calls) == (2, 2)
-
-
-def test_precompute_is_byte_identical_to_a_fresh_score():
-    """THE parity assertion: same spot bucket + same feature values => the
-    memoised result IS the from-scratch result, field for field."""
-    deps, sleeve, est, pipe = _rig()
-    first = _score(deps, sleeve)
-    served = _score(deps, sleeve)
-    assert served is first                       # served from the precompute...
-    assert (est.calls, pipe.calls) == (1, 1)     # ...paying no model call
-    # ...and it equals what a from-scratch score computes from the same inputs.
-    assert _score_fresh(deps, sleeve) == first
-
-
-def test_prebook_precompute_serves_the_nan_ask_prescore():
-    """The tick's boundary Phase A scores with NaN asks; a mid-second fast fire
-    scores the SAME cell the same way, so second S's work is the fire's
-    precompute."""
-    deps, sleeve, est, pipe = _rig()
-    nan = float("nan")
-    boundary = _score(deps, sleeve, yes_ask=nan, no_ask=nan)
-    assert boundary.skip_reason is None          # pre-book sentinel
-    assert pipe.calls == 0                       # no ask => no HGB inference
-    mid_second = _score(deps, sleeve, yes_ask=nan, no_ask=nan)
-    assert mid_second is boundary
-    assert est.calls == 1                        # the RF slice was paid ONCE
-
-
-@pytest.mark.parametrize(
-    "label,mutate",
-    [
-        ("fresh ask", lambda kw, deps, sleeve: kw.update(yes_ask=0.71)),
-        ("other-side ask", lambda kw, deps, sleeve: kw.update(no_ask=0.33)),
-        ("spot", lambda kw, deps, sleeve: kw.update(live_spot=_SPOT + 25.0)),
-        # The ONLY mutable input: re-anchoring the window changes z / ORB.
-        (
-            "engine window anchor",
-            lambda kw, deps, sleeve: setattr(
-                deps.partial_ret_engine.state[_COIN], "window_start_spot_5m",
-                _SPOT * 1.001,
-            ),
-        ),
-        (
-            "engine rv snapshot",
-            lambda kw, deps, sleeve: setattr(
-                deps.partial_ret_engine.state[_COIN], "rv_1h_at_open_5m", 2e-3
-            ),
-        ),
-        (
-            "sleeve ask band",
-            lambda kw, deps, sleeve: setattr(
-                sleeve, "ask_bucket_ranges", ((0.10, 0.95),)
-            ),
-        ),
-        (
-            "sleeve side filter",
-            lambda kw, deps, sleeve: setattr(sleeve, "side_filter", "up"),
-        ),
-        (
-            "sleeve haircut",
-            lambda kw, deps, sleeve: setattr(sleeve, "slippage_haircut", 0.01),
-        ),
-    ],
-)
-def test_any_changed_input_misses_rather_than_serving_stale(label, mutate):
-    """The key is a COMPLETE determinant: nothing the scorers read may change
-    without the memo missing. A pass here is what makes the precompute a
-    parity-preserving move of WHEN work happens rather than a stale cache."""
-    deps, sleeve, est, pipe = _rig()
-    kw: dict = {}
-    first = _score(deps, sleeve)
-    mutate(kw, deps, sleeve)
-    served = _score(deps, sleeve, **kw)
-    assert served is not first, f"{label} was served from a stale memo"
-    # ...and the recomputed value is what a from-scratch score gives.
-    assert served == _score_fresh(deps, sleeve, **kw)
-
-
-def test_swapped_artifact_misses():
-    """A model hot-swap replaces the artifact OBJECT; the memo is
-    keyed on identity so the new bundle can never be served the old score."""
-    deps, sleeve, est, pipe = _rig()
-    first = _score(deps, sleeve)
-    hot_pipe = _FakePipeline()
-    swapped = P.dataclass_replace(
-        deps, checkpoint_hgb_artifact=_fake_hgb(hot_pipe)
-    )
-    served = _score(swapped, sleeve)
-    assert served is not first
-    assert hot_pipe.calls > 0
-
-
-def test_changed_fee_theta_misses(monkeypatch):
-    """``POLY_FEE_THETA`` feeds both `rf_edge` (a MODEL FEATURE) and the
-    fee-adjusted edge, so it belongs in the key."""
-    deps, sleeve, est, pipe = _rig()
-    first = _score(deps, sleeve)
-    monkeypatch.setattr(config, "POLY_FEE_THETA", config.POLY_FEE_THETA * 2.0)
-    assert _score(deps, sleeve) is not first
-
-
-def test_a_no_feature_cell_is_not_memoised():
-    """No z => the score is a cheap skip AND `rv_1h_at_open` stops being pinned
-    by the key, so refuse to memoise rather than reason about it."""
-    deps, sleeve, est, pipe = _rig(partial_ret_engine=PartialRetEngine())
-    first = _score(deps, sleeve)
-    assert first.skip_reason == "no_feature"
-    assert _score(deps, sleeve) is not first
-
-
-def test_an_unfingerprintable_engine_is_not_memoised():
-    """A duck-typed engine without the three accessors must degrade to uncached
-    scoring, never to a wrong key."""
-    deps, sleeve, est, pipe = _rig(partial_ret_engine=SimpleNamespace())
-    key, refs = P._score_memo_fingerprint(
-        coin=_COIN, sleeve=sleeve, entry_minute=_ENTRY_MINUTE,
-        window_start_ts=_WINDOW_START, live_spot=_SPOT,
-        yes_ask=0.70, no_ask=0.32, offset_sec=_OFFSET, deps=deps,
-    )
-    assert (key, refs) == (None, None)
-
-
-def test_a_new_wall_second_drops_the_memo(monkeypatch):
-    """Bounded staleness: the memo's inputs are only guaranteed co-temporal
-    within one second (the tick re-feeds the engine on the boundary)."""
-    deps, sleeve, est, pipe = _rig()
-    clock = [1_000_000.4]
-    monkeypatch.setattr(P.time, "time", lambda: clock[0])
-    first = _score(deps, sleeve)
-    assert _score(deps, sleeve) is first
-    clock[0] += 1.0
-    assert _score(deps, sleeve) is not first
-
-
-def test_nan_asks_key_as_none_not_nan():
-    """A raw NaN in the key would make every pre-score a miss (NaN != NaN, and
-    `float('nan') is float('nan')` is False)."""
-    assert P._ask_key(float("nan")) is None
-    assert P._ask_key(float("inf")) is None
-    assert P._ask_key(None) is None              # type: ignore[arg-type]
-    assert P._ask_key(0.7) == 0.7
-
-
 # --------------------------------------------------------------------------- flag-off byte-identity
-
-
-def test_flag_off_scores_from_scratch_every_time(monkeypatch):
-    monkeypatch.setattr(config, "FAST_TRIGGER_ENABLED", False)
-    deps, sleeve, est, pipe = _rig()
-    first = _score(deps, sleeve)
-    second = _score(deps, sleeve)
-    assert second is not first
-    assert second == first                      # same value, recomputed
-    assert (est.calls, pipe.calls) == (2, 2)
 
 
 def test_flag_off_never_caches_the_commit_stage(monkeypatch, db):
@@ -597,17 +316,8 @@ def test_trigger_builds_one_deps_bundle_per_second():
     assert len(built) == 2
 
 
-# --------------------------------------------------------------------------- scan-level precompute
-
-
 def _scan_rig(monkeypatch, *, scorer_calls: list, resolved):
-    """A fast scan wired to the real Stage-4 scoring path.
-
-    ``score_cell_hgb`` is replaced by a DETERMINISTIC counting stub so the
-    assertion can be "the scan paid zero scorer calls", which is only true if the
-    memo served it. Everything above the scorer (the fingerprint, the engine
-    accessors, the candidate/dedup guards) is the real code.
-    """
+    """A fast scan with a counting scorer stub and a stubbed resolver."""
     sleeve = _hgb_sleeve()
     deps, _s, _e, _p = _rig(
         peek_spots=lambda **k: {
@@ -626,33 +336,9 @@ def _scan_rig(monkeypatch, *, scorer_calls: list, resolved):
         return frozen
 
     monkeypatch.setattr(P, "_venue_market_cache_has", lambda *a, **k: True)
-    monkeypatch.setattr(P, "score_cell_hgb", _scorer)
+    monkeypatch.setattr(P, "_score_cell_for", _scorer)
     monkeypatch.setattr(P, "_resolve_net_cells", resolved)
     return sleeve, deps, _portfolio(sleeve)
-
-
-def test_an_event_between_boundaries_reuses_second_s_precompute(monkeypatch):
-    """THE fast-path claim: a fire that lands mid-second re-derives NOTHING the
-    boundary tick already derived for second S — same spot bucket, same engine,
-    same offset => the memo serves and the scorer is not called again."""
-    calls: list = []
-    sleeve, deps, portfolio = _scan_rig(
-        monkeypatch, scorer_calls=calls,
-        resolved=lambda cells, **kw: [],      # stop after the rescore
-    )
-    nan = float("nan")
-    # Second S, on the 1Hz thread: exactly the arguments run_scanner_tick's
-    # Phase A passes for this cell — and OUTSIDE the memo-read context, because
-    # the tick POPULATES the memo without ever serving from it.
-    _score_as_tick(deps, sleeve, yes_ask=nan, no_ask=nan)
-    assert len(calls) == 1
-    # ...then two mid-second fires.
-    for _ in range(2):
-        P.run_fast_entry_scan(
-            object(), portfolio, now_ts=_NOW, deps=deps,
-            trigger_src="fast_event",
-        )
-    assert len(calls) == 1, "a mid-second fire re-scored second S from scratch"
 
 
 def test_the_dd_halt_still_binds_on_a_cached_commit_stage(monkeypatch, db):
@@ -782,7 +468,7 @@ def test_placement_line_carries_the_full_breakdown(monkeypatch, caplog):
     )
     monkeypatch.setattr(P, "_venue_market_cache_has", lambda *a, **k: True)
     monkeypatch.setattr(
-        P, "score_cell_hgb",
+        P, "_score_cell_for",
         lambda **kw: SimpleNamespace(skip_reason=None, side="YES"),
     )
     monkeypatch.setattr(
@@ -833,6 +519,6 @@ def test_placement_line_carries_the_full_breakdown(monkeypatch, caplog):
     line = next(m for m in caplog.messages if m.startswith("fast_entry placed"))
     for field in (
         "trigger_to_post_ms=", "pre_ms=", "ctx_ms=", "ctxhit=1", "walk_ms=0.4",
-        "sign_ms=2", "post_ms=302", "db_ms=", "score=", "cells=", "bettable=",
+        "sign_ms=2", "post_ms=302", "db_ms=", "cells=", "bettable=",
     ):
         assert field in line, f"{field!r} missing from {line!r}"

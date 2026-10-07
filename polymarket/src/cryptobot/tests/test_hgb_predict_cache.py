@@ -27,7 +27,6 @@ from cryptobot.strategy.hgb_loader import (
     _PROBA_CACHE_MAX,
     predict_model_prob,
 )
-from cryptobot.tests._artifact_skips import needs_checkpoint
 
 
 class _FakePipe:
@@ -112,21 +111,3 @@ def test_duck_typed_stand_in_without_cache_still_predicts() -> None:
     assert pipe.calls == 1
 
 
-@needs_checkpoint
-def test_cached_value_is_byte_identical_to_fresh_recompute() -> None:
-    from cryptobot.strategy.checkpoint_loader import load_checkpoint_models
-
-    hgb = load_checkpoint_models()[1]
-    cols = hgb.columns_for("5m")
-    row = [0.1 * (i + 1) for i in range(len(cols))]
-
-    # Ground truth: recompute directly off the pipeline, no cache involved.
-    pipe = hgb.pipelines["5m"]
-    truth = float(pipe.predict_proba(pd.DataFrame([row], columns=cols))[:, 1][0])
-
-    first = predict_model_prob(hgb, interval="5m", feature_row_values=row)
-    hit = predict_model_prob(hgb, interval="5m", feature_row_values=row)
-
-    assert first == truth  # memoized path matches the raw predict bit-for-bit
-    assert hit == first  # and the hit is the exact same float object value
-    assert hgb._proba_cache[("5m", tuple(row))] == truth

@@ -331,6 +331,8 @@ class TestConfigConstantsMatchBacktest:
     def test_live_initial_bankroll_env_override(self) -> None:
         env = os.environ.copy()
         env["CRYPTOBOT_INITIAL_BANKROLL"] = "120.3838"
+        # Import this checkout's package, not whatever is installed.
+        env["PYTHONPATH"] = str(Path(config.__file__).resolve().parents[1])
         env.pop("INITIAL_BANKROLL", None)
         out = subprocess.check_output(
             [

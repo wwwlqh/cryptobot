@@ -182,7 +182,6 @@ def test_pipeline_persists_the_same_exact_twap_anchor(monkeypatch):
             value = "100.125" if self.calls == 1 else "999.0"
             return SimpleNamespace(value=Decimal(value))
 
-    monkeypatch.setattr(config, "TWAP_SYMMETRIC_ENABLED", True)
     mirror = Mirror()
     deps = SimpleNamespace(
         twap_mirror=mirror,
@@ -219,7 +218,6 @@ def test_resolver_carries_captured_twap_to_rescore_and_ledger(monkeypatch):
         def get_opening_twap(self, *args, **kwargs):
             raise AssertionError("resolver must not re-read a captured TWAP")
 
-    monkeypatch.setattr(config, "TWAP_SYMMETRIC_ENABLED", True)
     monkeypatch.setattr(pipeline, "_venue_market_cache_has", lambda *a: False)
     captured_kwargs = []
     frozen_score = SimpleNamespace(skip_reason=None, side="YES")

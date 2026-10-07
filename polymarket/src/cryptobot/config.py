@@ -391,44 +391,9 @@ V6_CONFIG_PATH: Path = _resolve_artifact(
     ("legacy", _REPO_ROOT / "backtest" / "optimize_runs" / "v2_step1last_live.json"),  # legacy-path-ok: pre-restructure checkouts
     ("new", _REPO_ROOT / "polymarket" / "live" / "config" / "v2_step1last_live.json"),
 )
-# RETIRED 2026-07-31 (exp044). Phases 1-2 took them off the live boot path;
-# phase 3 removed the last research readers, so all three are now artifacts with
-# ZERO consumers anywhere in the tree:
-#   * the baseline minute-entry HGB — data/models/hgb_v1.joblib +
-#     hgb_v1_manifest.json (CRYPTOBOT_HGB_MODEL / CRYPTOBOT_HGB_MANIFEST). Its
-#     last reader, the checkpoint-grid WFO, now carries the exp044 sleeve recipe
-#     inline (training/checkpoint.py EXP044_SLEEVES).
-#   * the baseline RF — data/models/rf_v1.joblib + rf_v1_manifest.json
-#     (CRYPTOBOT_RF_MODEL / CRYPTOBOT_RF_MANIFEST). Its only live consumer was
-#     the lut|rf|blend scorer, which went with the pair sleeves; the joblib and
-#     its research loader were deleted in phase 3.
-#   * the LUT — decision_table.parquet + its .lutcache.pkl sidecar
-#     (CRYPTOBOT_DECISION_TABLE). Only the pair sleeves and that same scorer
-#     ever looked a bucket up; the parquet was deleted in phase 3 with its whole
-#     producer chain.
-# Every live hgb sleeve is a checkpoint sleeve served by checkpoint_v1 below.
-# checkpoint_v1: frozen per-checkpoint-second sub-minute models (RF forests keyed
-# by (coin, interval, checkpoint_sec) + a per-interval HGB), built by
-# polymarket/backtest/training/export_models.py to give the sub-minute sleeves live/backtest
-# DECISION parity (2026-07-05 parity audit). Loaded only when SUBMINUTE_ENABLED.
-_CHECKPOINT_DIR = DATA_ROOT / "models" / "checkpoint_v1"
-CHECKPOINT_RF_MODEL_PATH: Path = _path(
-    "CRYPTOBOT_CHECKPOINT_RF_MODEL", _CHECKPOINT_DIR / "checkpoint_rf_v1.joblib"
-)
-CHECKPOINT_HGB_MODEL_PATH: Path = _path(
-    "CRYPTOBOT_CHECKPOINT_HGB_MODEL", _CHECKPOINT_DIR / "checkpoint_hgb_v1.joblib"
-)
-CHECKPOINT_MANIFEST_PATH: Path = _path(
-    "CRYPTOBOT_CHECKPOINT_MANIFEST", _CHECKPOINT_DIR / "checkpoint_v1_manifest.json"
-)
-
-# Chainlink-TWAP symmetric model. When enabled, the sub-minute sleeves keep
-# Binance for the decision-time spot and realized-volatility denominator, but
-# re-anchor the return numerator to Chainlink's exact 60s TWAP sample at
-# the market boundary. The scorer fails closed if that RTDS anchor is absent.
-TWAP_SYMMETRIC_ENABLED: bool = os.environ.get(
-    "CRYPTOBOT_TWAP_SYMMETRIC_ENABLED", "0"
-).strip().lower() in {"1", "true", "yes", "on"}
+# The TWAP model: one HistGradientBoosting classifier per interval, trained on
+# Chainlink 60-second TWAP settlement labels (polymarket/backtest/training/
+# export_twap_symmetric_60s.py).
 _TWAP_SYMMETRIC_DIR = DATA_ROOT / "models" / "twap_symmetric_v1"
 TWAP_SYMMETRIC_MODEL_PATH: Path = _path(
     "CRYPTOBOT_TWAP_SYMMETRIC_MODEL",
@@ -1034,21 +999,6 @@ BOOK_WS_WATCHDOG_VERIFY_TTL_MS: int = int(os.environ.get(
 BOOK_WS_WATCHDOG_SIZE_REL_TOL: float = float(os.environ.get(
     "CRYPTOBOT_BOOK_WS_WATCHDOG_SIZE_REL_TOL", "0.02"
 ))
-
-# -- RF step-function LUT (2026-07-25 latency audit) ---------------------------
-# The checkpoint RF forests are univariate (feature_columns ==
-# ['partial_ret_z_1h']), so each forest is exactly a step function of z and can be
-# served by a searchsorted instead of 200 tree traversals — 0.003ms vs ~6.8ms
-# measured, and score_cell_hgb calls predict_proba once per cell
-# (~36ms/order tick). LUTs are built on a daemon thread; a slice serves the
-# unchanged sklearn path until its LUT lands. (Unrelated to the retired
-# decision_table LUT — this is a per-forest step function, not a hit-rate table.)
-# Default ON, but kill-switchable WITHOUT a redeploy: this is the one change in
-# the pass that alters a number the decision reads, so the operator keeps a lever.
-# Set 0 to force every slice back onto sklearn.
-RF_STEP_LUT_ENABLED: bool = os.environ.get(
-    "CRYPTOBOT_RF_STEP_LUT", "true"
-).strip().lower() in ("1", "true", "yes")
 
 # Binance market-data-only base URL recommended by Binance for public market
 # data. Operators can switch to https://api.binance.com or api1-api4 if needed.

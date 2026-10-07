@@ -33,7 +33,6 @@ import numpy as np
 import pytest
 
 from cryptobot import config
-from cryptobot.tests._artifact_skips import needs_checkpoint
 from cryptobot.strategy.hgb_features import (
     COIN_MAP,
     FEATURE_GROUPS,
@@ -51,18 +50,6 @@ from polymarket.backtest.training import modeling as ev  # noqa: E402
 # The served checkpoint_v1 feature set, manifest order. Both intervals serve the
 # same 11 columns (asserted below against the on-disk manifest).
 FCOLS_5M = _feature_columns("rf,price,identity,time")[1]
-
-
-@pytest.fixture(scope="module")
-def hgb():
-    """The LIVE serving artifact: checkpoint_v1's per-interval HGB pipelines.
-
-    (2026-07-31: the frozen minute-sliced ``hgb_v1`` bundle this fixture used
-    to load was retired with exp044 — checkpoint_v1 is the only HGB the live
-    scorer serves.)"""
-    from cryptobot.strategy.checkpoint_loader import load_checkpoint_models
-
-    return load_checkpoint_models()[1]
 
 
 # --------------------------------------------------------------------------
@@ -246,17 +233,6 @@ def test_live_features_match_backtest_checkpoint_frame(interval, n_cols, side):
     assert n_compared == expected_rows
 
 
-@needs_checkpoint
-def test_checkpoint_parity_fixture_exercises_the_manifest_columns():
-    """Guard the gate above: it must cover exactly the columns the LIVE
-    checkpoint_v1 manifest serves, or it proves parity on the wrong vector."""
-    import json
-
-    manifest = json.loads(Path(config.CHECKPOINT_MANIFEST_PATH).read_text(encoding="utf-8"))
-    for interval in ("5m", "15m"):
-        assert manifest["feature_columns"][interval] == FCOLS_5M
-
-
 def test_window_start_ts_drives_hour_dow():
     """hour_utc/dow_utc come from window_start_ts, NOT now. 2025-05-04 12:34:56
     UTC is a Sunday (pandas dayofweek/Python weekday Mon=0..Sun=6 -> 6), hour 12.
@@ -358,64 +334,6 @@ def test_unknown_coin_and_interval_raise():
 # now (see test_checkpoint_parity.py); what survives here is the parity gate
 # between the live feature builder and the served pipeline.
 # --------------------------------------------------------------------------
-
-
-@needs_checkpoint
-def test_loader_serves_the_manifest_feature_columns(hgb):
-    assert set(hgb.pipelines) == {"5m", "15m"}
-    for interval in ("5m", "15m"):
-        cols = hgb.columns_for(interval)
-        assert cols == hgb.manifest["feature_columns"][interval]
-        assert cols == FCOLS_5M
-
-
-@needs_checkpoint
-@pytest.mark.parametrize("interval,feature_columns", [("5m", FCOLS_5M), ("15m", FCOLS_5M)])
-def test_predict_model_prob_matches_pipeline(hgb, interval, feature_columns):
-    """predict_model_prob == the pipeline's own predict_proba on the same rows,
-    built from the LIVE feature vectors (end-to-end builder -> loader path).
-
-    Vectors come from the same substrate-free checkpoint fixture the parity gate
-    above uses (the decision_table rows this used to read were retired
-    2026-07-31)."""
-    import pandas as pd
-
-    from cryptobot.strategy.hgb_loader import predict_model_prob
-
-    rows = _ckpt_rows(interval).head(64)
-    live_vectors = []
-    for row in rows.itertuples(index=False):
-        vec = build_feature_vector(
-            side="Up" if int(row.won_up) else "Down",
-            coin=str(row.coin),
-            interval=interval,
-            interval_min=int(ev.INTERVAL_MAP[interval]),
-            entry_minute=float(row.entry_minute),
-            window_start_ts=int(row.entry_ts),
-            model_p_up=float(
-                _stub_p_up(
-                    float(row.partial_ret_z_1h),
-                    str(row.coin).lower(),
-                    str(row.interval).lower(),
-                    int(row.checkpoint_sec),
-                )
-            ),
-            ask=float(row.ask),
-            other_ask=float(row.other_ask),
-            partial_ret_z_1h=float(row.partial_ret_z_1h),
-            feature_columns=feature_columns,
-        )
-        assert vec is not None
-        live_vectors.append(vec)
-    assert live_vectors
-
-    # Direct pipeline call on the same vectors (manifest column order).
-    frame = pd.DataFrame(live_vectors, columns=feature_columns)
-    direct = hgb.pipelines[interval].predict_proba(frame)[:, 1]
-
-    for i, vec in enumerate(live_vectors):
-        got = predict_model_prob(hgb, interval=interval, feature_row_values=vec)
-        assert got == pytest.approx(float(direct[i]), abs=1e-12)
 
 
 def test_coin_map_matches_backtest():
