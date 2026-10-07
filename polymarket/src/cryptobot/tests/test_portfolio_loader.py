@@ -886,25 +886,3 @@ def _edge_cap_artifact(tmp_path: Path) -> Path:
     )
 
 
-def test_edge_cap_off_keeps_artifact_max_edge(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Default 0.0 = byte-identical: the artifact's max_edge loads untouched."""
-    monkeypatch.setattr(config, "V2_EDGE_CAP", 0.0)
-    assert load_sleeves(_edge_cap_artifact(tmp_path)).sleeves[0].max_edge == 0.70
-
-
-def test_edge_cap_clamps_artifact_max_edge(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Armed cap below the artifact ceiling wins: max_edge = cap."""
-    monkeypatch.setattr(config, "V2_EDGE_CAP", 0.06)
-    assert load_sleeves(_edge_cap_artifact(tmp_path)).sleeves[0].max_edge == 0.06
-
-
-def test_edge_cap_above_artifact_ceiling_is_inert(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A cap looser than the artifact's own ceiling never RAISES it."""
-    monkeypatch.setattr(config, "V2_EDGE_CAP", 0.90)
-    assert load_sleeves(_edge_cap_artifact(tmp_path)).sleeves[0].max_edge == 0.70

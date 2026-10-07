@@ -327,44 +327,6 @@ def test_consume_on_fill_next_attempt_numbers_placements():
     assert wd.next_attempt(_cell(292, 0.70, 0.50, side="NO")) == 1
 
 
-def test_allow_refill_default_false_is_byte_identical():
-    # Multifill: on_second() without allow_refill must be UNCHANGED — a filled
-    # market stays consumed, both sides skipped. Default keyword = inert.
-    wd = WindowDecider(consume_on_fill=True)
-    assert wd.on_second(_cell(292, 0.70, 0.50, side="YES")) == "PLACE"
-    wd.note_fill(_cell(292, 0.70, 0.50, side="YES"))
-    assert wd.on_second(_cell(293, 0.70, 0.99, side="YES")) == "SKIP"  # consumed
-    # explicit allow_refill=False is identical to omitting it.
-    assert wd.on_second(
-        _cell(294, 0.70, 0.99, side="YES"), allow_refill=False
-    ) == "SKIP"
-
-
-def test_allow_refill_true_bypasses_fill_veto_for_new_entry():
-    # Multifill: allow_refill=True re-opens an already-FILLED market so a NEW
-    # independent entry can PLACE (the caller only sets this above the equity
-    # floor + under the entry cap; the band/window/offset/gate still all apply).
-    wd = WindowDecider(consume_on_fill=True)
-    assert wd.on_second(_cell(292, 0.70, 0.50, side="YES")) == "PLACE"
-    wd.note_fill(_cell(292, 0.70, 0.50, side="YES"))
-    # a fresh later second with allow_refill -> PLACE despite the prior fill.
-    assert wd.on_second(
-        _cell(293, 0.70, 0.50, side="YES"), allow_refill=True
-    ) == "PLACE"
-    # band still binds under refill (0.60 out of MID band -> SKIP, not PLACE).
-    assert wd.on_second(
-        _cell(294, 0.60, 0.50, side="YES"), allow_refill=True
-    ) == "SKIP"
-    # gate still binds under refill (edge below 0.03 -> SKIP).
-    assert wd.on_second(
-        _cell(295, 0.70, 0.01, side="YES"), allow_refill=True
-    ) == "SKIP"
-    # same-second never double-fires even under refill.
-    assert wd.on_second(
-        _cell(293, 0.70, 0.50, side="YES"), allow_refill=True
-    ) == "SKIP"
-
-
 def test_flag_off_restores_legacy_first_commit():
     # consume_on_fill=False (flag=0) -> legacy: first in-band second consumes
     # the window whether it PLACEs or gate-fails; note_fill is a no-op.

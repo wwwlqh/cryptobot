@@ -617,15 +617,6 @@ def score_cell_hgb(
     # selection-key divergence and lets the parity test guard it exactly.
     best_edge, best_side, best_prob = max(candidates, key=lambda c: (c[0], c[2]))
     realized_edge = best_edge - sleeve.slippage_haircut
-    # SUBMINUTE_FLIP_SIDE (operator order 2026-08-07): selection above ran
-    # untouched on the model's side — same firing seconds, same gates — and
-    # only the RETURNED side is inverted, so every downstream consumer
-    # (book routing, walker, ledger.side, grading) follows the flip natively.
-    # model_p/edge stay the MODEL side's numbers on purpose: the threshold and
-    # edge gates must pass exactly when they pass today. See config.py for the
-    # provenance trap this creates in signals/ledger.
-    if config.SUBMINUTE_FLIP_SIDE:
-        best_side = "NO" if best_side == "YES" else "YES"
     return ScoreResult(
         model_p=best_prob,
         side=best_side,

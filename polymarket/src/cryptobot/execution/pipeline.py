@@ -26,7 +26,6 @@ import contextlib
 import json
 import logging
 import math
-import queue
 import sqlite3
 import threading
 import time
@@ -50,16 +49,13 @@ from cryptobot.execution.capital import (
 )
 from cryptobot.execution.fill_rate_breaker import (
     BreakerState,
-    RampState,
     evaluate_breaker,
-    ramp_state,
     record_subminute_fill,
 )
 from cryptobot.execution.gates import GateInput, evaluate_gates
 from cryptobot.execution.ledger import (
     BetSignal,
     claim_subminute_scan,
-    count_window_entries,
     record_bet,
     record_signal_skip,
     record_signal_would_bet,
@@ -67,7 +63,6 @@ from cryptobot.execution.ledger import (
     subminute_market_other_sleeve,
     subminute_slot_seen,
     subminute_window_existing_side,
-    subminute_window_existing_side_any_sleeve,
     subminute_window_state,
     utc_now_iso,
 )
@@ -92,7 +87,7 @@ from cryptobot.execution.strategy_constants import (
     LIVE_READINESS_CACHE_TTL_S,
 )
 from cryptobot.execution.walk_book import walk_book_edge_preserving
-from cryptobot.execution import sizing_v2, held_position_pass
+from cryptobot.execution import sizing_v2
 from cryptobot.strategy import spec_v2
 from cryptobot.strategy.partial_ret import PartialRetEngine
 from cryptobot.strategy.score import ScoreResult, score_cell_hgb, score_cell_twap
@@ -210,8 +205,7 @@ def _v2_prune_window_decider(now_ts: int) -> None:
     retention never evicts a still-open window. Prunes the module-global MID
     decider, every per-sleeve decider, and the cross-sleeve market-filled set.
     """
-    global _V2_MARKET_FILLED, _FAST_REQUOTE_ATTEMPTS, _V2_RETRY_DIP_LIMIT
-    global _V2_FIRST_ATTEMPT_REJECTED
+    global _V2_MARKET_FILLED
     cutoff = int(now_ts) - _V2_DECIDER_RETAIN_SECONDS
     # De-dup by identity: the MID label(s) alias _V2_WINDOW_DECIDER.
     deciders = {id(_V2_WINDOW_DECIDER): _V2_WINDOW_DECIDER}
@@ -238,21 +232,6 @@ def _v2_prune_window_decider(now_ts: int) -> None:
             }
     if len(_V2_MARKET_FILLED) > _V2_DECIDER_PRUNE_ABOVE:
         _V2_MARKET_FILLED = {k for k in _V2_MARKET_FILLED if k[2] >= cutoff}
-    # Fix 3b fast-requote bound set — same window_start (index 2) cutoff.
-    if len(_FAST_REQUOTE_ATTEMPTS) > _V2_DECIDER_PRUNE_ABOVE:
-        _FAST_REQUOTE_ATTEMPTS = {
-            k: v for k, v in _FAST_REQUOTE_ATTEMPTS.items() if k[2] >= cutoff
-        }
-    # Retry adverse-dip gate map — same window_start (index 2) cutoff.
-    if len(_V2_RETRY_DIP_LIMIT) > _V2_DECIDER_PRUNE_ABOVE:
-        _V2_RETRY_DIP_LIMIT = {
-            k: v for k, v in _V2_RETRY_DIP_LIMIT.items() if k[2] >= cutoff
-        }
-    # First-attempt-only spent-side set — same window_start (index 2) cutoff.
-    if len(_V2_FIRST_ATTEMPT_REJECTED) > _V2_DECIDER_PRUNE_ABOVE:
-        _V2_FIRST_ATTEMPT_REJECTED = {
-            k for k in _V2_FIRST_ATTEMPT_REJECTED if k[2] >= cutoff
-        }
 
 
 def _v2_decider_cell(
@@ -444,11 +423,6 @@ class TickResult:
     # immediate-fill GETs (~50-260ms/order) are NOT counted here. Treat ms_tail
     # as a lower bound when deciding whether the tail is harmless.
     ms_tail: float = 0.0
-    # Book stage split: the entry/decision path vs the held-position pass that runs
-    # AFTER the POST. `ms_book` conflated them, so the headline book p50 was
-    # mostly post-POST cost and not decision-path cost at all.
-    ms_book_stop: float = 0.0
-    n_book_stop: int = 0
     # Σ walk_book_edge_preserving inside `_commit_cell` (2026-07-30 fast-entry
     # latency decomposition). The fast rung's placement line reported ONE number
     # for the whole commit loop, so "80ms of controllable cost" was
@@ -507,14 +481,6 @@ class _LiveCommitContext:
     order_client: Optional[object]
     notify: Optional[Callable[..., None]]
     tick_group_live_delta: dict[str, float]
-    # Fix 3a: the shared WS/prefetch book source (TickDeps.book_prefetch), wired
-    # here so _commit_cell can re-read the correct-side book immediately before a
-    # LIVE order POST (pre-POST freshness recheck). None => no source wired =>
-    # the recheck fails open (byte-identical to today). Assigned at construction
-    # from deps.book_prefetch; carrying the reference is inert unless
-    # config.PREPOST_RECHECK_ENABLED (or the WS-shadow validation mode) is on.
-    book_source: Optional[object] = None
-
 
 def _qualifying_entry_minute(sleeve: Sleeve, current_minute: int) -> Optional[int]:
     """Return the matching entry_minute if this tick is at a qualifying
@@ -1329,116 +1295,6 @@ def _sleeve_entry_gate(
     return None
 
 
-def _late_window_skip(
-    coin: str,
-    offset_sec: Optional[int],
-    interval_min: int,
-    wallet_mode: str,
-) -> bool:
-    """Late-window entry skip predicate (config.LATE_WINDOW_SKIP, default {}).
-
-    THE single authority for this gate's whole scope — the caller just tests the
-    boolean. Returns True only for a LIVE offset cell whose ``coin`` has a
-    configured late-window cutoff AND the order would land within that many
-    seconds of the window close (``interval_min*60 - offset_sec <= cutoff``). BTC
-    entries in the last ~20s of a window are a validated -EV cohort
-    (+$34.93/era when skipped, split-half validated). Pure so it unit-tests
-    directly (mirrors _prepost_recheck).
-
-    Byte-identical when unconfigured: the empty (falsy) dict short-circuits
-    BEFORE any lookup so the common path is zero-work. Never skips outside LIVE
-    (``wallet_mode != "LIVE"`` — DRY paper rows keep research parity), and
-    ``offset_sec is None`` (a minute-boundary cell with no sub-second offset) is
-    NEVER a late-window skip.
-    """
-    skip_map = config.LATE_WINDOW_SKIP
-    if not skip_map or offset_sec is None or wallet_mode != "LIVE":
-        return False
-    cutoff = skip_map.get((coin or "").upper())
-    if cutoff is None:
-        return False
-    return (interval_min * 60 - offset_sec) <= cutoff
-
-
-def _early_window_skip(
-    offset_sec: Optional[int],
-    interval_min: int,
-    wallet_mode: str,
-) -> bool:
-    """Early-window entry skip predicate (config.ENTRY_LAST_SECS_ONLY, 0=OFF).
-
-    THE single authority for this gate's whole scope — the caller just tests
-    the boolean. Operator order 2026-08-08 (flip era): LIVE entries only within
-    the final N seconds of the window; True when the order would land EARLIER
-    than that (``interval_min*60 - offset_sec > N``). Complements
-    ``_late_window_skip`` (which blocks the final seconds): with LATE=5 and
-    N=15 the live entry band is seconds-to-close 6..15, all coins, both
-    intervals. Byte-identical when unconfigured (0 short-circuits), never
-    skips outside LIVE, and ``offset_sec is None`` is never a skip — all
-    mirroring ``_late_window_skip``. Pure so it unit-tests directly.
-    """
-    limit = config.ENTRY_LAST_SECS_ONLY
-    if limit <= 0 or offset_sec is None or wallet_mode != "LIVE":
-        return False
-    return (interval_min * 60 - offset_sec) > limit
-
-
-def _ask_band_skip(coin: str, sleeve_label: str, ask: Optional[float]) -> bool:
-    """Ask-band entry skip predicate (config.ASK_BAND_SKIP, default ()).
-
-    THE single authority for this gate's whole scope — the caller just tests the
-    boolean. Returns True when ``ask`` lands inside a configured (coin, sleeve)
-    band that the 2026-07-20 ledger study measured as adverse (SOL's 0.65-0.85
-    marginal-favorite band on the sub-minute sleeves: WR 87.3% -> 69.5%,
-    +6.85c/$ -> -20.44c/$, while ETH/BTC HELD in the same band on the same
-    days). Pure so it unit-tests directly (mirrors _late_window_skip).
-
-    ``ask`` is the DECISION-TIME top-of-book ask — the same ``ask_book.top_ask``
-    scalar that feeds the sleeve band test (``_pick_ask`` -> ``WindowDecider.
-    _in_band``), ``GateInput.fill_price``, ``BetSignal.p_market`` and the
-    signals row's ``ask`` column. Gating on the identical quantity is what makes
-    the pinned band mean the same thing here, in the strategy spec, and in the
-    ledger the re-enable criterion will be graded from.
-
-    Band convention follows ``spec_v2.WindowDecider._in_band``: ``lo < ask <=
-    hi`` (open low, closed high), i.e. the strategy's documented MID band
-    ``(0.65, 0.85]``. An ask of exactly LO is OUTSIDE the skip band and trades;
-    exactly HI is inside and is skipped.
-
-    Sleeve selection is a PREFIX match on the lower-cased label, so
-    ``SOL:subminute:...`` covers ``subminute_5m`` AND ``subminute_15m`` while a
-    sleeve whose label does not start with the configured prefix is untouched;
-    ``*`` matches every sleeve.
-
-    Byte-identical when unconfigured: the empty (falsy) tuple short-circuits
-    BEFORE any comparison so the common path is zero-work. FAIL-OPEN on a
-    missing / non-finite ask (never skip on an unknown price).
-
-    DRY-INVARIANT BY CONSTRUCTION: there is no ``wallet_mode`` parameter, so a
-    DRY paper row and a LIVE order reach the identical verdict. This is a
-    DELIBERATE divergence from ``_late_window_skip`` (LIVE-only, for research
-    parity): that gate tunes execution timing, whereas this one removes a
-    cohort whose EDGE was refuted, so the DRY paper stream must stop claiming
-    edge the live book no longer has.
-    """
-    rules = config.ASK_BAND_SKIP
-    if not rules or ask is None:
-        return False
-    ask_f = float(ask)
-    if not math.isfinite(ask_f):
-        return False  # unknown price -> never suppress an order
-    coin_u = (coin or "").upper()
-    label = (sleeve_label or "").lower()
-    for rule in rules:
-        if rule.coin != coin_u:
-            continue
-        if rule.sleeve != "*" and not label.startswith(rule.sleeve):
-            continue
-        if rule.lo < ask_f <= rule.hi:
-            return True
-    return False
-
-
 def _execution_min_edge(sleeve: Sleeve) -> float:
     """Minimum realized VWAP edge required by the execution walker."""
     threshold = getattr(sleeve, "threshold", None)
@@ -1464,923 +1320,6 @@ def _execution_max_walk_price(sleeve: Sleeve) -> Optional[float]:
     ) is None:
         return None
     return sleeve.max_walk_price
-
-
-# --------------------------------------------------------------------------- Fix 3a
-# Pre-POST freshness recheck (flag-gated, default OFF). See
-# config.PREPOST_RECHECK_ENABLED. The seam lives entirely in _commit_cell (right
-# before the LIVE reserve/POST); these module-level helpers hold the pure decision
-# logic + the shadow-validation counters so they unit-test without driving a tick.
-
-# Shadow-validation counters (module-level, observational only). Populated ONLY in
-# SHADOW mode (recheck disabled + WS shadow on): each LIVE offset would-POST whose
-# fresh-book re-walk WOULD have skipped is classified against the real order
-# outcome, so the operator can grade the gate's true-positive rate (>=90% over
-# >=3 days = the enable-live gate) WITHOUT changing any behavior. Reset only on
-# process restart.
-_PREPOST_SHADOW_COUNTS: dict[str, int] = {
-    "would_skip": 0,           # total would-skip verdicts observed
-    "would_skip_rejected": 0,  # true positive: the POST really rejected
-    "would_skip_filled": 0,    # false positive: the POST really filled
-}
-# Drop-guard (TOXIC direction) shadow counters — separate ledger from the cover
-# guard above (config.PREPOST_DROP_GUARD_MODE == "shadow"). The cover guard's
-# reject-is-good "true positive" framing does NOT apply here (the drop guard's
-# would-skip predicts a TOXIC FILL below the decision ask, so a real FILL is the
-# avoided-toxic-fill, not a false positive). To avoid mislabeling, this dict uses
-# NEUTRAL outcome keys (`filled`/`rejected`); the operator grades polarity
-# offline by joining the logged decision+fresh ask back to the ledger.
-_PREPOST_DROP_SHADOW_COUNTS: dict[str, int] = {
-    "would_skip": 0,
-    "filled": 0,
-    "rejected": 0,
-}
-
-
-def _prepost_shadow_active() -> bool:
-    """True when the recheck should run in SHADOW (count-only) mode: the WS
-    shadow-compare infra is armed but the recheck itself is not enabled. In this
-    mode the gate NEVER suppresses an order — it only records what it WOULD have
-    decided vs the real fill/reject."""
-    return config.BOOK_WS_ENABLED and config.BOOK_WS_SHADOW
-
-
-def _prepost_shadow_classify(
-    *, filled: bool, coin: str, sleeve: str, offset_sec: Optional[int],
-    guard: str = "cover",
-    decision_ask: Optional[float] = None,
-    fresh_ask: Optional[float] = None,
-) -> None:
-    """Record + log one shadow would-skip verdict against the real outcome.
-
-    ``guard`` selects the ledger AND the log shape:
-      * "cover" -> _PREPOST_SHADOW_COUNTS (the MISS / book-thinned guard). A
-        would-skip that REJECTS is the true positive, so the line reports the
-        true_pos/false_pos rate the enable-live gate grades against.
-      * "drop"  -> _PREPOST_DROP_SHADOW_COUNTS (the TOXIC / ask-collapsed guard).
-        Reject-is-good does NOT hold here, so it uses NEUTRAL outcome labels
-        (filled/rejected) and logs the decision + fresh ask so offline grading
-        joins the drop magnitude back to the ledger — no misleading true_pos%.
-    """
-    if guard == "drop":
-        counts = _PREPOST_DROP_SHADOW_COUNTS
-        counts["would_skip"] += 1
-        counts["filled" if filled else "rejected"] += 1
-        logger.info(
-            "prepost_drop shadow: would_skip %s/%s off=%s dec_ask=%s "
-            "fresh_ask=%s -> real=%s (cum would_skip=%d filled=%d rejected=%d)",
-            coin, sleeve, offset_sec, decision_ask, fresh_ask,
-            "FILLED" if filled else "REJECTED",
-            counts["would_skip"], counts["filled"], counts["rejected"],
-        )
-        return
-    counts = _PREPOST_SHADOW_COUNTS
-    counts["would_skip"] += 1
-    key = "would_skip_filled" if filled else "would_skip_rejected"
-    counts[key] += 1
-    n = counts["would_skip"]
-    tp = counts["would_skip_rejected"]
-    logger.info(
-        "prepost_cover shadow: would_skip %s/%s off=%s -> real=%s "
-        "(cum would_skip=%d true_pos=%d [%.0f%%] false_pos=%d)",
-        coin, sleeve, offset_sec,
-        "FILLED" if filled else "REJECTED",
-        n, tp, (100.0 * tp / n) if n else 0.0,
-        counts["would_skip_filled"],
-    )
-
-
-def _prepost_fresh_cover(
-    book_source,
-    token_id: str,
-    now_ts: int,
-    *,
-    ask_book,
-    walker_target: float,
-    model_p: float,
-    sleeve: Sleeve,
-    anchor_for_walker: Optional[float],
-    fee_rate_bps: Optional[float] = None,
-    max_walk_price_override: Optional[float] = None,
-) -> tuple[Optional[float], Optional[float]]:
-    """Re-read the correct-side book from ``book_source`` and re-walk it with the
-    SAME params as the decision walk; return ``(cover, fresh_top_ask)`` where
-    ``cover`` is the fresh coverable notional ($) and ``fresh_top_ask`` is the
-    fresh book's best ask (for the drop guard).
-
-    Returns ``(None, None)`` to FAIL OPEN (proceed exactly as today): no token,
-    no source, no fresh frame for the token, or any error — a missing WS/prefetch
-    frame must NEVER suppress a live order. A fresh frame that is present but
-    un-walkable (thin/empty book => the priced level is gone) returns a cover of
-    0.0, NOT None, so the caller treats it as "no longer covered" rather than
-    fail-open; its ``fresh_top_ask`` is whatever the fresh book reports (None on
-    an empty ask side).
-    """
-    if not token_id or book_source is None:
-        return (None, None)
-    try:
-        fresh = book_source.get(token_id, now_ts=float(now_ts))
-    except Exception:  # noqa: BLE001 — a bad source must never block a live order
-        logger.debug("prepost_recheck book_source.get raised", exc_info=True)
-        return (None, None)
-    if fresh is None:
-        return (None, None)  # no fresh frame => fail open
-    # Canonical finite-or-None idiom (rejects NaN/inf so the drop-guard
-    # subtraction never sees a non-finite ask). Every wired source serves a
-    # BookSnapshot whose top_ask is None only when its ask side is empty.
-    fresh_top_ask = _finite_float_or_none(getattr(fresh, "top_ask", None))
-    try:
-        walked = walk_book_edge_preserving(
-            {"asks": getattr(fresh, "asks", None)},
-            walker_target,
-            prob_safe_floor=model_p,
-            fee_theta=config.POLY_FEE_THETA,
-            # Deliverable 8: thread the per-market predict.fun feeRateBps into the
-            # TENT fee (None on Polymarket => built-in parabola, byte-identical).
-            min_edge=_execution_min_edge(sleeve),
-            min_bet_usd=config.MIN_BET_USD,
-            max_walk_price=(
-                max_walk_price_override
-                if max_walk_price_override is not None
-                else _execution_max_walk_price(sleeve)
-            ),
-            walk_anchor_price=anchor_for_walker,
-        )
-    except Exception:  # noqa: BLE001 — a re-walk failure fails open
-        logger.debug("prepost_recheck re-walk raised", exc_info=True)
-        return (None, None)
-    # walked[0] = filled_usd (coverable notional). A None walk (book present but
-    # nothing clears the edge floor / depth) is a genuine "gone" => 0.0.
-    cover = walked[0] if walked is not None else 0.0
-    return (cover, fresh_top_ask)
-
-
-def _prepost_recheck(
-    *,
-    wallet_mode: str,
-    offset_sec: Optional[int],
-    book_source,
-    order_client,
-    token_id: str,
-    now_ts: int,
-    ask_book,
-    walker_target: float,
-    model_p: float,
-    sleeve: Sleeve,
-    anchor_for_walker: Optional[float],
-    proposed_bet_size: float,
-    decision_top_ask: Optional[float] = None,
-    fee_rate_bps: Optional[float] = None,
-    max_walk_price_override: Optional[float] = None,
-) -> tuple[bool, bool, str, Optional[float]]:
-    """Pre-POST freshness verdict. Returns
-    ``(skip_now, shadow_would_skip, reason, fresh_top_ask)`` with ``reason`` in
-    {"cover", "drop", ""} tagging WHICH guard produced the verdict and
-    ``fresh_top_ask`` the observed fresh best ask (None until a fresh frame is
-    read; the caller logs it in the drop-guard shadow line).
-
-    Two orthogonal guards share the one fresh re-read:
-      * COVER guard (config.PREPOST_RECHECK_ENABLED): the MISS direction — the
-        fresh book no longer covers the stake (the priced level thinned so the
-        FAK would reject). reason "cover".
-      * DROP guard (config.PREPOST_DROP_GUARD_MODE): the TOXIC direction — the
-        fresh best ask DROPPED >= PREPOST_DROP_GUARD_THRESH below
-        ``decision_top_ask`` (the book is collapsing mid-flight so the FAK fills
-        below the decision ask — a validated -EV toxic fill). reason "drop".
-
-    Verdicts:
-      * ``skip_now`` True  -> a LIVE guard says abort: cover guard ENABLED &
-        cover-would-skip, or drop guard mode=="live" & drop-would-skip. The
-        caller writes the guard's skip signal and does NOT reserve/POST (window
-        not consumed). Cover takes precedence when both fire.
-      * ``shadow_would_skip`` True -> the responsible guard is in SHADOW (cover:
-        recheck off + WS shadow on; drop: mode=="shadow"): the gate WOULD have
-        skipped; the caller proceeds to POST as today and classifies the verdict
-        against the real outcome in _process_live_post. Cover precedence again.
-
-    The 4th element ``fresh_top_ask`` carries the observed fresh best ask (the
-    same single fresh re-read — no redundant second book read) so the caller can
-    log it in the drop-guard shadow line without a side-channel.
-
-    FAIL-OPEN / byte-identical when off: the guard short-circuits to
-    ``(False, False, "", None)`` BEFORE any ``book_source`` read whenever NO
-    guard is active (cover neither enabled nor shadow AND drop mode "off"), the
-    cell is not a LIVE offset order that will POST, or no book source is wired.
-    """
-    enabled = config.PREPOST_RECHECK_ENABLED
-    shadow = _prepost_shadow_active()
-    drop_mode = config.PREPOST_DROP_GUARD_MODE  # "off" | "shadow" | "live"
-    if not (
-        (enabled or shadow or drop_mode != "off")
-        and wallet_mode == "LIVE"
-        and offset_sec is not None
-        and order_client is not None
-        and book_source is not None
-    ):
-        return (False, False, "", None)
-    fresh_cover, fresh_top_ask = _prepost_fresh_cover(
-        book_source, token_id, now_ts,
-        ask_book=ask_book, walker_target=walker_target, model_p=model_p,
-        sleeve=sleeve, anchor_for_walker=anchor_for_walker,
-        fee_rate_bps=fee_rate_bps,
-        max_walk_price_override=max_walk_price_override,
-    )
-    if fresh_cover is None:
-        # no fresh frame => fail open, proceed as today
-        return (False, False, "", None)
-    cover_would_skip = (
-        fresh_cover < proposed_bet_size * config.PREPOST_RECHECK_MIN_COVER_FRAC
-    )
-    # Drop verdict: fresh ask fell >= thresh below the decision ask. A pad-
-    # direction move (fresh ask ROSE => negative drop) never trips; a missing
-    # decision or fresh ask fails open (no drop verdict). 1e-12 guards the float
-    # boundary so an exact-thresh drop counts.
-    drop_would_skip = (
-        drop_mode != "off"
-        and fresh_top_ask is not None
-        and decision_top_ask is not None
-        and (decision_top_ask - fresh_top_ask)
-        >= config.PREPOST_DROP_GUARD_THRESH - 1e-12
-    )
-    # LIVE aborts first (cover precedence), then SHADOW would-skips.
-    if enabled and cover_would_skip:
-        return (True, False, "cover", fresh_top_ask)
-    if drop_mode == "live" and drop_would_skip:
-        return (True, False, "drop", fresh_top_ask)
-    if (not enabled) and shadow and cover_would_skip:
-        return (False, True, "cover", fresh_top_ask)
-    if drop_mode == "shadow" and drop_would_skip:
-        return (False, True, "drop", fresh_top_ask)
-    return (False, False, "", fresh_top_ask)
-
-
-# --------------------------------------------------------------------------- Fix 3b
-# Fast-requote for the flicker bucket (config.FAST_REQUOTE_ENABLED, default OFF).
-# On a no_liquidity FAK reject _process_live_post arms ONE bounded fast-requote
-# for the (coin, interval, window_start, side) key; a dedicated short-cadence
-# scheduler job (main.py, HELD_PASS_CADENCE dedicated-job pattern) drains due
-# requotes ~FAST_REQUOTE_DELAY_MS later and replays a fresh-book reserve→POST on
-# its OWN connection + order_client — no inline sleep on the tick thread. Flag
-# OFF => the arm helper short-circuits before any queue write and main.py
-# registers no drain job (byte-identical).
-
-# Only these coarse error_kinds arm a requote — the transient "book flickered
-# away" bucket. auth / market_closed / insufficient_funds / venue_unavailable /
-# post_only / invalid_amount / network / unknown are NOT flicker and never arm.
-_FAST_REQUOTE_ARM_ERROR_KINDS = frozenset({"no_liquidity"})
-# Bounded so a reject storm can never grow memory without limit; overflow just
-# drops the arm (the reject already left the window open for the next 1Hz tick).
-_FAST_REQUOTE_MAX_QUEUE = 1024
-_FAST_REQUOTE_QUEUE: "queue.Queue[_FastRequote]" = queue.Queue(
-    maxsize=_FAST_REQUOTE_MAX_QUEUE
-)
-# Durable-enough in-process bound: attempts armed per (coin, interval,
-# window_start, side) — keyed like _V2_MARKET_FILLED (window_start at index 2 so
-# _v2_prune_window_decider evicts resolved windows). Reset only on process
-# restart (the queue is in-memory too, so a restart cannot leave a stale arm).
-_FAST_REQUOTE_ATTEMPTS: dict[tuple, int] = {}
-
-# Retry adverse-dip gate state (config.RETRY_DIP_GATE_ENABLED, DEFAULT OFF). Maps
-# (coin, interval, window_start, side) -> the FAK limit of a no_liquidity offset
-# reject, so the NEXT-tick per-second retry (V2_REJECT_RETRY) can be skipped when
-# the fresh ask has dipped adversely below that limit. Keyed like
-# _FAST_REQUOTE_ATTEMPTS (window_start at index 2 so _v2_prune_window_decider
-# evicts resolved windows). Populated ONLY when the flag is on (OFF => stays
-# empty => the entry gate no-ops => runtime byte-identical).
-_V2_RETRY_DIP_LIMIT: dict[tuple, float] = {}
-
-
-def _is_adverse_dip(fresh_ask: float, reject_limit: float) -> bool:
-    """The fresh ask has dipped more than |FAST_REQUOTE_MIN_DELTA| below the
-    reject limit — the -EV cheap-refill cohort. The ONE threshold shared by the
-    fast-requote drain fence and the per-tick retry-dip gate so they can never
-    diverge. Callers pass finite prices."""
-    return fresh_ask < reject_limit + config.FAST_REQUOTE_MIN_DELTA
-
-
-def _retry_dip_gate_key(
-    coin: str,
-    interval: str,
-    window_start_ts: int,
-    side: str,
-    *,
-    is_topup: bool,
-    offset_sec: Optional[int],
-) -> Optional[tuple]:
-    """The ``(coin, interval, window_start, side)`` key into
-    ``_V2_RETRY_DIP_LIMIT``, or ``None`` when the gate is off or this cell is
-    ineligible (top-up or non-offset). ONE guard+key shared by the record and
-    check ends so they can never key differently. OFF => None => both ends no-op
-    (runtime byte-identical)."""
-    if not config.RETRY_DIP_GATE_ENABLED or is_topup or offset_sec is None:
-        return None
-    return (coin, interval, int(window_start_ts), side)
-
-
-def _record_retry_dip_limit(
-    coin: str,
-    interval: str,
-    window_start_ts: int,
-    side: str,
-    *,
-    error_kind: Optional[str],
-    is_topup: bool,
-    offset_sec: Optional[int],
-    limit_price: Optional[float],
-) -> None:
-    """Record a no_liquidity offset reject's FAK limit for the retry-dip gate.
-
-    Byte-identical no-op when the flag is off (the key is None, nothing written,
-    so the entry-side gate finds an empty map). Scoped to the SAME cohort the
-    fast-requote arms on (``no_liquidity`` flicker, non-top-up, offset cell) so
-    the raw per-second retry gets the adverse-dip fence the fast-requote already
-    has. Latest reject for a window wins (overwrites)."""
-    key = _retry_dip_gate_key(
-        coin, interval, window_start_ts, side,
-        is_topup=is_topup, offset_sec=offset_sec,
-    )
-    if key is None or error_kind not in _FAST_REQUOTE_ARM_ERROR_KINDS:
-        return
-    lp = _finite_float_or_none(limit_price)
-    if lp is not None:
-        _V2_RETRY_DIP_LIMIT[key] = lp
-
-
-def _retry_adverse_dip_skip(
-    coin: str,
-    interval: str,
-    window_start_ts: int,
-    side: str,
-    top_ask: Optional[float],
-    *,
-    is_topup: bool,
-    offset_sec: Optional[int],
-) -> bool:
-    """True iff the per-second FAK retry should SKIP re-entering this rejected
-    offset window because the FRESH ask has dipped below the prior reject's
-    ``limit + config.FAST_REQUOTE_MIN_DELTA`` — the -EV cheap-refill cohort the
-    fast-requote's own MIN_DELTA gate blocks but the raw retry does not.
-
-    A flicker-back (fresh ask at/above ``limit + MIN_DELTA``) passes (returns
-    False) and still fills, preserving that +EV cohort. Byte-identical no-op
-    (False) when the flag is off, the cell is a top-up / non-offset, the ask is
-    not finite, or no prior reject was recorded for this window."""
-    key = _retry_dip_gate_key(
-        coin, interval, window_start_ts, side,
-        is_topup=is_topup, offset_sec=offset_sec,
-    )
-    if key is None:
-        return False
-    ask = _finite_float_or_none(top_ask)
-    if ask is None:
-        return False
-    prior = _V2_RETRY_DIP_LIMIT.get(key)
-    return prior is not None and _is_adverse_dip(ask, prior)
-
-
-# First-attempt-only state (config.V2_FIRST_ATTEMPT_ONLY, operator 2026-07-29):
-# (coin, interval, window_start, side) keys whose window is SPENT by a
-# no_liquidity offset reject — the first real attempt is final, later qualifying
-# seconds skip instead of retrying. Keyed like _V2_RETRY_DIP_LIMIT (window_start
-# at index 2 so _v2_prune_window_decider evicts resolved windows). Populated
-# ONLY when the flag is on (OFF => stays empty => runtime byte-identical).
-_V2_FIRST_ATTEMPT_REJECTED: set[tuple] = set()
-
-
-def _first_attempt_only_key(
-    coin: str,
-    interval: str,
-    window_start_ts: int,
-    side: str,
-    *,
-    is_topup: bool,
-    offset_sec: Optional[int],
-) -> Optional[tuple]:
-    """The ``(coin, interval, window_start, side)`` key into
-    ``_V2_FIRST_ATTEMPT_REJECTED``, or ``None`` when the flag is off or this
-    cell is ineligible (top-up or non-offset). ONE guard+key shared by the
-    record and check ends so they can never key differently."""
-    if not config.V2_FIRST_ATTEMPT_ONLY or is_topup or offset_sec is None:
-        return None
-    return (coin, interval, int(window_start_ts), side)
-
-
-def _record_first_attempt_reject(
-    coin: str,
-    interval: str,
-    window_start_ts: int,
-    side: str,
-    *,
-    error_kind: Optional[str],
-    is_topup: bool,
-    offset_sec: Optional[int],
-) -> None:
-    """Mark this side window SPENT after a no_liquidity offset reject.
-
-    Byte-identical no-op when the flag is off. Scoped to the same cohort the
-    fast-requote arms on (``no_liquidity``, non-top-up, offset cell): infra /
-    transient error kinds carry no price information and keep retry semantics."""
-    key = _first_attempt_only_key(
-        coin, interval, window_start_ts, side,
-        is_topup=is_topup, offset_sec=offset_sec,
-    )
-    if key is None or error_kind not in _FAST_REQUOTE_ARM_ERROR_KINDS:
-        return
-    _V2_FIRST_ATTEMPT_REJECTED.add(key)
-
-
-def _first_attempt_consumed_skip(
-    coin: str,
-    interval: str,
-    window_start_ts: int,
-    side: str,
-    *,
-    is_topup: bool,
-    offset_sec: Optional[int],
-) -> bool:
-    """True iff this side window was already spent by a prior venue reject
-    (config.V2_FIRST_ATTEMPT_ONLY) — the per-second retry, and any multifill
-    extra on the same side, must skip instead of re-entering."""
-    key = _first_attempt_only_key(
-        coin, interval, window_start_ts, side,
-        is_topup=is_topup, offset_sec=offset_sec,
-    )
-    return key is not None and key in _V2_FIRST_ATTEMPT_REJECTED
-
-
-@dataclass(frozen=True)
-class _FastRequote:
-    """One armed fast-requote — a self-contained snapshot of the rejected
-    placement intent, carried to the drain job's thread. ``sleeve`` is the
-    long-lived read-only Sleeve object (same reference the tick used), so the
-    drain can re-derive band / min_edge / walk params without reconstructing
-    them. ``ready_at_monotonic`` = enqueue time + FAST_REQUOTE_DELAY_MS."""
-
-    sleeve: Sleeve
-    coin: str
-    side: str
-    token_id: str
-    poly_market_id: str
-    entry_minute: int
-    offset_sec: Optional[int]
-    window_start_ts: int
-    window_end_ts: int
-    model_p: float
-    realized_edge: Optional[float]
-    partial_ret_z_1h: Optional[float]
-    lut_p_bucket: Optional[int]
-    lut_hit_rate: Optional[float]
-    lut_n_cum: Optional[int]
-    fee_rate_bps: Optional[float]
-    strike_price: Optional[float]
-    window_open_spot: Optional[float]
-    walker_target: float
-    anchor_for_walker: Optional[float]
-    target_usd: float
-    wallet_id: str
-    wallet_group: Optional[str]
-    config_sha256: str
-    ready_at_monotonic: float
-    # Limit price of the REJECTED post — the adverse-dip gate compares the
-    # fresh ask against this at drain time. None (legacy arms) disables the
-    # gate for that item.
-    rejected_limit_price: Optional[float] = None
-
-
-def _maybe_arm_fast_requote(
-    *,
-    error_kind: Optional[str],
-    sleeve: Sleeve,
-    d: "CellDecision",
-    side: str,
-    token_id: str,
-    walker_target: float,
-    anchor_for_walker: Optional[float],
-    target_usd: float,
-    config_sha256: str,
-    wallet_id: str,
-    wallet_group: Optional[str],
-    now_ts: int,
-    now_monotonic: Optional[float] = None,
-    rejected_limit_price: Optional[float] = None,
-) -> bool:
-    """Arm ONE bounded fast-requote for a no_liquidity offset reject.
-
-    Returns True iff an item was enqueued. Byte-identical no-op (returns False
-    before any queue write) when the flag is off, the error is not a flicker
-    reject, the cell is not a LIVE sub-minute offset order, the window has
-    ended, or the per-side-window bound is already spent. Called only from the
-    LIVE reject branch of ``_process_live_post`` (so mode == LIVE by construction).
-    """
-    if not config.FAST_REQUOTE_ENABLED:
-        return False
-    if error_kind not in _FAST_REQUOTE_ARM_ERROR_KINDS:
-        return False
-    if d.offset_sec is None or not token_id:
-        return False  # sub-minute (offset) cells only
-    if now_ts >= d.window_end_ts:
-        return False  # never fire after window_end
-    key = (d.coin, sleeve.interval, d.window_start_ts, side)
-    n = _FAST_REQUOTE_ATTEMPTS.get(key, 0)
-    if n >= max(1, int(config.FAST_REQUOTE_MAX_ATTEMPTS)):
-        return False  # bound reached
-    now_m = time.monotonic() if now_monotonic is None else float(now_monotonic)
-    rq = _FastRequote(
-        sleeve=sleeve,
-        coin=d.coin,
-        side=side,
-        token_id=token_id,
-        poly_market_id=d.poly_market_id or "",
-        entry_minute=d.entry_minute,
-        offset_sec=d.offset_sec,
-        window_start_ts=d.window_start_ts,
-        window_end_ts=d.window_end_ts,
-        model_p=d.score.model_p,
-        realized_edge=d.score.realized_edge,
-        partial_ret_z_1h=d.score.partial_ret_z_1h,
-        lut_p_bucket=d.score.lut_p_bucket,
-        lut_hit_rate=d.score.lut_hit_rate,
-        lut_n_cum=d.score.lut_n_cum,
-        fee_rate_bps=d.fee_rate_bps,
-        strike_price=d.strike_price,
-        window_open_spot=d.window_open_spot,
-        walker_target=float(walker_target),
-        anchor_for_walker=anchor_for_walker,
-        target_usd=float(target_usd),
-        wallet_id=wallet_id,
-        wallet_group=wallet_group,
-        config_sha256=config_sha256,
-        ready_at_monotonic=now_m + max(0.0, config.FAST_REQUOTE_DELAY_MS / 1000.0),
-        rejected_limit_price=_finite_float_or_none(rejected_limit_price),
-    )
-    try:
-        _FAST_REQUOTE_QUEUE.put_nowait(rq)
-    except queue.Full:
-        logger.debug("fast_requote queue full — dropping arm for %s", key)
-        return False
-    _FAST_REQUOTE_ATTEMPTS[key] = n + 1
-    return True
-
-
-def _fast_requote_fresh_book(book_source, fetch_book, token_id: str, now_ts: int):
-    """Re-read the freshest correct-side book: the shared WS/prefetch source
-    chain first (``live_ctx``-equivalent), else ONE ``fetch_book`` GET. Returns
-    the snapshot or None (no source/frame/error) so the caller drops the
-    requote — a fast-requote with no fresh book to price is never placed."""
-    if not token_id:
-        return None
-    if book_source is not None:
-        try:
-            snap = book_source.get(token_id, now_ts=float(now_ts))
-        except Exception:  # noqa: BLE001 — a bad source must never crash the job
-            logger.debug("fast_requote book_source.get raised", exc_info=True)
-            snap = None
-        if snap is not None:
-            return snap
-    if fetch_book is None:
-        return None
-    try:
-        return fetch_book(token_id, now_ts=float(now_ts))
-    except Exception:  # noqa: BLE001
-        logger.debug("fast_requote fetch_book raised", exc_info=True)
-        return None
-
-
-def _execute_fast_requote(
-    conn,
-    rq: "_FastRequote",
-    *,
-    order_client,
-    fetch_book,
-    book_source=None,
-    now_ts: int,
-) -> str:
-    """Replay one armed fast-requote: fresh book → band → walk → pad → reserve →
-    ONE POST → standard accept/reject handling. Returns a short status string for
-    the drain's counters. Never raises for an expected drop (window closed, out
-    of band, thin book, slot race); a fill consumes the window (note_fill +
-    _V2_MARKET_FILLED + ledger row), a reject is terminal (mark_attempt_failed)
-    and arms no second requote (the bound set was spent at arm time)."""
-    sleeve = rq.sleeve
-    side = rq.side
-    coin = rq.coin
-    if order_client is None:
-        return "no_client"
-    # Interval entry-disable: this replay POSTs without re-entering the tick
-    # loop's sleeve gate, so it tests the predicate itself (same reason
-    # _ask_band_skip is applied here as well as on the entry path).
-    if _interval_entry_disabled(sleeve.interval_min):
-        return "interval_disabled"
-    if now_ts >= rq.window_end_ts:
-        return "window_closed"
-    mkey = (coin, sleeve.interval, rq.window_start_ts)
-    if mkey in _V2_MARKET_FILLED:
-        return "market_filled"
-
-    fresh = _fast_requote_fresh_book(book_source, fetch_book, rq.token_id, now_ts)
-    if fresh is None:
-        return "no_book"
-    top_ask = _finite_float_or_none(getattr(fresh, "top_ask", None))
-    if top_ask is None:
-        return "no_ask"
-
-    # Adverse-dip gate (config.FAST_REQUOTE_MIN_DELTA, default -0.02): a fresh
-    # ask that has dipped more than |MIN_DELTA| below the rejected limit is the
-    # market repricing AGAINST the bet, not a flicker refill — that cohort is
-    # -20c/$ in ground truth (reject_requotes 07-11..07-21, negative on all 4
-    # coins) while the unchanged-book cohort is +13..16c/$. Drop with no
-    # reserve and no POST; the reject_requotes telemetry row (written at arm
-    # time, before this) keeps grading the gated-out cohort.
-    if (
-        rq.rejected_limit_price is not None
-        and _is_adverse_dip(top_ask, rq.rejected_limit_price)
-    ):
-        return "adverse_dip"
-
-    dec = _v2_decider_for(sleeve)
-    v2cell = _v2_decider_cell(coin, sleeve.interval, rq.window_start_ts, side)
-    # Re-run the sleeve BAND check on the fresh ask (out-of-band → drop, no POST).
-    if not dec._in_band(float(top_ask)):
-        return "out_of_band"
-
-    # Ask-band entry skip gate (config.ASK_BAND_SKIP, default () = no-op). The
-    # requote is a REPLAY of the same entry, so without this it would be a
-    # bypass of the main-path gate whenever both flags are armed. Re-evaluated
-    # on the FRESH ask (the price this POST would actually pay), consistent with
-    # the band check above. Drops with no reserve and no POST.
-    if _ask_band_skip(coin, sleeve.label, top_ask):
-        return "ask_band_skip"
-
-    # V2_EDGE_CAP ceiling re-check on the FRESH ask (cap-gap fix 2026-07-23):
-    # the adverse-dip gate admits an ask up to |FAST_REQUOTE_MIN_DELTA| BELOW
-    # the rejected limit, and a LOWER ask RAISES the instantaneous edge — so a
-    # decision that passed the entry-path edge_above_ceiling gate under the
-    # ceiling could re-fire inside the capped >=max_edge region while the
-    # ledger records the stale armed edge. Mirror _gate_edge on the re-priced
-    # edge (same parabola fee basis as the scorer's pred_edge; sleeve.max_edge
-    # already carries the loader's V2_EDGE_CAP clamp). Tolerant getattr like
-    # _gate_threshold so band-only sleeve stubs skip it. Drop is fail-closed:
-    # no reserve, no POST.
-    _requote_max_edge = getattr(sleeve, "max_edge", None)
-    if _requote_max_edge is not None and rq.model_p is not None:
-        _repriced_edge = (
-            float(rq.model_p)
-            - float(top_ask)
-            - config.POLY_FEE_THETA * float(top_ask) * (1.0 - float(top_ask))
-        )
-        if _repriced_edge > float(_requote_max_edge):
-            return "edge_above_ceiling"
-
-    walked = walk_book_edge_preserving(
-        {"asks": getattr(fresh, "asks", None)},
-        rq.walker_target,
-        prob_safe_floor=rq.model_p,
-        fee_theta=config.POLY_FEE_THETA,
-        # Deliverable 8: per-market predict.fun feeRateBps (None on Polymarket).
-        min_edge=_execution_min_edge(sleeve),
-        min_bet_usd=config.MIN_BET_USD,
-        max_walk_price=_execution_max_walk_price(sleeve),
-        walk_anchor_price=rq.anchor_for_walker,
-    )
-    if walked is None or walked[0] < config.MIN_BET_USD:
-        return "insufficient_depth"
-    proposed_bet_size = walked[0]
-    walked_vwap = walked[2]
-    walked_limit = walked[3]
-
-    # Re-derive the FAK pad via the SAME _fak_padded_limit path. A fast-requote
-    # is BY CONSTRUCTION a retry (it only exists after a reject), so under
-    # V2_RETRY_REPRICE it prices off this replay's own fresh walked_limit rather
-    # than the first attempt's anchor.
-    limit_price_out = walked_limit
-    if config.V2_FAK_PAD > 0.0 and walked_limit is not None:
-        anchor = None if config.V2_RETRY_REPRICE else dec.anchor_limit(
-            v2cell, walked_limit
-        )
-        limit_price_out = _fak_padded_limit(
-            walked_limit, anchor=anchor, pad=config.V2_FAK_PAD
-        )
-
-    signal = BetSignal(
-        coin=coin,
-        sleeve=sleeve.label,
-        entry_minute=rq.entry_minute,
-        side=side,
-        window_start_ts=rq.window_start_ts,
-        window_end_ts=rq.window_end_ts,
-        interval_min=sleeve.interval_min,
-        poly_market_id=rq.poly_market_id or "",
-        poly_token_id=rq.token_id,
-        fee_rate_bps=rq.fee_rate_bps or 0.0,
-        model_p=rq.model_p,
-        p_market=top_ask,
-        fill_price=top_ask,
-        walked_vwap=walked_vwap,
-        limit_price=limit_price_out,
-        realized_edge=rq.realized_edge,
-        partial_ret_z_1h=rq.partial_ret_z_1h,
-        lut_p_bucket=_bucket_or_none(rq.lut_p_bucket),
-        lut_hit_rate=rq.lut_hit_rate,
-        lut_n_cum=rq.lut_n_cum,
-        target_usd=rq.target_usd,
-        bet_size=proposed_bet_size,
-        slot_filled_pre=0.0,
-        entry_top_price=top_ask,
-        yes_pre1_anchor=top_ask,
-        strike_price=rq.strike_price,
-        window_open_spot=rq.window_open_spot,
-        wallet_id=rq.wallet_id,
-        offset_sec=rq.offset_sec,
-        config_sha256=rq.config_sha256,
-    )
-
-    # Reserve OUTSIDE any txn (reserve commits) — the uniq_loa_active_slot
-    # partial index serializes any racing reservation (a concurrent 1Hz tick on
-    # the same slot), so an IntegrityError is a clean slot_full drop.
-    # (The reserve bumps the placement epoch itself — a reservation consumes
-    # group-cap pending, so every cached commit-stage view is now stale.)
-    try:
-        attempt = reserve_live_order_attempt(
-            conn, signal, wallet_group=rq.wallet_group
-        )
-    except sqlite3.IntegrityError:
-        return "slot_full"
-
-    _ensure_warm = getattr(order_client, "ensure_market_info_warm", None)
-    if _ensure_warm is not None and signal.poly_market_id:
-        try:
-            _ensure_warm(signal.poly_market_id)
-        except Exception:  # noqa: BLE001 — warm is best-effort
-            logger.debug("fast_requote ensure_market_info_warm raised", exc_info=True)
-
-    order_result = order_client.place_gtc_limit_order(
-        signal, client_order_id=attempt.client_order_id
-    )
-
-    # subminute_fills telemetry (accepted/rejected) — feeds the fill-rate breaker
-    # exactly like a normal placement. next_attempt advances the attempt counter.
-    _sub_attempt = (
-        dec.next_attempt(v2cell)
-        if (config.SUBMINUTE_ONE_PER_WINDOW and config.V2_REJECT_RETRY)
-        else 1
-    )
-    try:
-        record_subminute_fill(
-            conn,
-            coin=coin,
-            sleeve=sleeve.label,
-            offset_sec=rq.offset_sec,
-            window_start_ts=rq.window_start_ts,
-            side=side,
-            requested_usd=float(signal.bet_size),
-            quote_ask=top_ask,
-            limit_price=signal.limit_price,
-            filled_size=order_result.filled_size_tokens,
-            filled_price=order_result.filled_price_vwap,
-            filled_usd=order_result.filled_value_usd,
-            order_id=order_result.order_id,
-            client_order_id=attempt.client_order_id,
-            outcome=("accepted" if order_result.success else "rejected"),
-            attempt=_sub_attempt,
-            # trigger_src defaults to 'tick': the requote replay runs on the
-            # 100ms drain job, which is the tick's own retry machinery and not a
-            # fast-trigger rung.
-        )
-    except Exception:  # noqa: BLE001 — observability only
-        logger.warning("fast_requote subminute fill record failed", exc_info=True)
-
-    if not order_result.success:
-        # Terminal: release the slot reservation. The bound set was already spent
-        # at arm time, so no second requote is armed.
-        mark_attempt_failed(
-            conn, attempt.id, order_result.error_kind or "unknown", order_result.error
-        )
-        return "rejected"
-
-    # Accept: PURE_STOP_04 coverage — one immediate fill GET when the FAK left no
-    # fill (mirrors _commit_cell's inline path; deferred_fill_gets is None here).
-    live_filled_size = order_result.filled_size_tokens
-    live_filled_price = order_result.filled_price_vwap
-    live_fill_ts = order_result.fill_ts
-    _imm_intent_price = (
-        signal.walked_vwap if signal.walked_vwap is not None else signal.fill_price
-    )
-    _imm = _immediate_fill_for_held_pass(
-        order_client,
-        order_result.order_id,
-        offset_sec=rq.offset_sec,
-        current_size=live_filled_size,
-        intent_amount_usd=float(signal.bet_size),
-        intent_price=_imm_intent_price,
-    )
-    if _imm is not None:
-        live_filled_size, live_filled_price, _imm_ts = _imm
-        if _imm_ts is not None:
-            live_fill_ts = _imm_ts
-
-    # Ledger write — SUBMITTED transition + INSERT + link committed atomically in
-    # one BEGIN IMMEDIATE (the _finalize_bet_row LIVE-path idiom).
-    conn.execute("BEGIN IMMEDIATE")
-    try:
-        mark_attempt_submitted(
-            conn, attempt.id, order_result.order_id or "", commit=False
-        )
-        row_id = record_bet(
-            conn,
-            signal,
-            initial_realized_edge=None,
-            mode="LIVE",
-            wallet_group=rq.wallet_group,
-            live_order_id=order_result.order_id,
-            live_client_order_id=attempt.client_order_id,
-            live_filled_size=live_filled_size,
-            live_filled_price=live_filled_price,
-            live_fill_ts=live_fill_ts,
-            top_ask_at_decision=top_ask,
-        )
-        cur = conn.execute(
-            "SELECT id FROM live_order_attempts WHERE client_order_id=?",
-            (attempt.client_order_id,),
-        ).fetchone()
-        if cur is not None:
-            link_attempt_to_ledger(conn, int(cur["id"]), row_id)
-        else:
-            conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-
-    # Consume the window for BOTH sides so no later second / opposite side / other
-    # sleeve re-bets it (parity with _finalize_bet_row's consume-on-fill tail).
-    if config.SUBMINUTE_ONE_PER_WINDOW:
-        dec.note_fill(v2cell)
-        _V2_MARKET_FILLED.add(mkey)
-    return "filled"
-
-
-def drain_fast_requote_queue(
-    conn,
-    *,
-    order_client,
-    fetch_book,
-    book_source=None,
-    now_monotonic: Optional[float] = None,
-    now_ts: Optional[float] = None,
-    max_items: int = 8,
-) -> dict:
-    """Drain every armed fast-requote whose ready time has arrived.
-
-    Items not yet ready are re-queued for a later drain. Each ready item replays
-    ``_execute_fast_requote`` (fresh book → reserve → ONE POST). Bounded by
-    ``max_items`` per call so a backlog can't monopolize the scheduler thread
-    (each POST is ~300ms). Best-effort: a per-item error is logged and skipped.
-    Runs on the caller's OWN scheduler-pool connection (writes via BEGIN
-    IMMEDIATE; no shared write lock — audit finding #1 model)."""
-    now_m = time.monotonic() if now_monotonic is None else float(now_monotonic)
-    now_s = time.time() if now_ts is None else float(now_ts)
-    ready: list[_FastRequote] = []
-    not_ready: list[_FastRequote] = []
-    while len(ready) < max_items:
-        try:
-            item = _FAST_REQUOTE_QUEUE.get_nowait()
-        except queue.Empty:
-            break
-        if item.ready_at_monotonic > now_m:
-            not_ready.append(item)
-            continue
-        ready.append(item)
-    counters = {
-        "processed": 0, "placed": 0, "filled": 0, "rejected": 0,
-        "dropped": 0, "requeued": 0,
-    }
-    for item in ready:
-        counters["processed"] += 1
-        try:
-            status = _execute_fast_requote(
-                conn, item,
-                order_client=order_client,
-                fetch_book=fetch_book,
-                book_source=book_source,
-                now_ts=int(now_s),
-            )
-        except Exception:  # noqa: BLE001 — one bad requote must never break the job
-            logger.warning("fast_requote execute raised", exc_info=True)
-            status = "error"
-        if status == "filled":
-            counters["placed"] += 1
-            counters["filled"] += 1
-        elif status == "rejected":
-            counters["placed"] += 1
-            counters["rejected"] += 1
-        else:
-            counters["dropped"] += 1
-    for item in not_ready:
-        try:
-            _FAST_REQUOTE_QUEUE.put_nowait(item)
-            counters["requeued"] += 1
-        except queue.Full:
-            break
-    return counters
 
 
 # ---------------------------------------------------------------------------
@@ -2857,7 +1796,6 @@ def _fast_entry_scan(
                     tick, now_ts,
                     live_ctx=live_ctx,
                     tick_breaker=stage.tick_breaker,
-                    tick_ramp=stage.tick_ramp,
                     deferred_fill_gets=deferred_fill_gets,
                     # Never fan out: a fast scan carries at most a couple of
                     # cells and must hold the lock for as short as possible.
@@ -3414,11 +2352,6 @@ def _assemble_live_commit_context(
         order_client=deps.order_client,
         notify=deps.notify,
         tick_group_live_delta=tick_group_live_delta,
-        # Fix 3a pre-POST freshness recheck: share the same WS/prefetch book
-        # source Pass 2 read from, so the recheck re-reads the correct-side book
-        # right before the POST. Inert (never read) unless the recheck flag /
-        # WS-shadow validation mode is on — see _prepost_recheck.
-        book_source=deps.book_prefetch,
     )
     return live_ctx, loaded.wallet_snaps
 
@@ -3514,7 +2447,6 @@ class _FastCommitStage:
     ledger_probe: tuple
     loaded: _LiveCtxInputs
     tick_breaker: BreakerState
-    tick_ramp: RampState
     disk_free_mb: float
 
 
@@ -3594,7 +2526,6 @@ def _fast_commit_stage(
         ledger_probe=probe,
         loaded=loaded,
         tick_breaker=evaluate_breaker(conn),
-        tick_ramp=ramp_state(conn),
         disk_free_mb=deps.get_disk_free_mb(),
     )
     if config.FAST_TRIGGER_ENABLED and probe is not None:
@@ -3824,25 +2755,6 @@ def run_scanner_tick(
             coin, live_spot=spot.price, now_ts=now_ts,
         )
 
-    # Entry-skip lever (config.ENTRY_SKIP_SECONDS). A positive N suppresses ALL
-    # trading during the first N seconds of EVERY minute — the bot scans (the
-    # partial-ret engine above is already fed this tick, so the window-open
-    # snapshot + minute-boundary returns stay parity-correct) but places no bet
-    # until second N. Returning here BEFORE the live-context load and the sleeve
-    # loops means no market/book API calls and no scoring on a skipped tick. The
-    # per-window dedup then lands each window's single bet on the first tick at
-    # or after second N. We intentionally write NO per-coin skip rows: this
-    # fires up to N times per minute on every coin/sleeve and would bloat the
-    # signals table at 1Hz — the gap in the signal stream IS the observability.
-    # DEFAULT N=0 makes this a no-op (second-0 entry) so live fills at the
-    # minute boundary — aligned with the ORB+HGB backtest, which reads the
-    # pmdata book at entry_ts. See config.ENTRY_SKIP_SECONDS for the rationale.
-    if now_ts % 60 < config.ENTRY_SKIP_SECONDS:
-        _bump(tick.skips_by_reason, "within_skip_window")
-        conn.commit()
-        tick.duration_ms_total = (time.monotonic() - t0) * 1000.0
-        return tick
-
     # D-LIVE-20: load LIVE routing context ONCE per tick and build the shared
     # commit context from it (see _build_live_commit_context — the same call the
     # fast rungs make, so the two committers cannot drift).
@@ -3911,7 +2823,7 @@ def run_scanner_tick(
             # ZERO rows whenever that lever is re-enabled. A tick lost to
             # scheduler jitter drops that minute's row — the gap IS the
             # observability, same policy as the skip lever itself.
-            if now_ts % 60 == max(0, config.ENTRY_SKIP_SECONDS):
+            if now_ts % 60 == 0:
                 for coin in config.COINS:
                     record_signal_skip(
                         conn,
@@ -4204,13 +3116,11 @@ def run_scanner_tick(
     # of re-reading after each POST — bounded by one tick's orders against a
     # SUBMINUTE_BREAKER_WINDOW-deep rolling window.
     tick_breaker: Optional[BreakerState] = None
-    tick_ramp: Optional[RampState] = None
     if any(
         d.offset_sec is not None and d.score.skip_reason is None
         for d in cell_decisions
     ):
         tick_breaker = evaluate_breaker(conn)
-        tick_ramp = ramp_state(conn)
 
     # A11 latency: per-entry immediate-fill GETs queued by _commit_cell.
     # Flushed concurrently AFTER the cell loop (and BEFORE the held-position
@@ -4254,7 +3164,6 @@ def run_scanner_tick(
                     now_ts,
                     live_ctx=live_ctx,
                     tick_breaker=tick_breaker,
-                    tick_ramp=tick_ramp,
                     deferred_fill_gets=deferred_fill_gets,
                     parallel_posts=parallel_posts,
                 )
@@ -4292,39 +3201,7 @@ def run_scanner_tick(
         except Exception:  # noqa: BLE001 — reconciler is the backstop
             logger.warning("deferred immediate-fill flush failed", exc_info=True)
 
-    # Held-position pass (T3 scale-in driver) — runs strictly AFTER Phase B so
-    # a top-up never sits between an entry decision and its order POST.
-    # Flag-gated OFF by default: when config.SCALEIN_T3_ENABLED is unset the
-    # pass returns immediately. Best-effort: a failure here must never fail the
-    # tick.
-    #
-    # LEVER 2 (CRYPTOBOT_HELD_PASS_CADENCE_MS): when > 0 the pass is
-    # instead driven by a DEDICATED APScheduler job (main.py) at that cadence on
-    # its OWN connection, so we SKIP the inline call here. This deliberately
-    # relaxes the "an exit never runs between an entry decision and its POST"
-    # invariant above — the whole point of the flag; DEFAULT 0 keeps the inline
-    # pass, preserving the invariant. Trigger semantics are unchanged either way.
-    # 2026-07-25 latency audit: mark the post-POST boundary. Everything from
-    # here on is inside the tick's wall clock but delays NO fill — the headline
-    # `book` stage was mostly this, which is why book p50 looked like ~100ms of
-    # decision cost when a fully cache-served entry tick actually contributes
-    # 0.0ms. `_book_split_mark` freezes the entry-path book totals so whatever
-    # the held-position pass adds below is attributed to ms_book_stop instead.
     _tail_t0 = time.monotonic()
-    _book_split_mark = (tick.ms_book, tick.n_book_calls)
-    if config.HELD_PASS_CADENCE_MS <= 0:
-        try:
-            held_position_pass.run_held_position_pass(
-                conn, portfolio, now_ts=now_ts, deps=deps, spots=spots,
-            )
-        except Exception:  # noqa: BLE001 — the pass must never crash the tick
-            logger.warning("held-position pass failed", exc_info=True)
-    # Re-attribute: the timed fetch wrappers accumulate into ms_book/n_book_calls
-    # for the WHOLE tick, so subtract the frozen entry-path totals back out.
-    tick.ms_book_stop = max(0.0, tick.ms_book - _book_split_mark[0])
-    tick.n_book_stop = max(0, tick.n_book_calls - _book_split_mark[1])
-    tick.ms_book = _book_split_mark[0]
-    tick.n_book_calls = _book_split_mark[1]
 
     # A5 latency: off-decision-path warm of the NEXT window's Gamma market
     # metadata + CLOB market-info caches (uses the unwrapped fetcher — see
@@ -4627,8 +3504,6 @@ def _record_latency_trace(conn, tick: TickResult) -> None:
                 "n_rej": tick.n_orders_rej,
                 "pre_post": round(tick.ms_pre_post, 1),
                 "tail": round(tick.ms_tail, 1),
-                "book_stop": round(tick.ms_book_stop, 1),
-                "n_book_stop": tick.n_book_stop,
                 # W2 book-source attribution + WS staleness.
                 "bk_ws": tick.n_book_ws,
                 "bk_pf": tick.n_book_prefetch,
@@ -5015,7 +3890,6 @@ def _commit_cell(
     *,
     live_ctx: Optional[_LiveCommitContext] = None,
     tick_breaker: Optional[BreakerState] = None,
-    tick_ramp: Optional[RampState] = None,
     deferred_fill_gets: Optional[list["_DeferredFillGet"]] = None,
     parallel_posts: Optional[list["_PreparedPost"]] = None,
 ) -> None:
@@ -5026,8 +3900,8 @@ def _commit_cell(
     multi-cell ticks honor each wallet cap on the SECOND cell, not just the
     first.
 
-    ``tick_breaker`` / ``tick_ramp`` are the once-per-tick hoisted breaker +
-    ramp states (A10); when None (legacy caller) they are derived here.
+    ``tick_breaker`` is the once-per-tick hoisted breaker state (A10); when
+    None (legacy caller) it is derived here.
     ``deferred_fill_gets`` collects the accept branch's immediate-fill GET
     so run_scanner_tick can flush the batch off the Phase B loop (A11); when
     None the GET runs inline as before.
@@ -5325,54 +4199,8 @@ def _commit_cell(
                 # sides. The durable DB checks below stay as the hard
                 # already-PLACED guard (and survive a process restart that
                 # resets the in-memory decider).
-                # Multifill (operator 2026-07-10): above V2_MULTIFILL_MIN_EQUITY
-                # (0 since the 2026-07-25 every-qualifying order, so live today),
-                # allow additional INDEPENDENT entries per (coin, interval,
-                # window) resolution, up to V2_MULTIFILL_MAX_EXTRA extras on top
-                # of the initial entry — 1 + 3 = 4 non-topup ledger rows max
-                # (operator order 2026-07-25; see config for why an uncapped
-                # resolution is ~75% of the bankroll on one binary). Capacity is
-                # further bounded by the same-side rule, the shared exposure cap
-                # and the DD brake/halt. An extra entry is admissible ONLY when a
-                # PRIOR entry on this resolution already FILLED (count >= 1: only
-                # fills write a ledger row). `_multifill_extra` then (a) tells the
-                # decider to bypass its consume-on-fill veto, (b) bypasses the
-                # cross-sleeve first-fill-wins guard, and (c) forces the
-                # fresh-entry sizing path (new ledger row, full target — NOT a
-                # top-up of the prior fill). `sizing_equity` above is the same
-                # current-equity value the stake fractions size against.
-                _multifill_extra = False
-                if (
-                    config.V2_MULTIFILL_ENABLED
-                    and sizing_equity >= config.V2_MULTIFILL_MIN_EQUITY
-                ):
-                    _existing_entries = count_window_entries(
-                        conn,
-                        coin=d.coin,
-                        interval_min=sleeve.interval_min,
-                        window_start_ts=d.window_start_ts,
-                    )
-                    # Resolution full: the initial entry plus MAX_EXTRA extras
-                    # already hold ledger rows. Refuse with a DISTINCT reason —
-                    # falling through would skip as `v2_window_consumed` and make
-                    # the cap invisible to the regrade. The durable ledger tally
-                    # means this still binds after a restart mid-window.
-                    if _existing_entries > config.V2_MULTIFILL_MAX_EXTRA:
-                        _sub_skip("multifill_cap")
-                        return
-                    _multifill_extra = _existing_entries >= 1
-
                 _v2_dec = _v2_decider_for(sleeve)  # per-sleeve, band-aware
-                # SUBMINUTE_FLIP_SIDE: the decider's in-band qualification is a
-                # SELECTION rule and must see the MODEL side's ask (0.65-0.85),
-                # not the executed complement's (~0.2-0.35, never in band —
-                # feeding it the flip ask vetoes every second as
-                # v2_window_consumed, the 2026-08-07 05:17-07:20 zero-order bug).
-                _dec_side = (
-                    ("NO" if side == "YES" else "YES")
-                    if config.SUBMINUTE_FLIP_SIDE else side
-                )
-                _ask_now = _pick_ask(d, _dec_side)
+                _ask_now = _pick_ask(d, side)
                 _v2_cell = {
                     "coin": d.coin,
                     "interval": sleeve.interval,
@@ -5386,23 +4214,11 @@ def _commit_cell(
                         else float("-inf")
                     ),
                 }
-                _verdict = _v2_dec.on_second(_v2_cell, allow_refill=_multifill_extra)
+                _verdict = _v2_dec.on_second(_v2_cell)
                 _v2_prune_window_decider(now_ts)
                 if _verdict != "PLACE":
                     _sub_skip("v2_window_consumed")
                     return
-                # F2 tier-A size boost (operator 2026-07-14): 1.5x the sized
-                # stake when this PLACE is the market's FIRST qualifying second
-                # (rank 1 — the backtest attempt_rank==1 population) AND the
-                # score edge clears the tier gate. A restart mid-window resets
-                # the rank to 0 → no boost (fail-conservative). Multifill extras
-                # are rank >= 2 by construction and never boost.
-                if (
-                    config.V2_TIER_A_MULT != 1.0
-                    and _v2_dec.market_place_rank(_v2_cell) == 1
-                    and _v2_cell["pred_edge"] >= config.V2_TIER_A_EDGE
-                ):
-                    target_usd *= float(config.V2_TIER_A_MULT)
                 # Cross-sleeve one-bet-per-market (first fill wins). Each sleeve
                 # has its OWN decider (private _filled), so a fill by a
                 # DIFFERENT sleeve on this exact (coin, interval, window) market
@@ -5410,13 +4226,8 @@ def _commit_cell(
                 # In-memory set = fast path within a process; the ledger query =
                 # restart-durable guard (the per-sleeve subminute_window_* dedups
                 # all filter WHERE sleeve=? and do NOT arbitrate across sleeves).
-                # Multifill (equity >= floor) intentionally bypasses this so a
-                # SECOND independent entry — same sleeve OR the other band's
-                # sleeve — can open on an already-filled resolution; the
-                # prior-entry-FILLED requirement is enforced by
-                # count_window_entries above.
                 _mkt_key = (d.coin, sleeve.interval, d.window_start_ts)
-                if not _multifill_extra and (
+                if (
                     _mkt_key in _V2_MARKET_FILLED
                     or subminute_market_other_sleeve(
                         conn,
@@ -5428,60 +4239,23 @@ def _commit_cell(
                 ):
                     _sub_skip("market_dedup_cross_sleeve")
                     return
-                if _multifill_extra:
-                    # Multifill grows SAME-side capacity only, and it
-                    # deliberately bypasses the cross-sleeve first-fill-wins
-                    # guard above — so the per-sleeve opposite-side dedup below
-                    # (WHERE sleeve=?) cannot see a fill by the OTHER band's
-                    # sleeve. Enforce same-side ACROSS ALL sleeves here: above
-                    # the equity floor MID can fill YES on a resolution, the
-                    # price reverse, and NL then qualify NO — which would open
-                    # BOTH legs of one binary (a guaranteed-losing hedge). A
-                    # candidate whose side disagrees with the resolution's
-                    # already-open side (any sleeve, same interval+window) is
-                    # rejected before it can open the opposite leg. (This same
-                    # broadened query also catches a same-sleeve side flip.)
-                    existing_side = subminute_window_existing_side_any_sleeve(
-                        conn,
-                        coin=d.coin,
-                        interval_min=sleeve.interval_min,
-                        window_start_ts=d.window_start_ts,
-                    )
-                    if existing_side is not None and existing_side != side:
-                        _sub_skip("multifill_opposite_side")
-                        return
-                else:
-                    existing_side = subminute_window_existing_side(
-                        conn,
-                        coin=d.coin,
-                        sleeve=sleeve.label,
-                        window_start_ts=d.window_start_ts,
-                    )
-                    if existing_side is not None and existing_side != side:
-                        # Opposite side within this sleeve is rejected (never
-                        # bet both up and down on one resolution). Cross-sleeve
-                        # opposite side is already blocked by the first-fill-wins
-                        # guard above; only multifill bypasses that guard, and
-                        # its own branch (above) re-enforces same-side across all
-                        # sleeves.
-                        _sub_skip("market_dedup")
-                        return
-                if _multifill_extra:
-                    # A new INDEPENDENT entry: size to a full target (fresh
-                    # equity-fraction × brake × conc) and write its
-                    # own is_topup=0 ledger row — do NOT anchor it as a top-up of
-                    # the prior fill's slot. NOTE (dashboard): this is the ONLY
-                    # place a resolution can now carry >1 non-topup ledger row, so
-                    # a market's rollup may show multiple fills/positions.
-                    slot_filled, slot_anchor = 0.0, None
-                else:
-                    slot_filled, slot_anchor = subminute_window_state(
-                        conn,
-                        coin=d.coin,
-                        sleeve=sleeve.label,
-                        side=side,
-                        window_start_ts=d.window_start_ts,
-                    )
+                existing_side = subminute_window_existing_side(
+                    conn,
+                    coin=d.coin,
+                    sleeve=sleeve.label,
+                    window_start_ts=d.window_start_ts,
+                )
+                if existing_side is not None and existing_side != side:
+                    # Never bet both up and down on one resolution.
+                    _sub_skip("market_dedup")
+                    return
+                slot_filled, slot_anchor = subminute_window_state(
+                    conn,
+                    coin=d.coin,
+                    sleeve=sleeve.label,
+                    side=side,
+                    window_start_ts=d.window_start_ts,
+                )
             else:
                 if subminute_slot_seen(
                     conn,
@@ -5509,29 +4283,8 @@ def _commit_cell(
                 _sub_skip("subminute_breaker_tripped")
                 return
 
-            # B5 staged ramp sizing: rung 1 = min-bet under the hard
-            # cumulative cap; rung 2 = 50% target; rung 3 = full
-            # pe0.045/stake0.47 target. Rung 2/3 targets are FLOORED at the
-            # venue minimum (review finding: at the $100 wallet base the 5m
-            # target is ~$1.34, so 0.5× = $0.67 < MIN_BET_USD would make
-            # every rung-2 bet unplaceable and freeze the ramp; the WFO's
-            # own wallet sim used min_bet $1, so the floor is faithful).
-            # A10: same once-per-tick hoist as the breaker above.
-            ramp = tick_ramp if tick_ramp is not None else ramp_state(conn)
-            if ramp.rung == 1:
-                if ramp.cap_blocked:
-                    _sub_skip("subminute_ramp_cap")
-                    return
-                target_usd = float(config.MIN_BET_USD)
-            else:
-                target_usd = max(
-                    target_usd * float(ramp.stake_multiplier),
-                    float(config.MIN_BET_USD),
-                )
-
             # Per-coin cap clamp — MUST be last: after brake/conc (sized_usd),
-            # tier-A 1.5x, and the ramp multiplier, so the cap bounds what is
-            # actually sent. INERT since 2026-07-21 (operator override: empty
+            # so the cap bounds what is actually sent. INERT since 2026-07-21 (operator override: empty
             # max_bet_usd_by_coin maps); see _v2_apply_coin_cap.
             target_usd = _v2_apply_coin_cap(sleeve, d.coin, target_usd)
 
@@ -5688,35 +4441,7 @@ def _commit_cell(
             return
 
         _t_walk = time.monotonic()
-        # Phantom-book integrity guard (2026-08-08, shipped with the EDGE_CAP
-        # disarm): both sides' asks summing below $1 = a stale/cancelled quote
-        # on one side. Skip with a distinct reason so the cohort stays
-        # gradeable. Scoped to SUBMINUTE_FLIP_SIDE — the EDGE_CAP disarm that
-        # re-opened the phantom door is a flip-era order, and flip-off behavior
-        # stays byte-identical (the cap guards that config when restored).
-        if config.SUBMINUTE_FLIP_SIDE and _crossed_book_skip(
-            ask_book.top_ask, _pick_ask(d, "NO" if side == "YES" else "YES")
-        ):
-            _sub_skip("crossed_book")
-            return
-        # Flip-aware price-walk increment (== _execution_max_walk_price(sleeve)
-        # with SUBMINUTE_FLIP_SIDE off). Reused by the pre-POST cover re-walk
-        # below so both walks price the same book with the same cap.
-        max_walk_price_cell = _execution_max_walk_price_for(d, side, sleeve)
-        if max_walk_price_cell is not None and max_walk_price_cell < 0.0:
-            # Flip-cap sentinel: the flip book's top already prices above
-            # (1 - model_ask) + PAD, or either book is unreadable — the
-            # operator's flip ceiling says do not pay this. Distinct reason so
-            # the cap's bite is gradeable straight from signals.
-            _sub_skip("flip_cap")
-            return
-        if config.SUBMINUTE_FLIP_SIDE and anchor_for_walker is None:
-            # Pin the walk anchor to THIS decision's flip top ask so the
-            # relative increment enforces the ABSOLUTE ceiling in the pre-POST
-            # cover re-walk too — a fresh-book anchor would let the cap drift
-            # above mirror+PAD when the flip top rises between decision and
-            # POST.
-            anchor_for_walker = ask_book.top_ask
+        max_walk_price_cell = _execution_max_walk_price(sleeve)
         walked = walk_book_edge_preserving(
             {"asks": ask_book.asks},
             walker_target,
@@ -5790,41 +4515,6 @@ def _commit_cell(
 
         # Build gate input using top_ask (NOT walked VWAP — D2 parity).
         top_ask = ask_book.top_ask if ask_book.top_ask is not None else float("nan")
-        # Retry adverse-dip gate (config.RETRY_DIP_GATE_ENABLED, DEFAULT OFF =>
-        # empty map => byte-identical). The per-second FAK retry re-enters a
-        # rejected offset window with no adverse-dip fence; port the fast-requote
-        # MIN_DELTA gate here so a fresh ask dipped below the prior reject's limit
-        # (the -EV cheap-refill cohort) is skipped, while a flicker-back at/above
-        # the limit still fills. Pre-reserve / pre-POST, so the skip is clean.
-        # The explicit `d.offset_sec is not None` keeps `_sub_skip` (defined only
-        # on the offset path above) in scope — the helper also enforces it, but
-        # the local guard makes the coupling explicit and crash-proof if the
-        # helper's offset check is ever loosened (review-hardened 2026-07-24).
-        # First-attempt-only (config.V2_FIRST_ATTEMPT_ONLY, operator
-        # 2026-07-29): a prior no_liquidity reject spent this side window —
-        # skip the per-second retry entirely. Checked before the dip gate so
-        # the (now shadowed) dip fence only ever sees flag-off traffic.
-        if d.offset_sec is not None and _first_attempt_consumed_skip(
-            d.coin,
-            sleeve.interval,
-            d.window_start_ts,
-            side,
-            is_topup=is_topup_attempt,
-            offset_sec=d.offset_sec,
-        ):
-            _sub_skip("first_attempt_consumed")
-            return
-        if d.offset_sec is not None and _retry_adverse_dip_skip(
-            d.coin,
-            sleeve.interval,
-            d.window_start_ts,
-            side,
-            top_ask,
-            is_topup=is_topup_attempt,
-            offset_sec=d.offset_sec,
-        ):
-            _sub_skip("retry_adverse_dip")
-            return
         # Total ask-side notional ($) on this side's book — feeds the exp044
         # book_consumption gate (inert for non-hgb sleeves, which leave
         # book_consumption_max None). The CLOB adapter now carries the full
@@ -5862,24 +4552,13 @@ def _commit_cell(
             )
         else:
             pending_within_tick = tick_pending_delta.get(wallet_id, 0.0)
-        # SUBMINUTE_FLIP_SIDE: the gate stack's fill-price band (gates._gate_edge
-        # -> "fill_band") is a SELECTION rule like the decider band — it must see
-        # the MODEL side's ask, not the executed complement's ~0.2-0.35 (which
-        # sits below sleeve.min_fill_price and would veto every flip attempt —
-        # the 07:28-07:37 fill_band skips). All other GateInput fields keep
-        # executed-side semantics (freshness/depth are the book we actually hit).
-        gate_fill_price = top_ask
-        if config.SUBMINUTE_FLIP_SIDE:
-            _model_ask = _pick_ask(d, "NO" if side == "YES" else "YES")
-            if _model_ask is not None and math.isfinite(float(_model_ask)):
-                gate_fill_price = float(_model_ask)
         gate_input = GateInput(
             coin=d.coin,
             sleeve=sleeve,
             entry_minute=d.entry_minute,
             side=side,
             realized_edge=d.score.realized_edge,
-            fill_price=gate_fill_price,
+            fill_price=top_ask,
             fee_rate_bps=d.fee_rate_bps,
             spot_age_s=d.spot_age_s,
             proposed_bet_size=proposed_bet_size,
@@ -6052,17 +4731,6 @@ def _commit_cell(
         live_filled_price: Optional[float] = None
         live_fill_ts: Optional[str] = None
         _imm_intent_price: Optional[float] = None
-        # Fix 3a shadow: True when the pre-POST recheck ran in SHADOW mode
-        # (recheck disabled + WS shadow on) and WOULD have skipped this POST.
-        # _process_live_post reads it to classify the would-skip against the real
-        # fill/reject. Assigned below (right before the reserve/POST block).
-        _prepost_would_skip = False
-        # Drop-guard (TOXIC direction) shadow twin: True when the drop guard is
-        # in shadow mode and WOULD have aborted; _prepost_drop_fresh_ask carries
-        # the observed fresh best ask so _process_live_post can log the drop
-        # magnitude (decision vs fresh ask) alongside the real fill/reject.
-        _prepost_would_skip_drop = False
-        _prepost_drop_fresh_ask: Optional[float] = None
         # LEVER 1 (CRYPTOBOT_PHASE_B_PARALLEL_POST): when this cell's order POST
         # is deferred for the parallel fan-out, its within-tick exposure is
         # applied PESSIMISTICALLY at reserve time (see the parallel branch), so
@@ -6238,26 +4906,6 @@ def _commit_cell(
             nonlocal live_order_id, live_client_order_id, live_attempt_id
             nonlocal live_filled_size, live_filled_price, live_fill_ts
             nonlocal _imm_intent_price
-            # Fix 3a shadow: if a pre-POST guard ran in SHADOW mode and WOULD
-            # have skipped this POST, classify the verdict against the REAL order
-            # outcome. Pure counter + log, no behavior change. Cover guard =
-            # book-thinned (reject = true positive). Drop guard = toxic ask
-            # collapse (also logs decision + fresh ask so offline grading joins
-            # the drop magnitude to the ledger).
-            if _prepost_would_skip:
-                _prepost_shadow_classify(
-                    filled=bool(order_result.success),
-                    coin=d.coin, sleeve=sleeve.label, offset_sec=d.offset_sec,
-                    guard="cover",
-                )
-            if _prepost_would_skip_drop:
-                _prepost_shadow_classify(
-                    filled=bool(order_result.success),
-                    coin=d.coin, sleeve=sleeve.label, offset_sec=d.offset_sec,
-                    guard="drop",
-                    decision_ask=top_ask,
-                    fresh_ask=_prepost_drop_fresh_ask,
-                )
             # A0 latency instrumentation: accumulate the whole placement
             # envelope + the sign/post split the OrderClient measured.
             tick.ms_order_total += order_ms
@@ -6398,63 +5046,6 @@ def _commit_cell(
                     logger.debug(
                         "reject_requote enqueue failed", exc_info=True
                     )
-                # Fix 3b — FAST-REQUOTE (config.FAST_REQUOTE_ENABLED, default OFF
-                # => no-op: _maybe_arm_fast_requote short-circuits before any
-                # queue write). On a no_liquidity flicker reject, arm ONE bounded
-                # fast-requote for this (coin, interval, window, side) that the
-                # dedicated drain job replays ~FAST_REQUOTE_DELAY_MS later. Never
-                # for a top-up (the market already filled => the drain would
-                # market_filled-drop anyway) or a non-flicker error_kind.
-                # First-attempt-only supersedes the fast-requote: a requote IS
-                # a reattempt, so it must never arm when the reject is final.
-                if (
-                    config.FAST_REQUOTE_ENABLED
-                    and not is_topup_attempt
-                    and not config.V2_FIRST_ATTEMPT_ONLY
-                ):
-                    _maybe_arm_fast_requote(
-                        error_kind=order_result.error_kind,
-                        sleeve=sleeve,
-                        d=d,
-                        side=side,
-                        token_id=token_id,
-                        walker_target=walker_target,
-                        anchor_for_walker=anchor_for_walker,
-                        target_usd=target_usd,
-                        config_sha256=config_sha256,
-                        wallet_id=wallet_id,
-                        wallet_group=wallet_group,
-                        now_ts=now_ts,
-                        rejected_limit_price=signal.limit_price,
-                    )
-                # Retry adverse-dip gate (config.RETRY_DIP_GATE_ENABLED, DEFAULT
-                # OFF => no-op): record this no_liquidity offset reject's FAK
-                # limit so the NEXT-tick per-second retry (V2_REJECT_RETRY) can
-                # skip re-entry if the fresh ask dips adversely below it — the
-                # fence the fast-requote has but the raw retry lacks. Same cohort
-                # as the fast-requote arm (no_liquidity, non-top-up, offset cell).
-                _record_retry_dip_limit(
-                    d.coin,
-                    sleeve.interval,
-                    d.window_start_ts,
-                    side,
-                    error_kind=order_result.error_kind,
-                    is_topup=is_topup_attempt,
-                    offset_sec=d.offset_sec,
-                    limit_price=signal.limit_price,
-                )
-                # First-attempt-only (config.V2_FIRST_ATTEMPT_ONLY, operator
-                # 2026-07-29): this no_liquidity reject is FINAL — spend the
-                # side window so no later qualifying second retries it.
-                _record_first_attempt_reject(
-                    d.coin,
-                    sleeve.interval,
-                    d.window_start_ts,
-                    side,
-                    error_kind=order_result.error_kind,
-                    is_topup=is_topup_attempt,
-                    offset_sec=d.offset_sec,
-                )
                 _bump(tick.skips_by_reason, skip_reason)
                 tick.signals_written += 1
                 conn.commit()
@@ -6510,191 +5101,6 @@ def _commit_cell(
 
             # Accept path: write the ledger row + telemetry via the shared tail.
             _finalize_bet_row()
-
-        # Late-window entry skip gate (config.LATE_WINDOW_SKIP, default {} =>
-        # byte-identical: the predicate's falsy-dict guard short-circuits before
-        # any work). A LIVE offset entry whose fill would land within a coin's
-        # configured late-window cutoff of the window close is a validated -EV
-        # cohort (BTC last-20s = +$34.93/era when skipped, split-half validated)
-        # — drop it BEFORE the pre-POST recheck/reserve: no reserve, no POST,
-        # window NOT consumed (the next qualifying second re-evaluates, exactly
-        # like prepost_recheck_skip), just a signal. Scope (LIVE + offset +
-        # configured coin) lives entirely inside _late_window_skip.
-        #
-        # DELIBERATE PLACEMENT — end of the decision path, NOT hoisted earlier:
-        # the skip cohort must equal exactly "bets the ungated bot WOULD have
-        # placed", so the pre-registered 3-week grade can compute avoided-PnL
-        # cleanly. Hoisting this gate ahead of the later entry gates would poison
-        # the cohort with cells those gates would have rejected anyway (see the
-        # 4-agent review's F6). Keep it here.
-        if _late_window_skip(
-            coin=d.coin,
-            offset_sec=d.offset_sec,
-            interval_min=sleeve.interval_min,
-            wallet_mode=wallet_mode,
-        ):
-            _mark_skip(d, "late_window_skip")
-            record_signal_skip(
-                conn,
-                created_at=utc_now_iso(),
-                coin=d.coin, sleeve=sleeve.label, entry_minute=d.entry_minute,
-                side=side, window_start_ts=d.window_start_ts,
-                model_p=d.score.model_p, ask=top_ask,
-                edge=d.score.realized_edge, fee_rate_bps=d.fee_rate_bps,
-                partial_ret_z_1h=d.score.partial_ret_z_1h,
-                lut_p_bucket=_bucket_or_none(d.score.lut_p_bucket),
-                lut_hit_rate=d.score.lut_hit_rate, lut_n_cum=d.score.lut_n_cum,
-                skip_reason="late_window_skip",
-                mode=wallet_mode, wallet_group=wallet_group,
-                offset_sec=d.offset_sec,
-            )
-            _bump(tick.skips_by_reason, "late_window_skip")
-            tick.signals_written += 1
-            conn.commit()
-            return
-
-        # Early-window entry skip gate (config.ENTRY_LAST_SECS_ONLY, 0 => OFF
-        # => byte-identical). Operator order 2026-08-08: bet only within the
-        # final N seconds of the window. SAME DELIBERATE PLACEMENT as
-        # late_window_skip — end of the decision path — so the skipped cohort
-        # equals exactly "bets the ungated bot WOULD have placed" and the
-        # avoided-PnL grade stays clean. Window NOT consumed: a later
-        # qualifying second inside the band re-evaluates normally.
-        if _early_window_skip(
-            offset_sec=d.offset_sec,
-            interval_min=sleeve.interval_min,
-            wallet_mode=wallet_mode,
-        ):
-            _mark_skip(d, "early_window_skip")
-            record_signal_skip(
-                conn,
-                created_at=utc_now_iso(),
-                coin=d.coin, sleeve=sleeve.label, entry_minute=d.entry_minute,
-                side=side, window_start_ts=d.window_start_ts,
-                model_p=d.score.model_p, ask=top_ask,
-                edge=d.score.realized_edge, fee_rate_bps=d.fee_rate_bps,
-                partial_ret_z_1h=d.score.partial_ret_z_1h,
-                lut_p_bucket=_bucket_or_none(d.score.lut_p_bucket),
-                lut_hit_rate=d.score.lut_hit_rate, lut_n_cum=d.score.lut_n_cum,
-                skip_reason="early_window_skip",
-                mode=wallet_mode, wallet_group=wallet_group,
-                offset_sec=d.offset_sec,
-            )
-            _bump(tick.skips_by_reason, "early_window_skip")
-            tick.signals_written += 1
-            conn.commit()
-            return
-
-        # Ask-band entry skip gate (config.ASK_BAND_SKIP, default () =>
-        # byte-identical: the predicate's falsy-tuple guard short-circuits before
-        # any comparison). An entry whose decision ask (`top_ask` — the SAME
-        # scalar the sleeve band test, GateInput.fill_price and the signals `ask`
-        # column use) lands in a configured (coin, sleeve) band that went adverse
-        # is dropped: no reserve, no POST, window NOT consumed (the next
-        # qualifying second re-evaluates, exactly like late_window_skip), just a
-        # signal. Scope lives entirely inside _ask_band_skip.
-        #
-        # Unlike the late-window gate this one is DRY-INVARIANT (no wallet_mode
-        # argument): it removes a cohort whose EDGE was refuted on the live
-        # ledger, so the DRY paper stream must stop booking it too.
-        #
-        # SAME DELIBERATE PLACEMENT as late_window_skip — end of the decision
-        # path, NOT hoisted earlier — so the skip cohort equals exactly "bets the
-        # ungated bot WOULD have placed" and the pre-registered re-enable grade
-        # (band WR >= 80% AND daily flip-rate <= 15% over >= 3 days / >= 60 clean
-        # bets) can compute avoided-PnL cleanly. Keep it here.
-        if _ask_band_skip(d.coin, sleeve.label, top_ask):
-            _mark_skip(d, "ask_band_skip")
-            record_signal_skip(
-                conn,
-                created_at=utc_now_iso(),
-                coin=d.coin, sleeve=sleeve.label, entry_minute=d.entry_minute,
-                side=side, window_start_ts=d.window_start_ts,
-                model_p=d.score.model_p, ask=top_ask,
-                edge=d.score.realized_edge, fee_rate_bps=d.fee_rate_bps,
-                partial_ret_z_1h=d.score.partial_ret_z_1h,
-                lut_p_bucket=_bucket_or_none(d.score.lut_p_bucket),
-                lut_hit_rate=d.score.lut_hit_rate, lut_n_cum=d.score.lut_n_cum,
-                skip_reason="ask_band_skip",
-                mode=wallet_mode, wallet_group=wallet_group,
-                offset_sec=d.offset_sec,
-            )
-            _bump(tick.skips_by_reason, "ask_band_skip")
-            tick.signals_written += 1
-            conn.commit()
-            return
-
-        # Fix 3a — PRE-POST FRESHNESS RECHECK (config.PREPOST_RECHECK_ENABLED,
-        # default OFF => byte-identical: _prepost_recheck short-circuits before
-        # any book-source read). Re-read the correct-side book from the shared
-        # WS/prefetch source right before reserving the LIVE order; if the level
-        # priced in Pass 2 no longer covers the stake, SKIP the POST (no reserve,
-        # no POST, window NOT consumed, no reject_requotes / subminute_fills row —
-        # just a signal). FAIL-OPEN: no source / no fresh frame => proceed as
-        # today. SHADOW mode (recheck off + WS shadow on) never skips; it records
-        # what the gate WOULD decide vs the real outcome (_prepost_would_skip,
-        # classified in _process_live_post). REPRICE variant reserved/unbuilt.
-        # The DROP-guard extension (config.PREPOST_DROP_GUARD_MODE) rides the same
-        # fresh re-read: mode "live" aborts a TOXIC drop (fresh ask collapsed >=
-        # thresh below the decision ask) with skip_reason `prepost_drop_skip`;
-        # mode "shadow" only flags (_prepost_would_skip_drop). Cover takes
-        # precedence when both fire. Default off keeps this byte-identical.
-        if wallet_mode == "LIVE" and live_ctx is not None:
-            (
-                _prepost_skip_now, _prepost_shadow_skip, _prepost_reason,
-                _prepost_drop_fresh_ask,
-            ) = _prepost_recheck(
-                wallet_mode=wallet_mode,
-                offset_sec=d.offset_sec,
-                book_source=live_ctx.book_source,
-                order_client=live_ctx.order_client,
-                token_id=token_id,
-                now_ts=now_ts,
-                ask_book=ask_book,
-                walker_target=walker_target,
-                model_p=d.score.model_p,
-                sleeve=sleeve,
-                anchor_for_walker=anchor_for_walker,
-                proposed_bet_size=proposed_bet_size,
-                decision_top_ask=top_ask,
-                max_walk_price_override=max_walk_price_cell,
-            )
-            # Split the single shadow verdict onto its guard's flag (the reason
-            # tag disambiguates; cover wins when both are in shadow) so
-            # _process_live_post classifies each against the real fill/reject.
-            # The 4th return (_prepost_drop_fresh_ask) is the fresh ask the drop
-            # shadow line logs — used only when _prepost_would_skip_drop.
-            _prepost_would_skip = _prepost_shadow_skip and _prepost_reason == "cover"
-            _prepost_would_skip_drop = (
-                _prepost_shadow_skip and _prepost_reason == "drop"
-            )
-            if _prepost_skip_now:
-                # reason "drop" -> new `prepost_drop_skip` signal; "cover" keeps
-                # the existing `prepost_recheck_skip` string (dashboards/tests
-                # reference it). Same record_signal_skip field list either way.
-                _prepost_skip_reason = (
-                    "prepost_drop_skip" if _prepost_reason == "drop"
-                    else "prepost_recheck_skip"
-                )
-                _mark_skip(d, _prepost_skip_reason)
-                record_signal_skip(
-                    conn,
-                    created_at=utc_now_iso(),
-                    coin=d.coin, sleeve=sleeve.label, entry_minute=d.entry_minute,
-                    side=side, window_start_ts=d.window_start_ts,
-                    model_p=d.score.model_p, ask=top_ask,
-                    edge=d.score.realized_edge, fee_rate_bps=d.fee_rate_bps,
-                    partial_ret_z_1h=d.score.partial_ret_z_1h,
-                    lut_p_bucket=_bucket_or_none(d.score.lut_p_bucket),
-                    lut_hit_rate=d.score.lut_hit_rate, lut_n_cum=d.score.lut_n_cum,
-                    skip_reason=_prepost_skip_reason,
-                    mode=wallet_mode, wallet_group=wallet_group,
-                    offset_sec=d.offset_sec,
-                )
-                _bump(tick.skips_by_reason, _prepost_skip_reason)
-                tick.signals_written += 1
-                conn.commit()
-                return
 
         if wallet_mode == "LIVE" and live_ctx is not None and live_ctx.order_client is not None:
             # Reserve attempt OUTSIDE the slot lock — the attempt commit
@@ -6899,74 +5305,6 @@ def _maybe_alert_venue_degradation(
 def _pick_ask(d: CellDecision, side: str) -> Optional[float]:
     book = _book_for_side(d, side)
     return book.top_ask if book is not None else None
-
-
-def _crossed_book_skip(
-    exec_ask: Optional[float], other_ask: Optional[float]
-) -> bool:
-    """Phantom-book integrity guard (armed 2026-08-08 with the EDGE_CAP
-    disarm). True when BOTH sides' top asks are readable and sum below $1 —
-    a real two-sided book sums to >= $1 + overround, so a sub-$1 sum means
-    one side is a stale/cancelled phantom quote. The 08-07..08 era logged 5
-    such seconds; each read as a fake edge of 0.14-0.27, and the retired
-    0.08 edge cap was their only live filter. Fires only on POSITIVE
-    evidence of a broken book: unreadable/missing sides return False and
-    keep their ordinary no-book handling.
-    """
-    if exec_ask is None or other_ask is None:
-        return False
-    try:
-        a, b = float(exec_ask), float(other_ask)
-    except (TypeError, ValueError):
-        return False
-    if not (math.isfinite(a) and math.isfinite(b)):
-        return False
-    return (a + b) < 0.999
-
-
-def _execution_max_walk_price_for(
-    d: CellDecision, side: str, sleeve: Sleeve
-) -> Optional[float]:
-    """Walker price-walk INCREMENT for this cell — the sleeve leash, tightened
-    under SUBMINUTE_FLIP_SIDE so the walked limit can never exceed the
-    ABSOLUTE ceiling ``(1 - model_side_ask) + SUBMINUTE_FLIP_PAD``.
-
-    walk_book treats ``max_walk_price`` as a RELATIVE increment over its
-    anchor (``walk_cap_price = anchor + max_walk_price``), so the flip's
-    absolute ceiling must be converted against this cell's own flip-side top
-    ask BEFORE the min(). Comparing the absolute mirror price against the 5c
-    increment left the cap inert (min(0.05, 0.17..0.36) == 0.05 always) from
-    the 2026-08-07 05:17 flip deploy until the 2026-08-08 audit caught it.
-
-    Returns:
-      * flag OFF -> the sleeve increment untouched (None = leash disabled).
-      * flag ON  -> ``min(sleeve increment, ceiling - flip_top_ask)`` — the
-        caller anchors the walk at THIS decision's flip top ask so the
-        pre-POST cover re-walk cannot drift the cap above the ceiling on a
-        fresher book.
-      * ``-1.0`` SENTINEL -> unpriceable flip: model ask unreadable, flip top
-        unreadable, or flip top already above the ceiling. The caller must
-        SKIP the attempt (fail-closed; walk_book would reject a negative
-        increment anyway, but with a misleading config-drift warning).
-    """
-    base = _execution_max_walk_price(sleeve)
-    if not config.SUBMINUTE_FLIP_SIDE:
-        return base
-    model_ask = _pick_ask(d, "NO" if side == "YES" else "YES")
-    flip_top = _pick_ask(d, side)
-    if (
-        model_ask is None
-        or not math.isfinite(float(model_ask))
-        or flip_top is None
-        or not math.isfinite(float(flip_top))
-        or float(flip_top) <= 0.0
-    ):
-        return -1.0
-    ceiling = (1.0 - float(model_ask)) + config.SUBMINUTE_FLIP_PAD
-    inc = ceiling - float(flip_top)
-    if inc < 0.0:
-        return -1.0
-    return inc if base is None else min(float(base), inc)
 
 
 def _book_for_side(d: CellDecision, side: str) -> Optional[BookSnapshot]:

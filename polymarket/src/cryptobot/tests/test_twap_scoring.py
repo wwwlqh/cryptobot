@@ -88,7 +88,6 @@ def _engine() -> PartialRetEngine:
 
 def test_twap_scorer_uses_symmetric_z_and_best_trend_side(monkeypatch):
     pipe = _SideAwarePipeline()
-    monkeypatch.setattr(config, "SUBMINUTE_FLIP_SIDE", True)
 
     result = score_cell_twap(
         coin="btc",
@@ -104,7 +103,7 @@ def test_twap_scorer_uses_symmetric_z_and_best_trend_side(monkeypatch):
     )
 
     assert result.skip_reason is None
-    assert result.side == "YES"  # trend-only scorer never applies legacy flip
+    assert result.side == "YES"
     assert result.model_p == pytest.approx(0.92)
     assert len(pipe.frames) == 2
     assert pipe.frames[0]["partial_ret_z_side"].iloc[0] == pytest.approx(

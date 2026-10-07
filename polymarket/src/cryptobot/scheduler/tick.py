@@ -258,14 +258,8 @@ def start_scheduler(
     requote_drain_seconds: int = 2,
     wal_checkpoint_job: Optional[Callable[[], None]] = None,
     wal_checkpoint_seconds: int = 60,
-    held_pass_job: Optional[Callable[[], None]] = None,
-    held_pass_seconds: float = 0.0,
-    fast_requote_job: Optional[Callable[[], None]] = None,
-    fast_requote_seconds: float = 0.0,
     clob_ping_job: Optional[Callable[[], None]] = None,
     clob_ping_seconds: int = 20,
-    gc_collect_job: Optional[Callable[[], None]] = None,
-    gc_collect_seconds: int = 60,
     miss_forensics_job: Optional[Callable[[], None]] = None,
     miss_forensics_seconds: int = 300,
     book_ws_watchdog_job: Optional[Callable[[], None]] = None,
@@ -382,18 +376,6 @@ def start_scheduler(
             id="clob_ping",
             replace_existing=True,
         )
-    # Latency finding #6 (gc-pause): flag-gated periodic gc.collect() on the
-    # scheduler pool (the wal_checkpoint off-tick pattern) bounds memory creep
-    # from GC_TUNING's raised thresholds. Wired only when main.py supplies the
-    # job (GC_TUNING on) AND the cadence is positive
-    # (CRYPTOBOT_GC_COLLECT_SECONDS=0 keeps the job set byte-identical).
-    if gc_collect_job is not None and gc_collect_seconds > 0:
-        scheduler.add_job(
-            gc_collect_job,
-            trigger=IntervalTrigger(seconds=gc_collect_seconds),
-            id="gc_collect",
-            replace_existing=True,
-        )
     # WS mirror stall watchdog (operator order 2026-08-06): off-tick REST
     # cross-check of SUSPECT (old-ladder) mirror tokens. Wired only when main.py
     # supplies the job (mirror authoritative + watchdog enabled + venue mirror
@@ -447,34 +429,6 @@ def start_scheduler(
             wal_checkpoint_job,
             trigger=IntervalTrigger(seconds=wal_checkpoint_seconds),
             id="wal_checkpoint",
-            replace_existing=True,
-        )
-    # LEVER 2 (CRYPTOBOT_HELD_PASS_CADENCE_MS): dedicated fast-cadence
-    # held-position (T3 scale-in) job. Wired ONLY when main.py passes a positive
-    # cadence (the flag is on) — otherwise the inline pass in run_scanner_tick
-    # runs as today and NO job is registered (byte-identical). IntervalTrigger
-    # accepts float seconds for sub-second cadences; job_defaults already pin
-    # max_instances=1 + coalesce so a slow re-score pass never overlaps itself or
-    # thunder-herds.
-    if held_pass_job is not None and held_pass_seconds > 0:
-        scheduler.add_job(
-            held_pass_job,
-            trigger=IntervalTrigger(seconds=held_pass_seconds),
-            id="held_position_fast",
-            replace_existing=True,
-        )
-    # Fix 3b (CRYPTOBOT_FAST_REQUOTE_ENABLED): dedicated short-cadence job that
-    # drains due fast-requotes ~FAST_REQUOTE_DELAY_MS after a no_liquidity flicker
-    # reject and replays a fresh-book reserve→POST on its OWN connection +
-    # order_client (the held_position_fast / requote_drain dedicated-job pattern).
-    # Wired ONLY when main.py passes a positive cadence (the flag is on) —
-    # otherwise NO job is registered (byte-identical). max_instances=1 + coalesce
-    # (job_defaults) keep a slow drain from overlapping itself or thundering.
-    if fast_requote_job is not None and fast_requote_seconds > 0:
-        scheduler.add_job(
-            fast_requote_job,
-            trigger=IntervalTrigger(seconds=fast_requote_seconds),
-            id="fast_requote_drain",
             replace_existing=True,
         )
     # On-chain miss forensics (CRYPTOBOT_MISS_FORENSICS_ENABLED, default ON):

@@ -2313,7 +2313,7 @@ def test_latency_block_exposes_decision_and_freshness(db: sqlite3.Connection):
         "sign": 1.0, "post": 410.0, "order": 430.0, "total": 560.0,
         "n_gamma": 0, "n_book": 1, "n_orders": 1,
         "post_rej": 0.0, "n_rej": 0,
-        "pre_post": 62.0, "tail": 95.0, "book_stop": 55.0, "n_book_stop": 2,
+        "pre_post": 62.0, "tail": 95.0,
         "bk_ws": 3, "bk_pf": 5, "bk_rest": 0, "ws_age": 3600.0,
     })
     db.execute(
@@ -2330,7 +2330,6 @@ def test_latency_block_exposes_decision_and_freshness(db: sqlite3.Connection):
     # The post-POST tail is reported apart from it — it delays no fill.
     assert block["decision"]["tail"]["p50"] == pytest.approx(95.0)
     # Entry-path books are split from the held-position pass's books.
-    assert block["decision"]["book_stop"]["p50"] == pytest.approx(55.0)
 
     fresh = block["freshness"]
     assert fresh["sources"] == {"ws": 3, "prefetch": 5, "rest": 0}
@@ -2346,35 +2345,13 @@ def test_latency_block_exposes_decision_and_freshness(db: sqlite3.Connection):
 def test_strategy_flags_block_in_payload(
     db: sqlite3.Connection, portfolio, monkeypatch: pytest.MonkeyPatch
 ):
-    """Item 31: the Config tab's strategy panel renders from
-    payload['strategy_flags'] — env-pinned execution knobs (T3 / fresh gate /
-    late-window skip / ask-band skip / tier-A), never hardcoded UI strings."""
-    monkeypatch.setattr(config, "SCALEIN_T3_ENABLED", True)
-    monkeypatch.setattr(config, "LATE_WINDOW_SKIP", {"BTC": 20})
-    monkeypatch.setattr(
-        config, "ASK_BAND_SKIP",
-        (config.AskBandSkipRule(coin="SOL", sleeve="subminute",
-                                lo=0.65, hi=0.85),),
-    )
-
+    """The Config tab's strategy panel renders from payload['strategy_flags']."""
     payload, _ = build_payload(db, portfolio)
     sf = payload["strategy_flags"]
-    assert sf["scalein_t3"]["enabled"] is True
-    assert sf["scalein_t3"]["max_n"] == config.SCALEIN_T3_MAX_N
-    assert sf["scalein_t3"]["frac"] == pytest.approx(config.SCALEIN_T3_FRAC)
-    assert sf["late_window_skip"] == {"BTC": 20}
-    assert sf["ask_band_skip"] == [
-        {"coin": "SOL", "sleeve": "subminute", "lo": 0.65, "hi": 0.85}
-    ]
-    assert sf["tier_a"]["mult"] == pytest.approx(config.V2_TIER_A_MULT)
-    assert sf["tier_a"]["edge"] == pytest.approx(config.V2_TIER_A_EDGE)
-    assert sf["scalein_t3"]["disarm_band"] == pytest.approx(
-        config.SCALEIN_T3_DISARM_BAND
-    )
-    assert sf["topup_fresh_gate_mode"] in ("off", "shadow", "live")
     assert sf["fak_pad"] == pytest.approx(
         float(getattr(config, "V2_FAK_PAD", 0.0))
     )
+    assert sf["min_bet_usd"] == pytest.approx(config.MIN_BET_USD)
     # The block is display-only config echo — strict-JSON safe.
     json.dumps(sf, allow_nan=False)
 

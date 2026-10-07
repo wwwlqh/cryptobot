@@ -30,7 +30,6 @@ import pytest
 from cryptobot import config
 from cryptobot.execution.fill_rate_breaker import (
     evaluate_breaker,
-    ramp_state,
     record_subminute_fill,
 )
 from cryptobot.execution.ledger import (
@@ -186,8 +185,6 @@ def _hermetic_subminute_config(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(config, "SUBMINUTE_BREAKER_MIN_FILL_RATE", 0.5)
     monkeypatch.setattr(config, "SUBMINUTE_BREAKER_EV_MIN_SETTLED", 3)
     monkeypatch.setattr(config, "SUBMINUTE_BREAKER_EV_MAX_LOSS_FRAC", 0.15)
-    monkeypatch.setattr(config, "SUBMINUTE_RAMP_GREEN_BETS", 2)
-    monkeypatch.setattr(config, "SUBMINUTE_RAMP_CAP_USD", 5.0)
 
 
 # ---------------------------------------------------------------------------
@@ -641,133 +638,6 @@ class TestEvaluateBreaker:
 
 
 # ---------------------------------------------------------------------------
-# 8. ramp_state
-# ---------------------------------------------------------------------------
-
-
-class TestRampState:
-    @pytest.fixture(autouse=True)
-    def _enable_legacy_ramp(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        # 2026-07-05: the staged ramp runs only when SUBMINUTE_RAMP_ENABLED=1
-        # (default off = full-target sizing, 35% DD is the sole control). Every
-        # test in THIS class exercises the legacy rung/cap logic, so enable it;
-        # the disabled default is covered by test_ramp_disabled_is_full_size.
-        monkeypatch.setattr(config, "SUBMINUTE_RAMP_ENABLED", True)
-
-    def test_ramp_disabled_is_full_size(
-        self, tmp_db: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        # Default (ramp off): no probation — sub-minute sizes at its full backtest
-        # target from the first bet; the 35% DD halt is the sole risk control.
-        monkeypatch.setattr(config, "SUBMINUTE_RAMP_ENABLED", False)
-        state = ramp_state(tmp_db)
-        assert state.rung == 3
-        assert state.stake_multiplier == pytest.approx(1.0)
-        assert state.min_bet_override is False
-        assert state.cap_blocked is False
-
-    def test_fresh_db_is_rung_1_min_bet(self, tmp_db: sqlite3.Connection) -> None:
-        state = ramp_state(tmp_db)
-        assert state.rung == 1
-        assert state.min_bet_override is True
-        assert state.cap_blocked is False
-        assert state.stake_multiplier == pytest.approx(1.0)
-        assert state.cumulative_filled_usd == pytest.approx(0.0)
-        assert state.n_settled == 0
-
-    def test_rung_1_cumulative_cap_blocks(self, tmp_db: sqlite3.Connection) -> None:
-        # SUBMINUTE_RAMP_CAP_USD pinned to 5.0; 3.0 + 2.5 = 5.5 >= cap.
-        add_fill(tmp_db, offset_sec=275, filled_usd=3.0)
-        add_fill(tmp_db, offset_sec=280, filled_usd=2.5)
-        state = ramp_state(tmp_db)
-        assert state.rung == 1
-        assert state.cumulative_filled_usd == pytest.approx(5.5)
-        assert state.cap_blocked is True
-
-    def test_unfilled_ghosts_do_not_consume_the_cap(
-        self, tmp_db: sqlite3.Connection
-    ) -> None:
-        # The cap counts REALIZED fill value — unfilled FAKs cost nothing.
-        for i in range(10):
-            add_fill(tmp_db, offset_sec=5 + 5 * i, requested_usd=1.0, filled_usd=0.0)
-        state = ramp_state(tmp_db)
-        assert state.cumulative_filled_usd == pytest.approx(0.0)
-        assert state.cap_blocked is False
-
-    def test_rung_2_after_green_bets(self, tmp_db: sqlite3.Connection) -> None:
-        # SUBMINUTE_RAMP_GREEN_BETS pinned to 2.
-        for i in range(int(config.SUBMINUTE_RAMP_GREEN_BETS)):
-            add_settled_bet(
-                tmp_db, offset_sec=275, window_start_ts=WINDOW_START + 300 * i
-            )
-        state = ramp_state(tmp_db)
-        assert state.rung == 2
-        assert state.stake_multiplier == pytest.approx(0.5)
-        assert state.min_bet_override is False
-        assert state.cap_blocked is False
-        assert state.n_settled == int(config.SUBMINUTE_RAMP_GREEN_BETS)
-
-    def test_rung_3_after_double_green(self, tmp_db: sqlite3.Connection) -> None:
-        for i in range(2 * int(config.SUBMINUTE_RAMP_GREEN_BETS)):
-            add_settled_bet(
-                tmp_db, offset_sec=275, window_start_ts=WINDOW_START + 300 * i
-            )
-        state = ramp_state(tmp_db)
-        assert state.rung == 3
-        assert state.stake_multiplier == pytest.approx(1.0)
-        assert state.min_bet_override is False
-
-    def test_baseline_and_pending_rows_do_not_advance_the_ramp(
-        self, tmp_db: sqlite3.Connection
-    ) -> None:
-        # Settled BASELINE rows (offset_sec NULL) don't count...
-        for i in range(2 * int(config.SUBMINUTE_RAMP_GREEN_BETS)):
-            add_settled_bet(
-                tmp_db, offset_sec=None, window_start_ts=WINDOW_START + 300 * i
-            )
-        # ...and unsettled (PENDING) sub-minute rows don't either.
-        record_bet(
-            tmp_db,
-            make_subminute_signal(offset_sec=275, window_start_ts=WINDOW_START + 9000),
-        )
-        state = ramp_state(tmp_db)
-        assert state.rung == 1
-        assert state.n_settled == 0
-
-    def test_fail_closed_on_missing_table(self, tmp_db: sqlite3.Connection) -> None:
-        tmp_db.execute("DROP TABLE subminute_fills")
-        state = ramp_state(tmp_db)
-        assert state.rung == 1
-        assert state.min_bet_override is True
-        assert state.cap_blocked is True  # fail-closed: refuse placement
-
-    def test_dry_paper_bets_never_advance_the_ramp(
-        self, tmp_db: sqlite3.Connection
-    ) -> None:
-        """Regression: DRY paper sub-minute bets fill at the observed book by
-        construction — 50 of them must NOT jump the ramp to rung 3 before the
-        first REAL (LIVE) order proves fills are possible."""
-        from cryptobot import config as _cfg
-
-        for i in range(2 * _cfg.SUBMINUTE_RAMP_GREEN_BETS):
-            rowid = record_bet(
-                tmp_db,
-                make_subminute_signal(
-                    offset_sec=275,
-                    window_start_ts=WINDOW_START + 300 * i,
-                ),
-                mode="DRY",
-            )
-            tmp_db.execute(
-                "UPDATE ledger SET outcome='WIN', pnl_net=0.1 WHERE id=?",
-                (rowid,),
-            )
-        state = ramp_state(tmp_db)
-        assert state.rung == 1
-        assert state.n_settled == 0
-
-
-# ---------------------------------------------------------------------------
 # Adversarial-review regression fixes (2026-07-03)
 # ---------------------------------------------------------------------------
 
@@ -800,20 +670,6 @@ class TestBreakerResetFormat:
         # Full history (safe side): the ghost fills still trip the breaker.
         assert state.n_orders == 6
         assert state.tripped
-
-
-class TestRampArithmetic:
-    def test_green_bets_reachable_under_rung1_cap(self) -> None:
-        """Review major (deadlock): rung 2 requires GREEN_BETS settled bets,
-        but rung-1 fills are ~MIN_BET_USD each and stop at RAMP_CAP_USD —
-        the shipped defaults must leave the target reachable with headroom
-        (the original 25 x $1 deadlocked against the $20 cap)."""
-        need = config.SUBMINUTE_RAMP_GREEN_BETS * config.MIN_BET_USD
-        assert need <= config.SUBMINUTE_RAMP_CAP_USD * 0.8, (
-            f"rung-2 unreachable: {config.SUBMINUTE_RAMP_GREEN_BETS} bets x "
-            f"${config.MIN_BET_USD} = ${need} vs rung-1 cap "
-            f"${config.SUBMINUTE_RAMP_CAP_USD}"
-        )
 
 
 class TestPruneScoping:

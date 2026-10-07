@@ -294,16 +294,6 @@ def _migrate_db(conn: sqlite3.Connection) -> None:
     _add_column_if_missing(conn, "ledger", "exit_ts", "TEXT")
     _add_column_if_missing(conn, "ledger", "exit_kind", "TEXT")
 
-    # T3 scale-in top-up tag (execution/scale_in.py): 1 on a T3 scale-in top-up
-    # row so live grading can separate T3 top-ups from entries and from generic
-    # within-minute top-ups. Additive + defaulted 0 so every existing caller and
-    # legacy row is byte-identical. schema.sql seeds it on fresh installs; this
-    # covers legacy DBs. The durable no-dip state table is created below in
-    # _ensure_per_strategy_live_tables.
-    _add_column_if_missing(
-        conn, "ledger", "scalein_topup", "INTEGER NOT NULL DEFAULT 0"
-    )
-
     # Venue dimension (deliverable 5): the trading venue each bet was placed on
     # ('polymarket' default / 'predictfun'). Additive + DEFAULT 'polymarket', so
     # (1) every legacy ledger row reads back as 'polymarket' after the ALTER —
@@ -688,19 +678,6 @@ def _ensure_per_strategy_live_tables(conn: sqlite3.Connection) -> None:
             ON stop_loss_attempts(ledger_id);
         CREATE INDEX IF NOT EXISTS idx_stop_loss_attempts_created
             ON stop_loss_attempts(created_at DESC);
-
-        -- T3 scale-in durable no-dip state (execution/scale_in.py). ONE row per
-        -- ENTRY position; disarmed=1 is permanent (no-dip fail OR stop trigger).
-        -- schema.sql is the source of truth for fresh installs; re-applied here
-        -- for legacy DBs.
-        CREATE TABLE IF NOT EXISTS scalein_state (
-            ledger_id         INTEGER PRIMARY KEY,
-            ask0              REAL,
-            running_min_ask   REAL,
-            disarmed          INTEGER NOT NULL DEFAULT 0,
-            last_attempt_ts   INTEGER,
-            updated_at        TEXT
-        );
         """
     )
 

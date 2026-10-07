@@ -539,14 +539,7 @@ def _parse_sleeve(raw: dict) -> Sleeve:
         # edge-preserving top-up regime: the walker stops on realized VWAP
         # edge instead of a fixed depth-consumption fraction.
 
-    # V2_EDGE_CAP (registered candidate 2026-07-22): when armed (>0), clamp the
-    # artifact's max_edge so the existing edge_above_ceiling gate rejects
-    # high-claimed-edge entries — claimed edge >=0.08 is adverse-selected in
-    # live AND fold-E/F replays (see config.V2_EDGE_CAP). 0.0 = artifact value
-    # untouched (byte-identical).
     max_edge_val = float(_required(cfg, "max_edge", label))
-    if config.V2_EDGE_CAP > 0.0:
-        max_edge_val = min(max_edge_val, config.V2_EDGE_CAP)
 
     return Sleeve(
         label=label,

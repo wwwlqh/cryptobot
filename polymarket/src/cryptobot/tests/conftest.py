@@ -38,23 +38,6 @@ def _clear_gamma_market_cache() -> Iterator[None]:
     clear_aux_cache()
 
 
-@pytest.fixture(autouse=True)
-def _neutralize_entry_skip(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Pin config.ENTRY_SKIP_SECONDS=0 for the whole suite by default.
-
-    The entry-skip lever suppresses all bet placement during the first N
-    seconds of every minute. Every run_scanner_tick fixture in this suite
-    drives ticks at exact-minute timestamps (now_ts % 60 == 0), so a nonzero N
-    would short-circuit them all before scoring and break the scoring / dedup /
-    parity assertions they were written for. N=0 is also the live default
-    (2026-06-07: no skip, so live fills at the minute boundary aligned with the
-    ORB+HGB backtest), so this fixture now matches production rather than
-    overriding it. Tests that exercise the gate itself set
-    config.ENTRY_SKIP_SECONDS explicitly inside the test.
-    """
-    monkeypatch.setattr(config, "ENTRY_SKIP_SECONDS", 0)
-
-
 @pytest.fixture
 def db() -> Iterator[sqlite3.Connection]:
     """In-memory SQLite connection with schema + migrations applied."""

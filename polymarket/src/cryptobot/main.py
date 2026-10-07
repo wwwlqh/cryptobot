@@ -58,97 +58,6 @@ def _disk_free_mb() -> float:
         return 0.0
 
 
-def _apply_gc_tuning() -> None:
-    """Latency finding #6 (gc-pause): move the boot heap out of the collector.
-
-    Called once at boot — after every artifact load (RF/HGB/checkpoint
-    bundles, LUT, prefetchers) and immediately before ``start_scheduler`` —
-    and self-gates on ``config.GC_TUNING`` (default OFF => returns without
-    touching ``gc`` at all, byte-identical runtime).
-
-    ``gc.collect()`` runs FIRST — order matters: ``gc.freeze()`` moves every
-    surviving tracked object into the permanent generation, so cyclic boot
-    garbage frozen uncollected would leak for the process lifetime. After the
-    freeze, gen-2 passes no longer re-scan the artifact heap with the GIL
-    held; the raised thresholds then keep young-gen passes off the tick's
-    steady allocation churn (the periodic off-tick collect job registered in
-    ``main()`` bounds the resulting memory creep).
-
-    Known bounded, memory-only leak under the flag: the prefetch daemon
-    threads are already running here, so a transient object of theirs can be
-    frozen mid-flight — refcounting still frees the non-cyclic ones
-    immediately, only cyclic stragglers stick.
-    """
-    from cryptobot import config
-
-    if not config.GC_TUNING:
-        return
-    import gc
-
-    gc.collect()
-    gc.freeze()
-    gc.set_threshold(
-        config.GC_GEN0_THRESHOLD,
-        config.GC_GEN1_THRESHOLD,
-        config.GC_GEN2_THRESHOLD,
-    )
-    logger.info(
-        "gc tuning armed: frozen=%d thresholds=%s collect_every=%ss",
-        gc.get_freeze_count(),
-        gc.get_threshold(),
-        config.GC_COLLECT_SECONDS,
-    )
-
-
-def _install_gc_pause_telemetry(
-    min_pause_ms: float = 10.0,
-) -> Optional[Callable[[str, dict], None]]:
-    """Latency finding #6 telemetry: log every GC pause >= ``min_pause_ms``.
-
-    Self-gates on ``config.GC_PAUSE_TELEMETRY`` (default OFF => installs
-    nothing, returns None). Deliberately INDEPENDENT of ``config.GC_TUNING``
-    so the operator can measure a before (telemetry on, tuning off) vs after
-    (both on) on the live box — the verifier's before/after measurement ask.
-    Returns the installed callback (tests detach via
-    ``gc.callbacks.remove``).
-    """
-    from cryptobot import config
-
-    if not config.GC_PAUSE_TELEMETRY:
-        return None
-    import gc
-
-    # CPython collections never nest, so one pending start-time cell suffices.
-    pending_t0: Optional[float] = None
-
-    def _gc_pause_cb(phase: str, info: dict) -> None:
-        nonlocal pending_t0
-        if phase == "start":
-            # Gen-0 passes fire ~every 700 allocations — timing them makes
-            # the instrument perturb the tick path it measures. Only gen 1/2
-            # can pause >= the report floor, so gen 0 is never timed.
-            if info.get("generation") == 0:
-                return
-            pending_t0 = time.perf_counter()
-            return
-        t0 = pending_t0
-        pending_t0 = None
-        if t0 is None:
-            return
-        pause_ms = (time.perf_counter() - t0) * 1000.0
-        if pause_ms >= min_pause_ms:
-            logger.info(
-                "gc_pause %.1fms gen=%s collected=%s uncollectable=%s",
-                pause_ms,
-                info.get("generation"),
-                info.get("collected"),
-                info.get("uncollectable"),
-            )
-
-    gc.callbacks.append(_gc_pause_cb)
-    return _gc_pause_cb
-
-
 def _build_deps_factory(
     partial_ret_engine: "PartialRetEngine",
     config_sha256: str,
@@ -729,17 +638,6 @@ def main(argv: list[str] | None = None) -> int:
             warm_step_luts(checkpoint_rf)
     else:
         logger.info("RF step-LUT DISABLED (CRYPTOBOT_RF_STEP_LUT=0) — sklearn path")
-    # T3 boot visibility (operator 2026-07-09, retained through the 2026-08-05
-    # stop-loss retirement): a single INFO line at arm so an enabled-but-inert
-    # held-position pass is never silently undiagnosable again. The 2026-07-10
-    # incident (13h armed, 20 losses, 0 attempts) had nothing at boot confirming
-    # the arm or its parameters.
-    if config.SCALEIN_T3_ENABLED:
-        logger.info(
-            "held-position pass armed: T3 scale-in (max_n=%d, disarm_band=%.3f)",
-            config.SCALEIN_T3_MAX_N,
-            config.SCALEIN_T3_DISARM_BAND,
-        )
     partial_ret_engine = PartialRetEngine()
     twap_mirror = None
     if config.TWAP_SYMMETRIC_ENABLED:
@@ -1427,72 +1325,6 @@ def main(argv: list[str] | None = None) -> int:
         except Exception:  # noqa: BLE001 — hygiene job must never crash the scheduler
             logger.warning("wal_checkpoint job raised", exc_info=True)
 
-    # LEVER 2 (CRYPTOBOT_HELD_PASS_CADENCE_MS): dedicated fast-cadence
-    # held-position job. When the cadence flag is > 0 the inline pass in
-    # run_scanner_tick is SKIPPED (execution/pipeline.py) and THIS job drives the
-    # pass at the configured sub-second cadence on its OWN scheduler-pool
-    # connection (conns.get() ThreadLocalConnections — the wal_checkpoint /
-    # requote_drain pattern), so a cratering favorite is cut FASTER than 1Hz,
-    # decoupled from the entry tick. It builds the SAME deps the tick uses
-    # (deps_factory: order_client / fetch_book / fetch_market / notify /
-    # partial_ret_engine / checkpoint artifacts) and reads the cached spot batch
-    # the 1Hz tick keeps warm (partial_ret_engine is fed by the tick, so the
-    # re-score reads its latest state). run_held_position_pass self-gates on
-    # config.SCALEIN_T3_ENABLED + a wired OrderClient, so the job is inert until
-    # T3 itself is armed. DEFAULT 0 => not wired at all (below).
-    _held_pass_fast_job: Optional[Callable[[], None]] = None
-    if config.HELD_PASS_CADENCE_MS > 0:
-        from cryptobot.execution import held_position_pass as _held_pass_mod
-
-        def _run_held_pass_fast_job() -> None:
-            try:
-                job_conn = conns.get()  # this scheduler-pool thread's own connection
-                job_now_ts = int(time.time())
-                job_deps = deps_factory()
-                job_spots = job_deps.fetch_spots(
-                    now_ts=float(job_now_ts),
-                    tick_seconds=config.SPOT_FETCH_INTERVAL_SECONDS,
-                )
-                if job_spots is None:
-                    return
-                _held_pass_mod.run_held_position_pass(
-                    job_conn, portfolio, now_ts=job_now_ts,
-                    deps=job_deps, spots=job_spots,
-                )
-            except Exception:  # noqa: BLE001 — the job must never crash the scheduler
-                logger.warning("held_position_fast job raised", exc_info=True)
-
-        _held_pass_fast_job = _run_held_pass_fast_job
-
-    # Fix 3b (CRYPTOBOT_FAST_REQUOTE_ENABLED): dedicated fast-requote drain. On a
-    # no_liquidity flicker reject the tick arms a bounded requote; this job
-    # replays it ~FAST_REQUOTE_DELAY_MS later on its OWN scheduler-pool
-    # connection + the same OrderClient/book source the tick uses (the
-    # held_position_fast / requote_drain dedicated-job pattern). It re-reads the
-    # freshest book (book_prefetch chain, else one fetch_book GET), re-runs the
-    # band check, reserves a fresh attempt, and POSTs once. DEFAULT OFF => this
-    # block is skipped and start_scheduler registers no job (byte-identical).
-    _fast_requote_drain_job: Optional[Callable[[], None]] = None
-    if config.FAST_REQUOTE_ENABLED:
-        from cryptobot.execution.pipeline import drain_fast_requote_queue
-
-        def _run_fast_requote_drain_job() -> None:
-            try:
-                job_conn = conns.get()  # this scheduler-pool thread's own connection
-                job_deps = deps_factory()
-                counters = drain_fast_requote_queue(
-                    job_conn,
-                    order_client=job_deps.order_client,
-                    fetch_book=job_deps.fetch_book,
-                    book_source=job_deps.book_prefetch,
-                    now_ts=int(time.time()),
-                )
-                if counters.get("placed"):
-                    logger.info("fast_requote_drain %s", counters)
-            except Exception:  # noqa: BLE001 — drain must never crash the scheduler
-                logger.warning("fast_requote_drain job raised", exc_info=True)
-
-        _fast_requote_drain_job = _run_fast_requote_drain_job
 
     # Catch-all issue alert (operator decision 2026-07-03): several code
     # paths record CRITICAL pipeline_health rows without notifying (dd_halt,
@@ -1550,38 +1382,6 @@ def main(argv: list[str] | None = None) -> int:
             lead_ms=config.SPOT_PREFETCH_LEAD_MS,
         )
         spot_prefetcher.start()
-
-    # Latency finding #6 (gc-pause): optional GC pause telemetry + flag-gated
-    # GC tuning (gc.collect + gc.freeze + raised thresholds). Telemetry first
-    # so the tuning pass's own boot collect is measured. Both helpers
-    # self-gate on their config flags — default OFF => neither touches gc,
-    # byte-identical runtime. Placed after EVERY boot artifact load (RF/HGB/
-    # checkpoint bundles, LUT, prefetchers) so the freeze captures the full
-    # permanent heap, and before the scheduler's tick cadence begins.
-    _install_gc_pause_telemetry()
-    _apply_gc_tuning()
-
-    # Latency finding #6: with GC tuning armed, an explicit periodic collect
-    # on the scheduler pool (the wal_checkpoint_job off-tick pattern) bounds
-    # memory creep from the raised thresholds on the 2GB box. Post-freeze the
-    # young heap is small so the pass is cheap, but it still holds the GIL
-    # and can coincide with a tick — an accepted latency tradeoff, under the
-    # flag only. Registered through the start_scheduler param pattern (the
-    # clob_ping precedent) so start_scheduler stays the single owner of the
-    # job set; flag-off wiring stays byte-identical (param defaults None).
-    # GC_COLLECT_SECONDS=0 disables just this job while keeping the freeze +
-    # thresholds.
-    _gc_collect_job: Optional[Callable[[], None]] = None
-    if config.GC_TUNING:
-        import gc
-
-        def _run_gc_collect_job() -> None:
-            try:
-                gc.collect()
-            except Exception:  # noqa: BLE001 — hygiene job must never crash the scheduler
-                logger.warning("gc_collect job raised", exc_info=True)
-
-        _gc_collect_job = _run_gc_collect_job
 
     # WS mirror stall watchdog (operator order 2026-08-06). The mirror's
     # freshness cap was removed because snapshot age = market quietness on these
@@ -1725,18 +1525,8 @@ def main(argv: list[str] | None = None) -> int:
         requote_drain_job=requote_drain_job,
         wal_checkpoint_job=_wal_checkpoint_job,
         wal_checkpoint_seconds=config.WAL_CHECKPOINT_SECONDS,
-        held_pass_job=_held_pass_fast_job,
-        held_pass_seconds=(config.HELD_PASS_CADENCE_MS / 1000.0),
-        fast_requote_job=_fast_requote_drain_job,
-        fast_requote_seconds=(
-            config.FAST_REQUOTE_DRAIN_MS / 1000.0
-            if config.FAST_REQUOTE_ENABLED
-            else 0.0
-        ),
         clob_ping_job=clob_ping_job,
         clob_ping_seconds=config.CLOB_PING_SECONDS,
-        gc_collect_job=_gc_collect_job,
-        gc_collect_seconds=config.GC_COLLECT_SECONDS,
         miss_forensics_job=_miss_forensics_job,
         miss_forensics_seconds=config.MISS_FORENSICS_SECONDS,
         book_ws_watchdog_job=_book_ws_watchdog_job,

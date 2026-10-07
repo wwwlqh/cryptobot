@@ -328,56 +328,6 @@ def test_start_scheduler_omits_clob_ping_when_disabled(db: sqlite3.Connection):
         scheduler.shutdown(wait=False)
 
 
-def test_start_scheduler_registers_gc_collect_when_provided(db: sqlite3.Connection):
-    """Latency finding #6 / F8: the flag-gated periodic gc.collect() is
-    registered through the start_scheduler param pattern (the clob_ping
-    precedent) — start_scheduler is the single owner of the job set."""
-    from apscheduler.triggers.interval import IntervalTrigger
-    from cryptobot.scheduler.tick import start_scheduler
-
-    runner = _runner(db, lambda: TickResult(tick_ts=0, duration_ms_total=1.0))
-    runner.deps_factory = lambda: None
-    scheduler = start_scheduler(
-        runner,
-        tick_seconds=3600,
-        gc_collect_job=lambda: None,
-        gc_collect_seconds=60,
-    )
-    try:
-        job = scheduler.get_job("gc_collect")
-        assert job is not None
-        assert isinstance(job.trigger, IntervalTrigger)
-        assert job.trigger.interval.total_seconds() == 60
-    finally:
-        scheduler.shutdown(wait=False)
-
-
-def test_start_scheduler_omits_gc_collect_when_disabled(db: sqlite3.Connection):
-    """CRYPTOBOT_GC_COLLECT_SECONDS=0 → no gc_collect job even when the
-    caller supplies one; no job supplied (GC_TUNING off) → same. Flag-off
-    wiring stays byte-identical."""
-    from cryptobot.scheduler.tick import start_scheduler
-
-    runner = _runner(db, lambda: TickResult(tick_ts=0, duration_ms_total=1.0))
-    runner.deps_factory = lambda: None
-    scheduler = start_scheduler(
-        runner,
-        tick_seconds=3600,
-        gc_collect_job=lambda: None,
-        gc_collect_seconds=0,
-    )
-    try:
-        assert scheduler.get_job("gc_collect") is None
-    finally:
-        scheduler.shutdown(wait=False)
-
-    scheduler = start_scheduler(runner, tick_seconds=3600)
-    try:
-        assert scheduler.get_job("gc_collect") is None
-    finally:
-        scheduler.shutdown(wait=False)
-
-
 def test_start_scheduler_omits_sweep_when_not_provided(db: sqlite3.Connection):
     """Bare call (no sweep_job) registers only the scanner tick — keeps
     existing test fixtures and the --once smoke path working."""

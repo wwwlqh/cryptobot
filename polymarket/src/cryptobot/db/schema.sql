@@ -40,7 +40,6 @@ CREATE TABLE IF NOT EXISTS ledger (
     bet_size                REAL NOT NULL,            -- this row's notional (target - filled_pre for top-ups)
     slot_filled_pre         REAL NOT NULL DEFAULT 0,  -- pre-this-row fill amount; > 0 implies is_topup
     is_topup                INTEGER NOT NULL DEFAULT 0,  -- 1 when slot_filled_pre > 0
-    scalein_topup           INTEGER NOT NULL DEFAULT 0,  -- 1 for a T3 scale-in top-up row (execution/scale_in.py); distinguishes T3 top-ups from generic within-minute top-ups for live grading
     entry_top_price         REAL NOT NULL,            -- sticky cap anchor (R-NEW-9)
     add_on_realized_edge_minus_initial_edge REAL,     -- forensic; populated when is_topup=1 (R-NEW-9)
     -- resolution strike (review #2) --------------------------------------
@@ -344,27 +343,6 @@ CREATE INDEX IF NOT EXISTS idx_stop_loss_attempts_ledger
     ON stop_loss_attempts(ledger_id);
 CREATE INDEX IF NOT EXISTS idx_stop_loss_attempts_created
     ON stop_loss_attempts(created_at DESC);
-
-
--- =========================================================================
--- scalein_state: durable per-position no-dip state for the T3 scale-in
--- (execution/scale_in.py). ONE row per ENTRY ledger position (ledger_id).
--- ``ask0`` = the entry's scanned decision ask (ledger.p_market); the top-up
--- ladder stays armed only while ``running_min_ask`` (tick-observed running min
--- of the side best ask, crossed books skipped) has never fallen below
--- ``ask0 - no_dip``. The first violation sets ``disarmed=1`` PERMANENTLY (a
--- stop trigger also disarms). DB-derived so it survives a process restart — no
--- in-memory state to lose (the observation gap while the process is down is
--- inherent to tick observation; see reference memory).
--- =========================================================================
-CREATE TABLE IF NOT EXISTS scalein_state (
-    ledger_id         INTEGER PRIMARY KEY,   -- the ENTRY position row this state tracks
-    ask0              REAL,                   -- entry scanned decision ask (ledger.p_market)
-    running_min_ask   REAL,                   -- tick-observed running min of the side best ask
-    disarmed          INTEGER NOT NULL DEFAULT 0,  -- 1 once no-dip fails OR a stop triggers (permanent)
-    last_attempt_ts   INTEGER,                -- unix sec of the last top-up ATTEMPT (cadence throttle)
-    updated_at        TEXT
-);
 
 
 -- =========================================================================

@@ -685,7 +685,6 @@ def test_the_dd_halt_still_binds_on_a_cached_commit_stage(monkeypatch, db):
     monkeypatch.setattr(P, "_live_wallet_skip_reason", lambda **k: None)
     monkeypatch.setattr(P, "_fresh_operator_state", lambda *a, **k: None)
     monkeypatch.setattr(P, "evaluate_breaker", lambda conn: SimpleNamespace(tripped=False))
-    monkeypatch.setattr(P, "ramp_state", lambda conn: SimpleNamespace(rung=3))
     monkeypatch.setattr(P, "_wallet_drawdown_halted", lambda pf, snap: True)
     monkeypatch.setattr(P, "_commit_cell", lambda *a, **k: pytest.fail(
         "a drawdown-halted wallet placed off-tick"
@@ -809,7 +808,6 @@ def test_placement_line_carries_the_full_breakdown(monkeypatch, caplog):
                     all_group_caps_sum_usd=0.0, wallet_snaps={},
                 ),
                 tick_breaker=SimpleNamespace(tripped=False),
-                tick_ramp=SimpleNamespace(rung=3),
                 disk_free_mb=10_000.0,
             ),
             True,

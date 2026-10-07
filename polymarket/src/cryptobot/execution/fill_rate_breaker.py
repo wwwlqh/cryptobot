@@ -1,4 +1,4 @@
-"""B4/B5: sub-minute fill-rate circuit breaker + staged sizing ramp.
+"""Sub-minute fill-rate circuit breaker.
 
 The sub-minute checkpoint add-on (step5+step1last port — see
 backtest/optimize_runs/checkpoint_grid_combo_wfo/checkpoint_grid_combo_digest.md)
@@ -12,9 +12,6 @@ that lets reality assert itself cheaply:
     taker delay) OR realized EV over settled sub-minute bets is clearly
     negative — and a tripped breaker blocks every further sub-minute
     placement while the baseline 60s sleeves keep running untouched;
-  * the RAMP (`ramp_state`) keeps stakes at min-bet under a hard cumulative
-    dollar cap until enough settled bets prove the breaker green, then
-    scales toward the pe0.045/stake0.47 target in rungs.
 
 Everything here is read/derive-from-DB — no in-memory state that a process
 restart could clear, and no network. Callers wrap every entry point in
@@ -225,76 +222,3 @@ def evaluate_breaker(conn: sqlite3.Connection) -> BreakerState:
     except Exception:  # noqa: BLE001 — fail CLOSED
         logger.exception("subminute breaker evaluation failed — failing closed")
         return BreakerState(True, "error", 0, None, 0, None, None)
-
-
-# ---------------------------------------------------------------------------
-# Staged sizing ramp
-# ---------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class RampState:
-    rung: int                    # 1 (min-bet) / 2 (50% target) / 3 (full)
-    stake_multiplier: float      # applied to sleeve target (rung 1 overrides)
-    min_bet_override: bool       # rung 1: clamp stake to MIN_BET_USD
-    cumulative_filled_usd: float # rung-1 hard-cap accounting
-    cap_blocked: bool            # rung-1 cumulative cap reached → block
-    n_settled: int
-
-
-def ramp_state(conn: sqlite3.Connection) -> RampState:
-    """Derive the ramp rung from settled sub-minute bets + cumulative fills.
-
-    Fail-closed: any internal error returns a cap_blocked rung-1 state so
-    placement is refused rather than mis-sized.
-
-    When ``config.SUBMINUTE_RAMP_ENABLED`` is off (the default — see that flag
-    for the rationale), the staged ramp is skipped: this returns a full-size
-    rung-3 state from the first bet and the 35% drawdown halt is the sole
-    sizing control.
-    """
-    if not config.SUBMINUTE_RAMP_ENABLED:
-        return RampState(
-            rung=3,
-            stake_multiplier=1.0,
-            min_bet_override=False,
-            cumulative_filled_usd=0.0,
-            cap_blocked=False,
-            n_settled=0,
-        )
-    try:
-        clause, params = _reset_clause()
-        # mode='LIVE' is REQUIRED: the ramp exists to prove REAL fills are
-        # possible before scaling real money — DRY paper bets (which "fill"
-        # at the observed book by construction) must never advance a rung.
-        settled_row = conn.execute(
-            "SELECT COUNT(*) AS n FROM ledger "
-            "WHERE offset_sec IS NOT NULL AND mode = 'LIVE' "
-            "AND outcome IN ('WIN', 'LOSS')"
-            + clause.replace("created_at", "bet_ts"),
-            params,
-        ).fetchone()
-        n_settled = int(settled_row["n"] or 0)
-
-        green = int(config.SUBMINUTE_RAMP_GREEN_BETS)
-        if n_settled >= 2 * green:
-            return RampState(3, 1.0, False, 0.0, False, n_settled)
-        if n_settled >= green:
-            return RampState(2, 0.5, False, 0.0, False, n_settled)
-
-        # Rung 1: min-bet stakes under the hard cumulative dollar cap. The
-        # cap counts REALIZED fill value (plan: SUM(filled_usd)) — unfilled
-        # ghost FAKs cost nothing and are the breaker's business, not the
-        # cap's. A failed query fails closed via the except below.
-        fclause, fparams = _reset_clause()
-        cum_row = conn.execute(
-            "SELECT COALESCE(SUM(filled_usd), 0.0) AS s FROM subminute_fills "
-            "WHERE 1=1" + fclause,
-            fparams,
-        ).fetchone()
-        cumulative = float(cum_row["s"] or 0.0)
-        cap_blocked = cumulative >= float(config.SUBMINUTE_RAMP_CAP_USD)
-        return RampState(1, 1.0, True, cumulative, cap_blocked, n_settled)
-    except Exception:  # noqa: BLE001 — fail CLOSED
-        logger.exception("subminute ramp evaluation failed — failing closed")
-        return RampState(1, 1.0, True, 0.0, True, 0)

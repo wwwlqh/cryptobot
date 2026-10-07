@@ -173,7 +173,6 @@ def record_bet(
     signal: BetSignal,
     *,
     is_topup: bool | None = None,
-    scalein_topup: bool = False,
     initial_realized_edge: Optional[float] = None,
     mode: str = "DRY",
     wallet_group: Optional[str] = None,
@@ -219,17 +218,6 @@ def record_bet(
             f"{signal.side}, {signal.window_start_ts})"
         )
 
-    # A T3 scale-in top-up is a strict subset of top-ups: scalein_topup ⇒
-    # is_topup (slot_filled_pre > 0). Enforced application-side (SQLite cannot
-    # add CHECK via ALTER) so a caller that tags scalein_topup without the
-    # cumulative-fill anchor fails loudly instead of writing a mislabelled row.
-    resolved_scalein_topup = bool(scalein_topup)
-    if resolved_scalein_topup and not resolved_topup:
-        raise ValueError(
-            "record_bet: scalein_topup=True requires is_topup / "
-            f"slot_filled_pre > 0 (got slot_filled_pre={signal.slot_filled_pre})"
-        )
-
     addon_delta: Optional[float] = None
     if resolved_topup and initial_realized_edge is not None:
         addon_delta = signal.realized_edge - initial_realized_edge
@@ -245,7 +233,7 @@ def record_bet(
            interval_min, poly_market_id, poly_token_id, fee_rate_bps,
            model_p, p_market, fill_price, walked_vwap, realized_edge,
            partial_ret_z_1h, lut_p_bucket, lut_hit_rate, lut_n_cum,
-           target_usd, bet_size, slot_filled_pre, is_topup, scalein_topup, entry_top_price,
+           target_usd, bet_size, slot_filled_pre, is_topup, entry_top_price,
            add_on_realized_edge_minus_initial_edge, yes_pre1_anchor, strike_price,
            window_open_spot, pair_group_id, pair_role, pair_component, paired_coin,
            mode, wallet_group, live_order_id, live_client_order_id,
@@ -253,7 +241,7 @@ def record_bet(
            top_ask_at_decision, pair_orphan, offset_sec, edge_semantics_version,
            outcome, config_sha256, venue)
         VALUES
-          (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 2, 'PENDING', ?, ?)
+          (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 2, 'PENDING', ?, ?)
         """,
         (
             now,
@@ -281,7 +269,6 @@ def record_bet(
             signal.bet_size,
             signal.slot_filled_pre,
             int(resolved_topup),
-            int(resolved_scalein_topup),
             signal.entry_top_price,
             addon_delta,
             signal.yes_pre1_anchor,

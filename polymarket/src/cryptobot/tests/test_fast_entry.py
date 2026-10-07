@@ -121,10 +121,8 @@ def _clean_state(monkeypatch):
     monkeypatch.setattr(config, "SUBMINUTE_ENABLED", True)
     monkeypatch.setattr(config, "SUBMINUTE_KILL", False)
     P._V2_WINDOW_DECIDERS.pop("fe_5m", None)
-    P._V2_FIRST_ATTEMPT_REJECTED.clear()
     yield
     P._V2_WINDOW_DECIDERS.pop("fe_5m", None)
-    P._V2_FIRST_ATTEMPT_REJECTED.clear()
     # A leaked lock would deadlock every later test's tick commit.
     if P._FAST_ENTRY_LOCK.locked():  # pragma: no cover - regression guard
         P._FAST_ENTRY_LOCK.release()
@@ -389,7 +387,6 @@ def _stub_commit_stage(monkeypatch, commit, *, wallet_snaps=None):
     monkeypatch.setattr(
         P, "evaluate_breaker", lambda conn: SimpleNamespace(tripped=False)
     )
-    monkeypatch.setattr(P, "ramp_state", lambda conn: SimpleNamespace(rung=3))
     monkeypatch.setattr(P, "_commit_cell", commit)
 
 
@@ -518,36 +515,6 @@ def test_phase_b_blocks_until_a_fast_scan_releases():
     P._FAST_ENTRY_LOCK.release()
     assert done.wait(timeout=5.0) is True
     t.join(timeout=5.0)
-
-
-# --------------------------------------------------------------------------- first-attempt-only
-
-def test_fast_path_reject_spends_the_side_the_tick_reads(monkeypatch):
-    """A fast-path no_liquidity reject must consume the side window so the
-    NEXT 1Hz tick skips instead of re-attempting. Both rungs share one
-    process-global set — that IS the mechanism."""
-    monkeypatch.setattr(config, "V2_FIRST_ATTEMPT_ONLY", True)
-
-    def _commit_that_rejects(conn, d, *a, **k):
-        # What _commit_cell does on a venue no_liquidity reject.
-        P._record_first_attempt_reject(
-            d.coin, d.sleeve.interval, d.window_start_ts, d.score.side,
-            error_kind="no_liquidity", is_topup=False, offset_sec=d.offset_sec,
-        )
-
-    _stub_commit_stage(monkeypatch, _commit_that_rejects)
-    assert P._first_attempt_consumed_skip(
-        "BTC", "5m", _WINDOW_START, "YES", is_topup=False, offset_sec=286
-    ) is False
-    _scan(peek_spots=lambda **kw: _spots())
-    # The tick's own gate, at a LATER second of the same window, now skips.
-    assert P._first_attempt_consumed_skip(
-        "BTC", "5m", _WINDOW_START, "YES", is_topup=False, offset_sec=286
-    ) is True
-    # The opposite side stays independently eligible (unchanged semantics).
-    assert P._first_attempt_consumed_skip(
-        "BTC", "5m", _WINDOW_START, "NO", is_topup=False, offset_sec=286
-    ) is False
 
 
 # --------------------------------------------------------------------------- trigger_src column

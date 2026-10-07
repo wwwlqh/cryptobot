@@ -53,7 +53,6 @@ from cryptobot.execution.sizing_v2 import (
     DEFAULT_CONC_DOWNWEIGHT,
     DEFAULT_MIN_BET_USD,
 )
-from cryptobot.execution.held_position_pass import _top_bid as _mark_top_bid
 from cryptobot.execution.strategy_constants import (
     LIVE_BALANCE_TOLERANCE_USD,
     WALLET_SNAPSHOT_FRESHNESS_TTL_S,
@@ -211,62 +210,24 @@ def _v2_sizing_constants() -> dict[str, Any]:
         # gate / sizing / execution primitive reads these back — they are echoed
         # straight from config for the operator's reference document.
         "fak_pad": float(getattr(config, "V2_FAK_PAD", 0.0)),
-        "multifill_enabled": bool(getattr(config, "V2_MULTIFILL_ENABLED", False)),
-        "multifill_min_equity": float(
-            getattr(config, "V2_MULTIFILL_MIN_EQUITY", 5000.0)
-        ),
     }
 
 
+def _top_bid(book: Any) -> Optional[float]:
+    """Best bid on a book snapshot, or None. Bids are sorted ascending."""
+    bids = getattr(book, "bids", None) if book is not None else None
+    if not bids:
+        return None
+    try:
+        price = float(bids[-1]["price"])
+    except (KeyError, IndexError, TypeError, ValueError):
+        return None
+    return price if math.isfinite(price) and price > 0 else None
+
+
 def _strategy_flags_block() -> dict[str, Any]:
-    """Item 31 (2026-07-21): the env-pinned execution-quality knobs of the
-    CURRENT deploy, emitted so the Config tab's strategy panel renders from
-    live config — never a hardcoded strategy string that goes stale on the
-    next amendment. Complements (does not duplicate) v2.spec (bands / gates /
-    coins / offsets), v2.sizing (base fracs, brake, fak_pad) and the portfolio block (capital fracs, caps, halt frac).
-    DISPLAY ONLY — no gate / sizing / execution primitive reads this back."""
-    ask_band_rules = [
-        {"coin": r.coin, "sleeve": r.sleeve, "lo": r.lo, "hi": r.hi}
-        for r in tuple(getattr(config, "ASK_BAND_SKIP", ()) or ())
-    ]
+    """Execution knobs of the current deploy, shown on the Config tab."""
     return {
-        # T3 taker scale-in top-ups (project_bothsides_waitfordip_20260715).
-        "scalein_t3": {
-            "enabled": bool(getattr(config, "SCALEIN_T3_ENABLED", False)),
-            "max_n": int(getattr(config, "SCALEIN_T3_MAX_N", 3)),
-            "frac": float(getattr(config, "SCALEIN_T3_FRAC", 0.5)),
-            "no_dip": float(getattr(config, "SCALEIN_T3_NO_DIP", 0.0)),
-            "cap": float(getattr(config, "SCALEIN_T3_CAP", 0.83)),
-            "spread_max": float(getattr(config, "SCALEIN_T3_SPREAD_MAX", 0.02)),
-            "exposure_cap": float(
-                getattr(config, "SCALEIN_T3_EXPOSURE_CAP", 1.5)
-            ),
-            "cadence_s": int(getattr(config, "SCALEIN_T3_CADENCE_S", 1)),
-            "fak_pad": float(getattr(config, "SCALEIN_T3_FAK_PAD", 0.01)),
-            "end_buffer_s": int(getattr(config, "SCALEIN_T3_END_BUFFER_S", 4)),
-            # Model-deterioration disarm band (ex-STOPLOSS_BAND). Fires
-            # `bid >= model_p + band` while underwater and PERMANENTLY disarms
-            # further top-ups for the market.
-            "disarm_band": float(
-                getattr(config, "SCALEIN_T3_DISARM_BAND", 0.04)
-            ),
-        },
-        # Top-up freshness gate tri-state: off / shadow / live.
-        "topup_fresh_gate_mode": str(
-            getattr(config, "TOPUP_FRESH_GATE_MODE", "off")
-        ),
-        # Late-window entry skip, {coin: seconds-before-close} (e.g. BTC:20).
-        "late_window_skip": {
-            str(k): int(v)
-            for k, v in dict(getattr(config, "LATE_WINDOW_SKIP", {}) or {}).items()
-        },
-        # Ask-band skip rules (built 122bacd; empty = gate OFF).
-        "ask_band_skip": ask_band_rules,
-        # Tier-A first-fill upsize.
-        "tier_a": {
-            "mult": float(getattr(config, "V2_TIER_A_MULT", 1.5)),
-            "edge": float(getattr(config, "V2_TIER_A_EDGE", 0.0465)),
-        },
         "fak_pad": float(getattr(config, "V2_FAK_PAD", 0.0)),
         "min_bet_usd": float(getattr(config, "MIN_BET_USD", DEFAULT_MIN_BET_USD)),
     }
@@ -1007,7 +968,7 @@ def _mark_open_position(
             snap = book_mark_get(str(poly_token_id), now_ts=float(now_ts))
         except Exception:  # noqa: BLE001 — a bad/absent book degrades to entry
             snap = None
-        mark_px = _mark_top_bid(snap)
+        mark_px = _top_bid(snap)
     shares: Optional[float] = None
     if live_filled_size is not None:
         try:
@@ -3268,9 +3229,6 @@ def _latency_block(conn: sqlite3.Connection) -> Optional[dict[str, Any]]:
             "tail": _pstats(
                 [float(s.get("tail", 0.0) or 0.0) for s in samples
                  if float(s.get("tail", 0.0) or 0.0) > 0.0]
-            ),
-            "book_stop": _pstats(
-                [float(s.get("book_stop", 0.0) or 0.0) for s in samples]
             ),
         }
 

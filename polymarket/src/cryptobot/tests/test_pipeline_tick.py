@@ -409,131 +409,6 @@ def _blowup_deps(spots_fn) -> TickDeps:
     )
 
 
-@pytest.mark.parametrize("offset_min", [7, 11, 21])
-def test_entry_skip_suppresses_first_seconds_every_minute(
-    db: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch, offset_min: int
-) -> None:
-    # Within the first 10 seconds of ANY minute — qualifying entry minute or
-    # not — the whole tick short-circuits: no scoring, no bet, no market/book
-    # call. Parametrized over an entry-minute (7), a pairs-only minute (11),
-    # and a mixed minute (21) to prove the guard is universal, not entry-gated.
-    monkeypatch.setattr(config, "ENTRY_SKIP_SECONDS", 10)
-    now_ts = 1_715_923_200 + offset_min * 60 + 5  # second-of-minute = 5
-    deps = _blowup_deps(_spots)
-
-    result = run_scanner_tick(db, _make_portfolio(), now_ts=now_ts, deps=deps)
-
-    assert result.pending_rows_written == 0
-    assert result.cells_evaluated == 0
-    # The guard fires once per tick (a single telemetry bump), NOT one row per
-    # coin/sleeve — at 1Hz that would bloat the signals table ~10x/min/cell.
-    assert result.skips_by_reason.get("within_skip_window") == 1
-    assert result.skips_by_reason.get("not_entry_minute", 0) == 0
-    assert db.execute("SELECT COUNT(*) FROM ledger").fetchone()[0] == 0
-    # No per-coin signal rows are written for the skip — the stream gap is the
-    # observability, by design.
-    assert db.execute(
-        "SELECT COUNT(*) FROM signals WHERE skip_reason = 'within_skip_window'"
-    ).fetchone()[0] == 0
-
-
-def test_entry_skip_still_feeds_partial_ret_engine(
-    db: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # The whole point of feeding-but-not-trading: a tick inside the skip window
-    # must STILL advance the partial-ret engine, or the window-open snapshot and
-    # z-score parity would degrade. Assert the engine observed this tick.
-    monkeypatch.setattr(config, "ENTRY_SKIP_SECONDS", 10)
-    now_ts = 1_715_923_200 + 7 * 60 + 5  # within skip window
-    deps = _blowup_deps(_spots)
-
-    run_scanner_tick(db, _make_portfolio(), now_ts=now_ts, deps=deps)
-
-    # PartialRetEngine.update stamps per-coin state on every tick it sees. If
-    # the guard had returned BEFORE the update loop, the engine would hold no
-    # observation for this now_ts. We assert the engine advanced by checking the
-    # last-observed tick is this tick for each coin (update() sets last_tick_ts
-    # at its tail, so seeing now_ts proves the skipped tick still fed it).
-    for coin in ("BTC", "ETH", "SOL", "XRP"):
-        state = deps.partial_ret_engine.state.get(coin)
-        assert state is not None, f"engine never observed {coin} during skip window"
-        assert state.last_tick_ts == now_ts, (
-            f"{coin} engine not fed on the skipped tick "
-            f"(last_tick_ts={state.last_tick_ts}, expected {now_ts})"
-        )
-
-
-def test_entry_skip_allows_entry_after_skip_window(
-    db: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # At second 15 (>= 10) of a qualifying entry minute the guard is open: the
-    # tick proceeds to scoring/evaluation exactly as at second 0.
-    monkeypatch.setattr(config, "ENTRY_SKIP_SECONDS", 10)
-    now_ts = 1_715_923_200 + 7 * 60 + 15  # second-of-minute=15, gate open
-    window5 = (now_ts // 300) * 300
-    stub = StubDeps(
-        market_lookup=_build_markets(window5, interval_min=5),
-        book_lookup={f"YES-{c}": _book(f"YES-{c}", top=0.53, now_ts=now_ts) for c in ("BTC","ETH","SOL","XRP")} |
-                    {f"NO-{c}": _book(f"NO-{c}", top=0.45, now_ts=now_ts) for c in ("BTC","ETH","SOL","XRP")},
-        spot_data=_spots(now_ts=now_ts),
-    )
-    deps = _stub_deps(stub)
-    for coin, spot in stub.spot_data.items():
-        seed_for_tests(deps.partial_ret_engine, coin, now_ts=now_ts, spot=spot.price)
-
-    result = run_scanner_tick(db, _make_portfolio(), now_ts=now_ts, deps=deps)
-
-    # Both sleeves (v6_5m mod5=2, v6_15m mod15=7) evaluated all coins.
-    assert result.cells_evaluated == len(config.COINS) * 2
-    assert result.skips_by_reason.get("within_skip_window", 0) == 0
-
-
-def test_entry_skip_boundary_second_n_trades(
-    db: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # Boundary: second == N is the FIRST tradable second (guard is strict `<`).
-    monkeypatch.setattr(config, "ENTRY_SKIP_SECONDS", 10)
-    now_ts = 1_715_923_200 + 7 * 60 + 10  # second-of-minute == 10 exactly
-    window5 = (now_ts // 300) * 300
-    stub = StubDeps(
-        market_lookup=_build_markets(window5, interval_min=5),
-        book_lookup={f"YES-{c}": _book(f"YES-{c}", top=0.53, now_ts=now_ts) for c in ("BTC","ETH","SOL","XRP")} |
-                    {f"NO-{c}": _book(f"NO-{c}", top=0.45, now_ts=now_ts) for c in ("BTC","ETH","SOL","XRP")},
-        spot_data=_spots(now_ts=now_ts),
-    )
-    deps = _stub_deps(stub)
-    for coin, spot in stub.spot_data.items():
-        seed_for_tests(deps.partial_ret_engine, coin, now_ts=now_ts, spot=spot.price)
-
-    result = run_scanner_tick(db, _make_portfolio(), now_ts=now_ts, deps=deps)
-
-    assert result.cells_evaluated == len(config.COINS) * 2
-    assert result.skips_by_reason.get("within_skip_window", 0) == 0
-
-
-def test_entry_skip_zero_restores_second_zero_entry(
-    db: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # ENTRY_SKIP_SECONDS=0 is the no-op: second-0 trading proceeds as before.
-    monkeypatch.setattr(config, "ENTRY_SKIP_SECONDS", 0)
-    now_ts = 1_715_923_200 + 7 * 60  # second-of-minute=0
-    window5 = (now_ts // 300) * 300
-    stub = StubDeps(
-        market_lookup=_build_markets(window5, interval_min=5),
-        book_lookup={f"YES-{c}": _book(f"YES-{c}", top=0.53, now_ts=now_ts) for c in ("BTC","ETH","SOL","XRP")} |
-                    {f"NO-{c}": _book(f"NO-{c}", top=0.45, now_ts=now_ts) for c in ("BTC","ETH","SOL","XRP")},
-        spot_data=_spots(now_ts=now_ts),
-    )
-    deps = _stub_deps(stub)
-    for coin, spot in stub.spot_data.items():
-        seed_for_tests(deps.partial_ret_engine, coin, now_ts=now_ts, spot=spot.price)
-
-    result = run_scanner_tick(db, _make_portfolio(), now_ts=now_ts, deps=deps)
-
-    assert result.cells_evaluated == len(config.COINS) * 2
-    assert result.skips_by_reason.get("within_skip_window", 0) == 0
-
-
 def test_peak_drawdown_halt_blocks_new_entries(db: sqlite3.Connection) -> None:
     from cryptobot.execution.ledger import record_bet
     from cryptobot.tests.test_slot_state import make_signal
@@ -1438,7 +1313,6 @@ def _reset_v2_window_state() -> None:
         dec.reset()
     pipeline._V2_WINDOW_DECIDERS.clear()
     pipeline._V2_MARKET_FILLED.clear()
-    pipeline._V2_FIRST_ATTEMPT_REJECTED.clear()
 
 
 def _fast_scan_runner(monkeypatch: pytest.MonkeyPatch, src: str = "fast_sweep"):

@@ -213,24 +213,15 @@ class WindowDecider:
     def _market_key(cell: Mapping[str, Any]) -> tuple:
         return (cell["coin"], cell["interval"], cell["window_start"])
 
-    def on_second(self, cell: Mapping[str, Any], *, allow_refill: bool = False) -> str:
+    def on_second(self, cell: Mapping[str, Any]) -> str:
         """Advance the state machine one second for one scored cell.
 
         ``cell`` must expose: ``coin, interval, window_start, side, ask,
         offset_sec, pred_edge``.
 
-        ``allow_refill`` (multifill, operator 2026-07-10): when True, the
-        consume-on-fill short-circuit that vetoes a market already spent by a
-        prior FILL is bypassed, so this qualifying second is re-evaluated by the
-        normal band/window/offset/gate path and can PLACE a NEW independent
-        entry on an already-filled resolution. The caller only sets this above
-        the multifill equity floor once a prior entry on the resolution has
-        FILLED (the per-resolution count is unbounded — operator 2026-07-11); it
-        defaults to False so every other caller (incl. the frozen live path and
-        the parity gate) is byte-identical.
         """
         if self.consume_on_fill:
-            return self._on_second_consume_on_fill(cell, allow_refill=allow_refill)
+            return self._on_second_consume_on_fill(cell)
         return self._on_second_first_commit(cell)
 
     def _on_second_first_commit(self, cell: Mapping[str, Any]) -> str:
@@ -247,13 +238,9 @@ class WindowDecider:
             return "PLACE"
         return "WINDOW_DONE"
 
-    def _on_second_consume_on_fill(
-        self, cell: Mapping[str, Any], *, allow_refill: bool = False
-    ) -> str:
-        # A fill on EITHER side spends the whole market window — UNLESS the
-        # caller allows a multifill refill (a new independent entry on an
-        # already-filled resolution, gated by equity + entry-cap upstream).
-        if not allow_refill and self._market_key(cell) in self._filled:
+    def _on_second_consume_on_fill(self, cell: Mapping[str, Any]) -> str:
+        # A fill on EITHER side spends the whole market window.
+        if self._market_key(cell) in self._filled:
             return "SKIP"
         if not (self._in_band(cell["ask"]) and self._in_offset_window(cell)):
             # Not a qualifying second yet; window stays open (not consumed).
