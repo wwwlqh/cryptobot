@@ -1,46 +1,40 @@
-"""Fast-trigger entry rungs — the 250ms sweep + the WS book-event push.
+"""Fast entry triggers: a 250ms sweep and a WebSocket book-update push.
 
-Why this exists (on-chain miss forensic, 2026-07-30, n=45 rejects): 84% of our
-misses were consumed by a FASTER TAKER, median 1.0s before our arrival, ~5x our
-size, at exactly our quoted ask. Our POST path is already at the venue floor
-(sign ~1ms, POST ~300ms of which 250ms is the taker delay every taker pays), so
-the only reclaimable latency is TRIGGER-TO-DECISION. The scanner samples once
-per second on a boundary-aligned tick, so a fillable ask that appears mid-second
-waits ~500ms on average before we even look at it.
+On-chain forensics of our rejected orders showed most were taken by a faster
+taker, about a second before our order arrived, at our quoted ask. Signing and
+POSTing are already at the venue floor (the 250ms taker delay applies to
+everyone), so what can still be cut is the delay between a fillable ask
+appearing and our decision. A 1 Hz tick sees an ask that appears mid-second
+~500ms late on average.
 
-Two extra trigger rungs, both converging on ONE evaluation path
-(:func:`cryptobot.execution.pipeline.run_fast_entry_scan`, which is the tick's
-own scoring + resolver + ``_commit_cell``):
+Two extra triggers share one evaluation path
+(:func:`cryptobot.execution.pipeline.run_fast_entry_scan`, which uses the
+tick's own scoring, resolver and ``_commit_cell``):
 
-* **sweep** — an APScheduler job at ``CRYPTOBOT_FAST_TRIGGER_MS`` (default
-  250ms, clamped to >=100ms). Cheap-guard-first: outside a qualifying offset
-  window :func:`fast_entry_candidate_sleeves` returns empty after pure integer
-  math and the fire costs nothing. Mean sampling delay 500ms -> ~125ms.
-* **event** — the venue WS book mirror fires a narrow ask-side callback; a
-  dedicated coalescing worker thread runs the same scan within ~20ms of the
-  push. Separately killable via ``CRYPTOBOT_FAST_TRIGGER_EVENT_ENABLED``
-  because it is the rung that touches the venue's WS reader thread.
+* **sweep**: a scheduler job every ``CRYPTOBOT_FAST_TRIGGER_MS`` (default
+250ms, at least 100ms). Outside a qualifying entry window
+:func:`fast_entry_candidate_sleeves` returns nothing after a few integer
+comparisons, so a fire costs almost nothing. Average sampling delay drops from
+~500ms to ~125ms. * **event**: the WS book mirror calls back on ask-side
+updates and a coalescing worker thread runs the same scan within ~20ms. It has
+its own switch (``CRYPTOBOT_FAST_TRIGGER_EVENT_ENABLED``) because it runs off
+the WS reader thread.
 
-Thread model — the WS reader thread must NEVER do heavy work (it is the same
-thread that feeds every book read in the process; blocking it silently degrades
-the whole bot to REST). :meth:`FastEntryTrigger.on_ask_update` is therefore two
-attribute reads plus an ``Event.set()``; all real work happens on this module's
-own daemon worker thread.
+The WS reader thread feeds every book read in the process and must never do
+heavy work; blocking it would push the whole bot onto REST. So
+:meth:`FastEntryTrigger.on_ask_update` is two attribute reads and an
+``Event.set()``, and everything else runs on this module's worker thread.
 
-Nothing here is venue-specific: the trigger logic reads only core config +
-the portfolio's sleeve offset sets, and the event rung is registered through
-``BookSourceChain.set_ask_update_callback``, which fans the hook out over
-whichever sources expose one (so a venue whose mirror has no such hook simply
-runs the sweep rung alone).
+Nothing here is venue-specific: the triggers read core config and the sleeves'
+offset sets, and the event callback is registered through
+``BookSourceChain.set_ask_update_callback``. A book source without a callback
+hook just runs the sweep.
 
-Per-second work (2026-07-30 latency pass) — the trigger side owns ONE piece of
-it: :meth:`FastEntryTrigger._deps_for` builds the ``TickDeps`` bundle once per
-integer second instead of once per fire. That is not just a saved dataclass
-construction: the scan's own per-second caches
-(``pipeline._fast_resolver_deps`` and ``pipeline._FastCommitStage``) key on the
-bundle's IDENTITY, so a fresh object per fire defeated them outright. The rest
-of the precompute lives in ``execution.pipeline`` where the scoring and the
-commit stage are.
+:meth:`FastEntryTrigger._deps_for` builds the ``TickDeps`` bundle once per
+second instead of once per fire. Besides saving the construction, this lets the
+scan's per-second caches (``pipeline._fast_resolver_deps`` and
+``pipeline._FastCommitStage``), which are keyed on the bundle's identity,
+actually hit.
 """
 
 from __future__ import annotations
@@ -64,24 +58,22 @@ logger = logging.getLogger(__name__)
 
 ConnFactory = Callable[[], sqlite3.Connection]
 
-# Sweep cadence floor. The 100ms fast-requote drain job is the proven floor for
-# an APScheduler job on this box; below it the guard itself starts to cost more
-# than the sampling delay it removes.
+# Minimum sweep cadence. 100ms is the fastest proven for a scheduler job on the
+# live box; below it the check itself costs more than the delay it removes.
 MIN_TRIGGER_MS = 100
 
-# Event-rung minimum inter-scan gap. Derived from the sweep cadence rather than
-# a fourth env knob: at the 250ms default this caps the event rung at ~16
-# scans/s while still firing ~immediately for the first push after a quiet
-# stretch (the gap only bites when the book is churning, and consecutive scans
-# on a churning book would re-read nearly the same ladder anyway). Floored at
-# 20ms — the reaction target from the forensic.
+# Minimum gap between event scans, derived from the sweep cadence instead of
+# another setting. At the 250ms default this caps event scans at ~16/s while
+# still reacting immediately to the first push after a quiet spell (the gap
+# only matters on a churning book, where back-to-back scans would see nearly
+# the same ladder). Never below 20ms, the reaction target.
 EVENT_MIN_GAP_FLOOR_S = 0.020
 
 
 def fast_trigger_seconds(ms: Optional[int] = None) -> float:
-    """Sweep cadence in seconds, clamped to >= :data:`MIN_TRIGGER_MS`.
+    """Sweep cadence in seconds, at least :data:`MIN_TRIGGER_MS`.
 
-    ``IntervalTrigger`` accepts float seconds, so 250ms is expressed as 0.25.
+    ``IntervalTrigger`` takes float seconds, so 250ms is 0.25.
     """
     raw = config.FAST_TRIGGER_MS if ms is None else ms
     try:
@@ -92,22 +84,21 @@ def fast_trigger_seconds(ms: Optional[int] = None) -> float:
 
 
 def event_min_gap_seconds() -> float:
-    """Minimum gap between two event-rung scans (see :data:`EVENT_MIN_GAP_FLOOR_S`)."""
+    """Minimum gap between two event scans (see :data:`EVENT_MIN_GAP_FLOOR_S`).
+    """
     return max(EVENT_MIN_GAP_FLOOR_S, fast_trigger_seconds() / 4.0)
 
 
 @dataclass
 class FastEntryTrigger:
-    """Both fast rungs over one shared single-cell evaluation.
+    """Both fast triggers over one shared single-cell evaluation.
 
-    ``conn_factory`` returns the CALLING thread's own sqlite3 connection (the
-    ``ThreadLocalConnections`` handle) — the sweep job runs on an APScheduler
-    pool thread and the event worker on its own thread, so each resolves its own
-    connection exactly like the wal_checkpoint / requote_drain / held_position_fast
-    jobs (audit finding #1).
+    ``conn_factory`` returns the calling thread's own sqlite3 connection (the
+    ``ThreadLocalConnections`` handle): the sweep runs on a scheduler thread
+    and the event worker on its own thread, and each needs its own connection.
 
-    ``book_source`` is the ``BookSourceChain``; it is read only for
-    ``noted_tokens()`` (the current entry universe) to filter WS pushes.
+    ``book_source`` is the ``BookSourceChain``; only ``noted_tokens()`` (the
+    current entry universe) is read, to filter WS pushes.
     """
 
     conn_factory: ConnFactory
@@ -117,49 +108,45 @@ class FastEntryTrigger:
     now_fn: Callable[[], float] = time.time
     monotonic_fn: Callable[[], float] = time.monotonic
 
-    # --- event-rung state -------------------------------------------------
-    # Tokens the tick has subscribed for the current (+ next) window. Refreshed
-    # by the sweep; an empty set means "unknown" and disables the filter rather
-    # than dropping every push.
+    # --- event state -------------------------------------------------------
+    # Tokens the tick has subscribed for the current (and next) window,
+    # refreshed by the sweep. An empty set means unknown and disables the
+    # filter rather than dropping every push.
     _universe: frozenset = field(default_factory=frozenset, repr=False)
-    # Whether the last sweep saw a qualifying offset window. Read by the WS
-    # callback as a single atomic attribute load. At most one sweep-cadence
-    # stale, which can only cost a wasted wake — the worker re-derives the real
-    # gate before scanning (``run_fast_entry_scan`` returns immediately when
-    # ``fast_entry_candidate_sleeves`` is empty).
+    # Whether the last sweep saw a qualifying entry window. The WS callback
+    # reads it as one attribute load. It can be one sweep stale, which at worst
+    # wakes the worker for nothing: the scan re-checks the real gate and
+    # returns immediately when ``fast_entry_candidate_sleeves`` is empty.
     _in_window: bool = field(default=False, repr=False)
-    #: The exact tuple `_universe` was built from, compared by IDENTITY so an
-    #: unchanged noted-token set costs nothing to re-check (see _refresh_universe).
+    # The tuple ``_universe`` was built from, compared by identity so an
+    # unchanged token set costs nothing to re-check (see _refresh_universe).
     _noted_ref: object = field(default=None, repr=False)
     _wake: threading.Event = field(default_factory=threading.Event, repr=False)
     _stop: threading.Event = field(default_factory=threading.Event, repr=False)
     _worker: Optional[threading.Thread] = field(default=None, repr=False)
     _last_event_scan_m: float = field(default=0.0, repr=False)
-    #: Monotonic stamp of the push that set :attr:`_wake` (see
-    #: :meth:`on_ask_update`). Written on the WS recv thread, read on the worker
-    #: — a plain float store/load, so a race can only mis-attribute ONE
-    #: telemetry line by the inter-push interval, never affect a decision.
+    # Monotonic time of the push that set :attr:`_wake` (see
+    # :meth:`on_ask_update`). Written on the WS thread and read on the worker
+    # as a plain float; a race can only misattribute one telemetry line, never
+    # a decision.
     _push_m: float = field(default=0.0, repr=False)
-    #: Per-second TickDeps prebuild (latency, 2026-07-30). ``deps_factory()``
-    #: constructs a multi-field dataclass per call; at ~16 fires/s that is pure
-    #: repeat work, and the SCAN's own per-second caches
-    #: (``pipeline._fast_resolver_deps`` / ``pipeline._FastCommitStage``) key on
-    #: the bundle's IDENTITY, so a fresh object per fire defeated them outright.
-    #: Rebuilt when the integer second advances.
+    # Per-second TickDeps bundle. ``deps_factory()`` builds a multi-field
+    # dataclass, and the scan's per-second caches key on the bundle's identity,
+    # so building one per fire would defeat them. Rebuilt when the second
+    # changes.
     _deps_second: int = field(default=-1, repr=False)
     _deps_cached: Optional[TickDeps] = field(default=None, repr=False)
-    # Counters for the operator log / tests. Never persisted — the fast rungs
-    # write DB rows ONLY when something places or rejects (the tick's policy);
-    # a per-firing row at 4Hz+ would be pure noise.
+    # Counters for logs and tests; never persisted. The fast triggers only
+    # write database rows when something places or rejects, like the tick.
     events_seen: int = 0
     events_dropped: int = 0
     sweep_scans: int = 0
 
     # ------------------------------------------------------------------
-    # Sweep rung
+    # Sweep
     # ------------------------------------------------------------------
     def run_sweep(self) -> dict:
-        """The APScheduler job body. Never raises."""
+        """The scheduler job body. Never raises."""
         try:
             now_ts = int(self.now_fn())
             candidates = fast_entry_candidate_sleeves(self.portfolio, now_ts)
@@ -168,8 +155,7 @@ class FastEntryTrigger:
                 return {}
             self._refresh_universe()
             self.sweep_scans += 1
-            # Hand the candidate list straight in — the guard above already paid
-            # for it, and the scan would otherwise recompute the same thing.
+            # Pass the candidates in; the guard above already computed them.
             return self._scan("fast_sweep", now_ts=now_ts, candidates=candidates)
         except Exception:  # noqa: BLE001 — a job must never crash the scheduler
             logger.warning("fast_entry sweep raised", exc_info=True)
@@ -178,11 +164,9 @@ class FastEntryTrigger:
     def _refresh_universe(self) -> None:
         """Re-read the chain's noted token set (the WS push filter).
 
-        Skipped entirely when the event rung is off: the set exists ONLY to
-        filter :meth:`on_ask_update`, so with no event rung this is a pure cost
-        at the sweep cadence. Guarded on tuple identity because the tick
-        re-notes the SAME tuple almost every second — rebuilding the frozenset
-        4x/s off an unchanged tuple is work for nothing.
+        Skipped when the event trigger is off, since the set only exists to
+        filter :meth:`on_ask_update`. Compared by tuple identity, because the
+        tick passes the same tuple almost every second.
         """
         src = self.book_source
         if src is None or not config.FAST_TRIGGER_EVENT_ENABLED:
@@ -201,28 +185,24 @@ class FastEntryTrigger:
         self._universe = frozenset(noted)
 
     # ------------------------------------------------------------------
-    # Event rung
+    # Event
     # ------------------------------------------------------------------
     def on_ask_update(self, token: str, _venue_ts: float) -> None:
-        """WS-reader-thread callback. MUST stay O(1) and non-blocking.
+        """WS reader-thread callback. Must stay O(1) and non-blocking.
 
-        Runs on the venue mirror's daemon recv thread at the measured ~822
-        msg/s, so it does exactly three things: gate on the current entry
-        universe, gate on the (sweep-maintained) in-window flag, and wake the
-        worker. Everything else — scoring, book reads, DB, the order POST —
-        happens on :meth:`_event_loop`'s own thread.
+        Runs on the mirror's receive thread at ~800 msg/s, so it only checks
+        the token against the entry universe, checks the in-window flag kept by
+        the sweep, and wakes the worker. Scoring, book reads, database writes
+        and the order POST all happen on :meth:`_event_loop`'s thread.
 
-        ``_venue_ts`` is part of the mirror's callback contract but unused here:
-        the worker re-derives everything from its own clock, and reading a
-        venue stamp on the recv thread would buy nothing.
+        ``_venue_ts`` is part of the callback signature but unused; the worker
+        uses its own clock.
 
-        One monotonic read was added (2026-07-30) AFTER both gates, so it is paid
-        only by a push that actually wakes the worker (not by the ~822 msg/s that
-        get dropped). It is what makes ``push_to_scan_ms`` measurable — without
-        it the whole trigger-side segment (worker wake + the
-        :func:`event_min_gap_seconds` throttle, up to 62ms at the 250ms default)
-        is invisible, and that segment is currently the single largest
-        UNMEASURED piece of push-to-POST.
+        The one monotonic clock read comes after both checks, so only a push
+        that wakes the worker pays for it. It makes ``push_to_scan_ms``
+        measurable: the worker wake plus the :func:`event_min_gap_seconds`
+        throttle (up to 62ms at the 250ms default) would otherwise be
+        invisible.
         """
         self.events_seen += 1
         universe = self._universe
@@ -249,14 +229,14 @@ class FastEntryTrigger:
         worker.start()
 
     def _event_loop(self) -> None:
-        """Wait for a push, then run ONE scan; coalesce whatever arrived while
-        the scan was running into a single follow-up scan.
+        """Wait for a push, run one scan, and fold whatever arrived during the
+        scan into a single follow-up scan.
 
-        ``Event`` (not a queue) IS the coalescing: N pushes between two scans
-        collapse to one wake, so a churning book can never build a backlog. The
-        flag is cleared BEFORE the scan, so a push that lands mid-scan re-sets it
-        and the next iteration re-scans immediately — which is correct, that push
-        carries a ladder the finished scan never saw.
+        The ``Event`` is the coalescing: any number of pushes between two scans
+        is one wake, so a churning book cannot build a backlog. The flag is
+        cleared before the scan, so a push that lands mid-scan sets it again
+        and triggers an immediate re-scan, which is right: that push carries a
+        ladder the finished scan did not see.
         """
         min_gap = event_min_gap_seconds()
         while not self._stop.is_set():
@@ -270,7 +250,7 @@ class FastEntryTrigger:
             throttle_s = 0.0
             if gap < min_gap:
                 # Too soon after the last scan: sleep out the remainder rather
-                # than dropping the push (the ladder change is still unseen).
+                # than drop the push (its ladder change has not been seen yet).
                 throttle_s = min_gap - gap
                 if self._stop.wait(timeout=throttle_s):
                     break
@@ -281,12 +261,11 @@ class FastEntryTrigger:
                 logger.warning("fast_entry event scan raised", exc_info=True)
                 continue
             if counters.get("orders"):
-                # One line per PLACEMENT only (never at push rate), carrying the
-                # segment `run_fast_entry_scan`'s own `pre_ms` cannot see: the
-                # push -> scan-start lead, split into the worker wake and the
-                # min-gap throttle. Read it TOGETHER with `fast_entry placed`:
-                # push_to_scan_ms + that line's pre_ms + trigger_to_post_ms is
-                # the whole push-to-POST chain.
+                # One line per placement (never per push) with the part
+                # ``run_fast_entry_scan``'s ``pre_ms`` cannot see: push to scan
+                # start, split into worker wake and throttle. push_to_scan_ms +
+                # the ``fast_entry placed`` line's pre_ms + trigger_to_post_ms
+                # is the whole push-to-POST time.
                 logger.info(
                     "fast_entry event_lead push_to_scan_ms=%.1f "
                     "throttle_ms=%.1f min_gap_ms=%.0f",
@@ -296,7 +275,8 @@ class FastEntryTrigger:
                 )
 
     def stop(self) -> None:
-        """Signal + join the event worker (bounded — it is a daemon thread)."""
+        """Signal and join the event worker (bounded; it is a daemon thread).
+        """
         self._stop.set()
         self._wake.set()
         worker = self._worker
@@ -306,21 +286,18 @@ class FastEntryTrigger:
 
     # ------------------------------------------------------------------
     def _deps_for(self, now_ts: int) -> TickDeps:
-        """The bundle for this integer second (see :attr:`_deps_cached`).
+        """The bundle for this second (see :attr:`_deps_cached`).
 
-        Not locked: the sweep job thread and the event worker can both land in
-        the same second, and the worst case is two constructions where one would
-        do — the bundle is a set of stable references either way.
+        Not locked: the sweep and the event worker can land in the same second,
+        and the worst case is building the bundle twice; it only holds stable
+        references.
 
-        Store ORDER is load-bearing: ``_deps_cached`` is assigned BEFORE
-        ``_deps_second``, so a racing reader that observes ``_deps_second ==
-        now_ts`` is guaranteed to have already observed a bundle built for that
-        second. The READ below therefore has to MIRROR it — load the second
-        first, the bundle second. Read them the other way round and a publish
-        landing between the two loads serves the PREVIOUS second's bundle under
-        a matching stamp, which is the staleness the store order was written to
-        prevent (a stale bundle would carry the previous second's fetchers and
-        caches).
+        Store order matters: ``_deps_cached`` is written before
+        ``_deps_second``, so a reader that sees ``_deps_second == now_ts`` has
+        already seen that second's bundle. Reads must therefore load the second
+        first and the bundle second; the other way round, a write landing
+        between the two loads would serve the previous second's bundle under
+        the current stamp.
         """
         second = self._deps_second
         cached = self._deps_cached
