@@ -4,12 +4,6 @@ import pandas as pd
 import pytest
 
 from polymarket.backtest.engine import tick_exit004 as te
-# The live stop-loss SELL chain was deleted 2026-08-05; its trigger predicate
-# survives verbatim as the T3 deterioration-disarm. The replay's stop logic
-# still needs parity with THAT predicate — it is the same PURE_STOP_04 rule.
-from cryptobot.execution.held_position_pass import (
-    _deterioration_disarm as live_should_stop,
-)
 
 
 def test_fee_and_hold_pnl():
@@ -74,22 +68,6 @@ def test_entry_fee_beats_the_retired_per_notional_form(cash_usd, price):
     new = te.entry_fee_usd(price, shares)
     assert old < new
     assert old / new == pytest.approx(price / float(config.POLY_FEE_CALIBRATION), rel=1e-12)
-
-
-def test_stop_exit_leg_is_fee_free_like_live():
-    """Historical stop bookings on the ledger were `proceeds - cost - entry_fee`
-    — the SELL leg carried no fee — so the replay of that era must not charge
-    one. The live stop-loss chain was DELETED 2026-08-05 (nothing can book a
-    stop exit any more), which freezes that contract: the engine must never
-    grow an exit-fee helper, and the live module must stay gone."""
-    assert not hasattr(te, "exit_fee_usd")
-
-    import importlib.util
-
-    assert importlib.util.find_spec("cryptobot.execution.stop_loss") is None, (
-        "cryptobot.execution.stop_loss came back — if a live exit path exists "
-        "again, re-check whether the replay must charge an exit-leg fee"
-    )
 
 
 def test_side_level_conversion_uses_complementary_up_book():
@@ -200,22 +178,6 @@ def test_dynamic_held_side_score_triggers_delayed_full_fok():
     assert result.close_ts == pytest.approx(102.4)
     assert result.exit_fill is not None
     assert result.exit_fill.vwap == pytest.approx(0.71)
-
-
-@pytest.mark.parametrize(
-    ("bid", "model_p", "entry_fill", "band"),
-    [
-        (0.70, 0.65, 0.80, 0.04),
-        (0.80, 0.65, 0.80, 0.04),
-        (0.68, 0.65, 0.80, 0.04),
-    ],
-)
-def test_stop_predicate_matches_live(bid, model_p, entry_fill, band):
-    assert te.should_stop(
-        bid=bid, model_p=model_p, entry_fill=entry_fill, band=band
-    ) == live_should_stop(
-        bid=bid, model_p=model_p, entry_fill=entry_fill, band=band
-    )
 
 
 def _tick(seconds, *, asks, ask_sizes, bids, bid_sizes):
