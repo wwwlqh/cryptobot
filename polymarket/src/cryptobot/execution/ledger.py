@@ -1,17 +1,14 @@
-"""Ledger writer + slot_state predicate for the live scanner.
+"""Ledger writer and slot_state check for the live scanner.
 
-Ports `slot_state` and PENDING-first `record_bet` from
-`hightempbot/execution/ledger.py:318-565`, adapted for cryptobot's slot key:
+Slot key:
 
   (coin, sleeve, entry_minute, side, window_start_ts)
 
-Where hightempbot read the slot key out of `event_detail` JSON, cryptobot
-queries first-class indexed columns (U1's `idx_ledger_slot` composite).
-This keeps `slot_state()` under p95 5ms at 1Hz × 12 slots/tick.
+These are indexed columns (``idx_ledger_slot``), which keeps ``slot_state()``
+fast enough to run for every slot every second.
 
-PENDING-first invariant (R18 carry-forward): every bet is inserted with
-outcome='PENDING' before any other write; settlement (WIN/LOSS/CANCELLED)
-happens later via the F3 resolution sweep (U7a).
+Every bet is inserted with outcome='PENDING' before anything else is written;
+the resolution sweep settles it later (WIN/LOSS/CANCELLED).
 """
 
 from __future__ import annotations
@@ -28,11 +25,10 @@ from cryptobot.execution.capital import wallet_id_for_sleeve
 
 @dataclass(frozen=True)
 class BetSignal:
-    """All the fields needed to write a PENDING ledger row.
+    """Everything needed to write a PENDING ledger row.
 
-    The pipeline (U9) builds a BetSignal from the scoring + walker outputs
-    and passes it to ``record_bet``. Top-up vs initial-fill is determined
-    by ``slot_filled_pre > 0``.
+    The pipeline builds it from the scoring and walker outputs and passes it to
+    ``record_bet``. A row is a top-up when ``slot_filled_pre > 0``.
     """
 
     # slot key
@@ -68,20 +64,15 @@ class BetSignal:
     # NOT against yes_pre1_anchor (a Polymarket probability in [0,1]
     # that's the wrong magnitude for a spot comparison; review #2).
     strike_price: Optional[float] = None
-    # Divergence #13 fix (2026-05-21): live spot at window_open — the
-    # same anchor the model trains against and Polymarket settles on.
-    # Read from PartialRetEngine.window_open_spot() at bet time; consumed
-    # by resolution_sweep._decide_won_up. When non-None this is the
-    # authoritative anchor; sweep falls back to strike_price only on
-    # legacy rows where window_open_spot is NULL.
+    # Spot at window open, the anchor the model trains on and Polymarket
+    # settles against. Read from PartialRetEngine.window_open_spot() at bet
+    # time and used by resolution_sweep._decide_won_up; old rows without it
+    # fall back to strike_price.
     window_open_spot: Optional[float] = None
-    # Audit w19oxqf24 (P2): the executable limit price for a LIVE GTC order —
-    # the most-expensive book level the walker consumed (walker WalkResult
-    # limit_price). The GTC BUY limit must be priced here, NOT at fill_price
-    # (= top_ask): the order is SIZED for multi-level walked notional, so a
-    # limit at top_ask only crosses top-of-book depth and systematically
-    # under-fills versus the recorded bet_size. None for DRY rows / legacy
-    # callers, where place_gtc_limit_order falls back to fill_price.
+    # The order's executable limit: the most expensive book level the walker
+    # used. The stake covers several levels, so a limit at fill_price (top ask)
+    # would only cross the top level and under-fill. None for DRY rows, where
+    # place_gtc_limit_order falls back to fill_price.
     limit_price: Optional[float] = None
     pair_group_id: Optional[str] = None
     pair_role: Optional[str] = None
@@ -135,13 +126,11 @@ def slot_state(
     params = _slot_params(coin, sleeve, entry_minute, side, window_start_ts)
     age = int(max(0, MAX_PENDING_AGE_MINUTES))
 
-    # Single pass (latency item #3): the stale-PENDING sum is folded into the
-    # main aggregate as a CASE on the same datetime('now', ?) age predicate the
-    # old second query used, so a filled slot no longer pays a second indexed
-    # scan every qualifying tick. The stale sum is only APPLIED when the slot
-    # has at least one non-PENDING row and age > 0 — identical to the old
-    # two-query gating, pinned by the filled+stale-PENDING cases in
-    # test_slot_state.py.
+    # One query: the stale-PENDING sum is a CASE on the same age predicate in
+    # the main aggregate, so a filled slot does not need a second scan every
+    # tick. The stale sum only applies when the slot has a non-PENDING row and
+    # age > 0 (covered by the filled + stale-PENDING cases in
+    # test_slot_state.py).
     row = conn.execute(
         f"SELECT COALESCE(SUM(bet_size), 0) AS filled, "
         f"SUM(CASE WHEN outcome != 'PENDING' THEN 1 ELSE 0 END) AS n_filled, "
@@ -184,20 +173,18 @@ def record_bet(
     top_ask_at_decision: Optional[float] = None,
     pair_orphan: int = 0,
 ) -> int:
-    """PENDING-first insert. Returns the new row id.
+    """Insert a PENDING row and return its id.
 
-    Caller-side responsibility: the orchestrator wraps this call in a
-    ``BEGIN IMMEDIATE`` transaction with the slot_state() probe so that
-    concurrent ticks evaluating the same slot are serialized (R-NEW-9).
+    The caller wraps this and the slot_state() check in one ``BEGIN IMMEDIATE``
+    transaction, so concurrent evaluations of the same slot are serialized.
 
-    ``is_topup`` defaults to ``signal.is_topup`` (slot_filled_pre > 0). When
-    is_topup is True and ``initial_realized_edge`` is supplied, the row's
-    ``add_on_realized_edge_minus_initial_edge`` column is populated.
+    ``is_topup`` defaults to ``signal.is_topup`` (slot_filled_pre > 0). For a
+    top-up with ``initial_realized_edge``, the row's
+    ``add_on_realized_edge_minus_initial_edge`` column is filled in.
 
-    Per-strategy LIVE plumbing (D-LIVE-1 / D-LIVE-3 / D-LIVE-28):
-    ``mode`` stamps the row's immutable LIVE/DRY column, ``wallet_group``
-    routes the group cap audit, and the ``live_*`` kwargs carry the CLOB
-    fill metadata when the pipeline took the LIVE path.
+    ``mode`` sets the row's LIVE/DRY column (never changed afterwards),
+    ``wallet_group`` attributes it to a group cap, and the ``live_*`` arguments
+    carry CLOB fill data for live orders.
     """
     now = utc_now_sql()
     resolved_topup = signal.is_topup if is_topup is None else bool(is_topup)
@@ -205,10 +192,9 @@ def record_bet(
         signal.sleeve, signal.pair_component
     )
 
-    # is_topup ⇔ slot_filled_pre > 0 — invariant enforced application-side
-    # because SQLite cannot add CHECK constraints via ALTER on existing DBs.
-    # Mismatch indicates a caller bug that would silently break the parity
-    # test (U16 filters on is_topup=False).
+    # is_topup must equal slot_filled_pre > 0. Checked here because SQLite
+    # cannot add a CHECK constraint to an existing table; a mismatch is a
+    # caller bug.
     expected_topup = signal.slot_filled_pre > 0.0
     if resolved_topup != expected_topup:
         raise ValueError(
@@ -325,7 +311,7 @@ def record_signal_skip(
     wallet_group: Optional[str] = None,
     offset_sec: Optional[int] = None,
 ) -> None:
-    """Write a SKIP:<reason> signals row. Observational only (D19)."""
+    """Write a SKIP:<reason> signals row. Observational only."""
     resolved_wallet_id = wallet_id or wallet_id_for_sleeve(sleeve)
     conn.execute(
         """

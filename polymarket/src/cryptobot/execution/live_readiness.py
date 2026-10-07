@@ -1,26 +1,23 @@
-"""Pre-tick LIVE readiness evaluator.
+"""Live readiness check, run before any wallet goes live.
 
-Per the 2026-05-24-001 per-strategy LIVE deploy plan §U9 / D-LIVE-5:
+``evaluate_readiness(conn, config, order_client)`` runs the checks that gate
+every DRY -> LIVE switch:
 
-  * `evaluate_readiness(conn, config, order_client)` runs the six checks
-    that gate every DRY → LIVE flip:
-        1. `_validate_wallet_config(sig, funder)` passes.
-        2. `order_client.check_balance()` ≥ SUM(group_caps).
-        3. Chain balance (when available) within
-           `LIVE_BALANCE_TOLERANCE_USD` of CLOB.
-        4. Fresh `wallet_reconciliation_runs` row (best-effort — empty
-           DB returns READY when other checks pass; the operator's first
-           deploy fires reconciliation later).
-        5. No `pipeline_health(stage='boot', status='CRITICAL')` rows in
-           the last hour.
-        6. `operator_control_state.state` ∈ {LIVE, STOPPED_PROCESSING}
-           (i.e., NOT TRANSFER_LOCK).
+  1. ``_validate_wallet_config(sig, funder)`` passes.
+  2. ``order_client.check_balance()`` >= the sum of group caps.
+  3. The on-chain balance (when available) is within
+     ``LIVE_BALANCE_TOLERANCE_USD`` of the CLOB balance.
+  4. A recent ``wallet_reconciliation_runs`` row exists.
+  5. No ``pipeline_health(stage='boot', status='CRITICAL')`` rows in the
+     last hour.
+  6. ``operator_control_state.state`` is LIVE or STOPPED_PROCESSING (not
+     TRANSFER_LOCK).
 
-  * The resulting `live_readiness_reports.report_json` is built from an
-    EXPLICIT field whitelist (D-LIVE-26b) — never from `Config.model_dump()`,
-    which would dump SecretStr values into the SQLite DB.
+``live_readiness_reports.report_json`` is built from an explicit field
+whitelist, never ``Config.model_dump()``, which would write secrets into the
+database.
 
-  * Returns `ReadinessReport.status='READY'` only when every check passes.
+``ReadinessReport.status`` is 'READY' only when every check passes.
 """
 
 from __future__ import annotations
@@ -152,7 +149,7 @@ class ReadinessReport:
 
 
 # ---------------------------------------------------------------------------
-# Field whitelist (D-LIVE-26b)
+# Report field whitelist
 # ---------------------------------------------------------------------------
 
 
@@ -180,12 +177,11 @@ def _build_report_payload(
     wallet_balance_freshness_s: Optional[float],
     sample_timestamp: str,
 ) -> dict[str, Any]:
-    """Construct the `report_json` payload from the D-LIVE-26b whitelist.
+    """Build the ``report_json`` payload from the field whitelist.
 
-    The Config singleton is NEVER serialized into this payload — pulling
-    `Config.model_dump(mode='json')` would dump POLY_PRIVATE_KEY (and
-    every other SecretStr) into the SQLite DB readable by any process
-    with file access.
+    Never serializes Config itself: ``Config.model_dump(mode='json')`` would
+    write POLY_PRIVATE_KEY and every other secret into a database file any
+    local process can read.
     """
     clob_chain_delta: Optional[float] = None
     if (
@@ -227,9 +223,10 @@ def _build_report_payload(
 
 @dataclass(frozen=True)
 class _PrefetchedReadinessState:
-    """Network-only state for `evaluate_readiness`. Caller fetches this
-    OUTSIDE `db_write_lock` so the lock isn't held during a 30s CLOB
-    call (reliability finding REL-08)."""
+    """Network results for ``evaluate_readiness``, fetched by the caller
+    outside ``db_write_lock`` so the lock is not held during a CLOB call
+    that can take up to 30s.
+    """
 
     clob_balance: Optional[float]
     clob_unreachable_detail: Optional[str]
@@ -275,13 +272,10 @@ def read_erc20_balance(
     if not isinstance(raw, str) or not raw.startswith("0x"):
         raise RuntimeError(f"Unexpected RPC balance response: {payload!r}")
     balance = int(raw, 16) / (10 ** decimals)
-    # Reliability finding: this value feeds the LIVE readiness drift gate
-    # straight from a single (default public, unauthenticated) RPC. Apply a
-    # sanity bound so a corrupt/hostile RPC answer cannot pass an absurd
-    # balance into the gate; an out-of-range value is treated as an error
-    # (caller surfaces it as chain_unreachable rather than a number to
-    # trust). For go-live, prefer a dedicated authenticated RPC over the
-    # shared public endpoint (POLYGON_RPC_URL default = polygon-rpc.com).
+    # This value feeds the readiness drift check straight from a single RPC (by
+    # default a public one), so bound it: an implausible balance is treated as
+    # an error (reported as chain_unreachable). For live trading prefer a
+    # dedicated authenticated RPC over the default polygon-rpc.com.
     if not math.isfinite(balance) or balance < 0 or balance > _MAX_PLAUSIBLE_BALANCE:
         raise RuntimeError(
             f"RPC balance out of plausible bounds: {balance!r}"
@@ -345,17 +339,16 @@ def evaluate_readiness(
     snapshot_freshness_ttl_s: int = WALLET_SNAPSHOT_FRESHNESS_TTL_S,
     prefetched: Optional[_PrefetchedReadinessState] = None,
 ) -> ReadinessReport:
-    """Run every readiness gate, persist the result, return the report.
+    """Run every readiness check, store the result and return the report.
 
-    Phase 2 deploys this from `scheduler/readiness.py` every
-    `LIVE_READINESS_CACHE_TTL_S / 2`. The dashboard + `live_action_guard
-    .require_fresh_live_readiness` read the most recent row.
+    The readiness job runs it every ``LIVE_READINESS_CACHE_TTL_S / 2``; the
+    dashboard and ``live_action_guard.require_fresh_live_readiness`` read the
+    latest row.
 
-    Reliability finding REL-08: when `prefetched` is None, this function
-    runs the CLOB/chain network calls itself (original behavior). When
-    the scheduler job wraps this call in `db_write_lock`, it should
-    instead pass `prefetched=prefetch_readiness_state(...)` so the lock
-    is held only for the DB read+write portion.
+    With ``prefetched=None`` this makes the CLOB and chain calls itself. A
+    caller holding ``db_write_lock`` should pass
+    ``prefetched=prefetch_readiness_state(...)`` so the lock only covers the
+    database work.
     """
     onchain_required = bool(getattr(config, "live_onchain_verify_enabled", True))
     if chain_balance_fetcher is None and onchain_required:
@@ -479,11 +472,10 @@ def evaluate_readiness(
             )
         )
 
-    # ---- 2. CLOB balance (prefetched outside db_write_lock) -----------
-    # Correctness finding #56 (CORR-004): both branches fired previously
-    # when `check_balance` raised, producing duplicate `clob_balance`
-    # check rows. The prefetched detail is the single source of truth;
-    # the is-None fallback only fires when no order_client was wired.
+    # ---- 2. CLOB balance (prefetched outside db_write_lock) ----------- The
+    # prefetched result is the single source; the fallback only runs when no
+    # order_client is wired, so a failing check_balance cannot add a second
+    # row.
     clob_balance = prefetched.clob_balance
     required_balance = _required_balance(portfolio)
     if prefetched.clob_unreachable_detail is not None:
@@ -536,11 +528,8 @@ def evaluate_readiness(
             )
         )
     elif chain_balance is not None:
-        # Correctness finding: previously this passed=True for ANY value
-        # (incl. 0.00), so a drained on-chain funder read as a passing gate
-        # and was only caught transitively by chain_clob_drift. Gate on the
-        # same floor used for CLOB so a low/zero on-chain balance fails
-        # closed independently of the drift check.
+        # Apply the same floor as the CLOB balance, so a drained on-chain
+        # wallet fails here directly rather than only through the drift check.
         passed = chain_balance >= required_balance
         checks.append(
             ReadinessCheck(
@@ -677,10 +666,10 @@ def _safe_call_fetcher(
 
 
 def _required_balance(portfolio: Optional["V6Portfolio"]) -> float:
-    """Readiness floor for CLOB balance per D-LIVE-4.
+    """Minimum CLOB balance for readiness.
 
-    Grouped portfolios use SUM(group_caps). Isolated-wallet portfolios
-    have no groups, so use the topology-aware funder floor when present.
+    Grouped portfolios use the sum of group caps. Isolated wallets have no
+    groups and use the portfolio's funder floor when present.
     """
     if portfolio is None:
         return 0.0
@@ -705,10 +694,10 @@ def _required_balance(portfolio: Optional["V6Portfolio"]) -> float:
 
 
 def _latest_recon_age_seconds(conn: sqlite3.Connection) -> Optional[float]:
-    """Age (seconds) of the latest `wallet_reconciliation_runs` row.
+    """Age in seconds of the latest ``wallet_reconciliation_runs`` row.
 
-    Returns None when the table is empty (Phase 1 deploy hasn't run the
-    reconciler yet); the readiness check fails closed.
+    Returns None when the table is empty (the reconciler has not run yet); the
+    readiness check then fails closed.
     """
     row = conn.execute(
         """
@@ -728,14 +717,11 @@ def _latest_recon_age_seconds(conn: sqlite3.Connection) -> Optional[float]:
 def _recent_critical_boot_count(
     conn: sqlite3.Connection, *, window_minutes: int = 60
 ) -> int:
-    """Count CRITICAL pipeline_health rows from the last `window_minutes`.
+    """Count CRITICAL pipeline_health rows from the last ``window_minutes``.
 
-    Security finding #13 / kieran-python #5: the prior f-string built the
-    interval clause via string interpolation. `int()` made it safe today
-    but one refactor away from injection. Use a parameter binding so the
-    pattern matches every other query site in the codebase. Reject
-    non-int `window_minutes` up front so the SQL layer never sees a
-    surprising value."""
+    The interval is passed as a bound parameter, like every other query here,
+    and a non-int ``window_minutes`` is rejected before it reaches SQL.
+    """
     if not isinstance(window_minutes, int) or isinstance(window_minutes, bool):
         raise TypeError(
             f"window_minutes must be int, got {type(window_minutes).__name__}"
@@ -776,9 +762,9 @@ def _read_operator_state(conn: sqlite3.Connection) -> str:
 
 
 def latest_readiness_report(conn: sqlite3.Connection) -> Optional[dict[str, Any]]:
-    """Return the most recent live_readiness_reports row as a dict, or
-    None when the table is empty. Phase 1 deploys lacking the writer
-    surface None here; the guard reads this as 'no_readiness_report'."""
+    """Return the latest live_readiness_reports row as a dict, or None when
+    there is none; the guard treats None as 'no_readiness_report'.
+    """
     row = conn.execute(
         """
         SELECT id, created_at, status, funder, clob_balance_usd,

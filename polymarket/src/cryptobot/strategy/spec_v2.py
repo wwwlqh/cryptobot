@@ -1,22 +1,24 @@
-"""Shared v2 "step1last" decision core — the single source of truth for the
-promoted sub-minute spec, kept bet-for-bet with the frozen research evaluator
-``polymarket/backtest/lib/pool_study.py`` (``build_bets`` / ``BET_SPEC_DEFAULT``).
+"""Per-second entry decision for sub-minute sleeves.
 
-Two consumers share this module:
-  * the pipeline's live per-second decision path (via :class:`WindowDecider`),
-  * the parity tests (via :func:`build_bets_src`, a pure frame-level replica of
-    research ``build_bets``).
+``WindowDecider`` decides, second by second, whether a scored cell places a
+bet, enforcing at most one bet per market. It matches the backtest evaluator
+``polymarket/backtest/lib/pool_study.py`` bet for bet.
 
-Frozen spec (do NOT reorder or retune without re-running the W6 parity gate):
-  * intervals = both 5m and 15m,
-  * ask band = ``0.65 < ask <= 0.85`` (open low, closed high — matches
-    ``pool_study.build_bets`` line 266, and the flipped ``score._ask_in_bucket``),
-  * offset window = last 30s per-second (5m: 270-299, 15m: 870-899),
-  * gate = ``pred_edge >= 0.03`` on ``model_p - ask - fee``,
-  * fee = ``POLY_FEE_THETA * ask * (1 - ask)`` with theta = 0.07,
-  * selection order = band -> reachable -> dedup (first entry_ts per market)
-    -> gate.  This order is load-bearing: dedup-before-gate yields ~half the
-    bet count of gate-first (measured n=2503 vs 5223 on fold E). Do not reorder.
+``V2_SPEC`` holds the defaults the decider falls back to (and the parity tests
+pin):
+
+  * intervals: 5m and 15m;
+  * ask band ``0.65 < ask <= 0.85`` (open low, closed high);
+  * offsets: the last 30 seconds (5m: 270-299, 15m: 870-899);
+  * gate ``pred_edge >= 0.03`` on ``model_p - ask - fee``;
+  * fee ``POLY_FEE_THETA * ask * (1 - ask)``.
+
+Live TWAP sleeves pass their own band, gate and entry offsets from the strategy
+config.
+
+Selection order is band -> reachable -> dedup (first second per market) ->
+gate, and the order matters: deduplicating before gating yields about half as
+many bets as gating first. Do not reorder.
 """
 
 from __future__ import annotations
@@ -27,10 +29,9 @@ from typing import Any, Mapping
 from cryptobot import config
 
 # ---------------------------------------------------------------------------
-# Frozen spec
+# Default spec
 # ---------------------------------------------------------------------------
-# Mirrors pool_study.BET_SPEC_DEFAULT with the two live overrides:
-#   intervals=("5m","15m")  and  ask_lo=0.65 (WFO-confirmed floor amendment).
+# Mirrors pool_study.BET_SPEC_DEFAULT with both intervals and ask_lo=0.65.
 V2_SPEC: dict[str, Any] = {
     "intervals": ("5m", "15m"),
     "coins": ("btc", "eth", "sol", "xrp"),
@@ -50,12 +51,12 @@ _WINDOW_START = {"5m": 270, "15m": 870}
 
 
 # ---------------------------------------------------------------------------
-# Primitive predicates (scalar-safe; fee is array-safe like pool_study.fee)
+# Primitive predicates (fee accepts arrays, like pool_study.fee)
 # ---------------------------------------------------------------------------
 def fee(ask):
-    """Polymarket fee haircut: ``theta * ask * (1 - ask)`` (theta=0.07).
+    """Polymarket fee: ``theta * ask * (1 - ask)``.
 
-    Accepts a scalar or numpy array, matching ``pool_study.fee``.
+    Accepts a scalar or numpy array, like ``pool_study.fee``.
     """
     return config.POLY_FEE_THETA * ask * (1.0 - ask)
 
@@ -73,44 +74,35 @@ def in_offset_window(interval: str, offset_sec: int) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Frame-level bet construction — pure replica of pool_study.build_bets
-# ---------------------------------------------------------------------------
-
-
-# ---------------------------------------------------------------------------
 # Live per-second state machine
 # ---------------------------------------------------------------------------
 class WindowDecider:
-    """Live-legal replica of the dedup-before-gate rule for a 1 Hz decision loop.
+    """Per-second, one-bet-per-market decision state for a 1 Hz loop.
 
-    Two consume policies, selected by ``consume_on_fill`` (the live master switch
-    is ``config.V2_REJECT_RETRY``):
+    Two policies, chosen by ``consume_on_fill`` (live:
+    ``config.V2_REJECT_RETRY``):
 
-    * **first-commit** (``consume_on_fill=False``, the DEFAULT — pins the frozen
-      fold-E parity gate at n=2366).  A real-time loop cannot peek "reachable"
-      across the whole window before placing, so the faithful no-retry rule is:
-      **commit the window at the first in-band, in-window second, gate THAT
-      second, and consume the window** (one attempt per market/resolution).  A
-      gate-FAILED first second still consumes the window.
+    * **first-commit** (``consume_on_fill=False``, the default, used by the
+    parity tests). A live loop cannot look ahead across the window, so the rule
+    is: at the first in-band, in-window second, gate that second and consume
+    the window, pass or fail (one attempt per market).
 
-    * **consume-on-fill** (``consume_on_fill=True``, operator order 2026-07-09).
-      A FAK rejection must NOT consume the window; only a FILL (recorded via
-      :meth:`note_fill`) or window end does.  Every qualifying second is a fresh,
-      independent placement attempt evaluated by the normal per-second path
-      (fresh book / fresh score / band / gate at THAT second's ask).  Once ANY
-      side fills, the window is consumed for BOTH sides (one-bet-per-market,
-      matching the ledger market-level dedup).  ``next_attempt`` numbers the
-      attempts (1, 2, 3…) for the ``subminute_fills.attempt`` telemetry column.
+    * **consume-on-fill** (``consume_on_fill=True``). A rejected FAK does not
+    consume the window; only a fill (via :meth:`note_fill`) or the window
+    ending does. Every qualifying second is a new attempt evaluated on its own
+    book, score, band and gate. Once either side fills, the market is done for
+    both sides. ``next_attempt`` numbers the attempts (1, 2, 3, ...) for
+    ``subminute_fills.attempt``.
 
-    Side key = ``(coin, interval, window_start, side)``; market key =
-    ``(coin, interval, window_start)``.  ``on_second`` returns:
-      * ``"PLACE"``       — a qualifying second, gate passed -> place a bet.
-      * ``"WINDOW_DONE"`` — first-commit only: first qualifying second, gate
-                            FAILED -> window consumed, no bet, no further attempts.
-      * ``"SKIP"``        — window already consumed, this second is not in
-                            band/window yet, this exact second already fired, or
-                            (consume-on-fill) the gate failed this second (window
-                            stays open — the next second is re-evaluated).
+    Side key = ``(coin, interval, window_start, side)``; market key = ``(coin,
+    interval, window_start)``. ``on_second`` returns:
+
+      * ``"PLACE"``: a qualifying second whose gate passed; place a bet.
+      * ``"WINDOW_DONE"``: first-commit only; the first qualifying second
+        failed the gate, so the window is consumed with no bet.
+      * ``"SKIP"``: the window is already consumed, this second is outside the
+        band or window, this second already fired, or (consume-on-fill) the gate
+        failed this second and the next second will be evaluated.
     """
 
     def __init__(
@@ -123,17 +115,13 @@ class WindowDecider:
         checkpoint_offsets: tuple[int, ...] | None = None,
     ) -> None:
         self.gate = V2_SPEC["gate"] if gate is None else gate
-        # Per-sleeve ask band (open low, closed high). Defaults reproduce the
-        # frozen MID band (0.65, 0.85] byte-identically, so ``WindowDecider()``
-        # is unchanged; a caller that owns a different band passes its own
-        # ask_lo/ask_hi. The band is per-DECIDER (not per-cell) so the state
-        # machine stays a faithful replica of ``in_ask_band`` for whichever
-        # sleeve owns it.
+        # Per-decider ask band (open low, closed high), defaulting to
+        # V2_SPEC's. The band belongs to the decider, not the cell, so each
+        # sleeve's decider applies its own band.
         self.ask_lo = V2_SPEC["ask_lo"] if ask_lo is None else float(ask_lo)
         self.ask_hi = V2_SPEC["ask_hi"] if ask_hi is None else float(ask_hi)
-        # New sleeves own their exact decision grid.  ``None`` preserves the
-        # retired checkpoint strategy's frozen last-30s behavior for historical
-        # callers/tests, while TWAP sleeves pass their manifest-backed offsets.
+        # Sleeves pass their own entry offsets; ``None`` means V2_SPEC's
+        # last-30s window.
         self.checkpoint_offsets = (
             None
             if checkpoint_offsets is None
@@ -146,15 +134,14 @@ class WindowDecider:
         self._filled: set[tuple] = set()              # market keys spent by a fill
         self._attempts: dict[tuple, int] = {}         # side key -> placement count
         self._attempted_offsets: dict[tuple, set] = {}  # side key -> offsets fired
-        # Anchored FAK pad (config.V2_FAK_PAD): side key -> walked_limit of the
-        # FIRST placed attempt in this (coin, interval, window_start, side)
-        # window. See :meth:`anchor_limit`.
+        # FAK pad anchor (config.V2_FAK_PAD): side key -> walked_limit of the
+        # first placed attempt in that window. See :meth:`anchor_limit`.
         self._first_limit: dict[tuple, float] = {}
 
     def _in_band(self, ask: float) -> bool:
         """This decider's band test: ``ask_lo < ask <= ask_hi`` (open low,
-        closed high). With the default bounds this is byte-identical to the
-        module-level :func:`in_ask_band`."""
+        closed high).
+        """
         return (ask > self.ask_lo) and (ask <= self.ask_hi)
 
     def _in_offset_window(self, cell: Mapping[str, Any]) -> bool:
@@ -173,9 +160,8 @@ class WindowDecider:
     def on_second(self, cell: Mapping[str, Any]) -> str:
         """Advance the state machine one second for one scored cell.
 
-        ``cell`` must expose: ``coin, interval, window_start, side, ask,
+        ``cell`` must have ``coin, interval, window_start, side, ask,
         offset_sec, pred_edge``.
-
         """
         if self.consume_on_fill:
             return self._on_second_consume_on_fill(cell)
@@ -205,23 +191,23 @@ class WindowDecider:
         seen = self._attempted_offsets.setdefault(skey, set())
         offset = cell["offset_sec"]
         if offset in seen:
-            # The SAME second never double-fires (defensive; 1 tick == 1 second).
+            # The same second never fires twice (defensive; one tick is one
+            # second).
             return "SKIP"
         seen.add(offset)
         if cell["pred_edge"] < self.gate:
-            # Gate FAIL does NOT consume — this second is dead, the next second
-            # (fresh book / fresh score / fresh ask) is independently eligible.
+            # A failed gate does not consume the window; the next second (new
+            # book, score and ask) is evaluated on its own.
             return "SKIP"
         return "PLACE"
 
     def next_attempt(self, cell: Mapping[str, Any]) -> int:
-        """Increment and return the 1-based placement-attempt number for this
-        (market, side) window.
+        """Increment and return the 1-based attempt number for this (market,
+        side) window.
 
-        Called once per ACTUAL order placement (at the ``subminute_fills``
-        record site) so the ``attempt`` column counts real placements (1, 2, 3…)
-        and skips induced by downstream gates never inflate it.  In first-commit
-        mode a window places at most once, so this returns 1.
+        Called once per actual order (where ``subminute_fills`` is written), so
+        skips from later gates never inflate it. In first-commit mode a window
+        places at most once, so this returns 1.
         """
         skey = self._key(cell)
         n = self._attempts.get(skey, 0) + 1
@@ -229,22 +215,17 @@ class WindowDecider:
         return n
 
     def anchor_limit(self, cell: Mapping[str, Any], walked_limit: float) -> float:
-        """Get-or-set the FIRST-placed walked limit for this side window.
+        """Get or set the first placed walked limit for this side window.
 
-        Records ``walked_limit`` as the anchor on the FIRST call for this
-        ``(coin, interval, window_start, side)`` key and returns it; every later
-        call in the same window returns the STORED first limit (ignoring the
-        passed value). Feeds the anchored FAK pad (``config.V2_FAK_PAD``, applied
-        at the pipeline's sub-minute BetSignal build) so a retry's padded cap can
-        never exceed ``first_limit + PAD``.
+        The first call for a ``(coin, interval, window_start, side)`` key
+        stores ``walked_limit`` and returns it; later calls in the same window
+        return the stored value. The FAK pad (``config.V2_FAK_PAD``) uses it so
+        a retry's cap can never exceed ``first_limit + PAD``.
 
-        In-memory only — a process restart mid-window re-seeds the anchor from the
-        next placement, which is acceptable (windows are <=60s; do NOT add a DB
-        read on the hot path). Multifill nuance (operator 2026-07-10): a multifill
-        extra entry shares the side-window anchor of the window's first attempt —
-        acceptable (multifill is inert below the $5k equity floor today). Keyed
-        exactly like ``_attempts`` and pruned by ``window_start`` with the rest of
-        the decider state (pipeline ``_v2_prune_window_decider``).
+        Memory only: after a restart mid-window the next placement sets a new
+        anchor, which is fine for windows under a minute (no database read on
+        the hot path). Pruned by ``window_start`` with the rest of the decider
+        state (pipeline ``_v2_prune_window_decider``).
         """
         skey = self._key(cell)
         anchor = self._first_limit.get(skey)
@@ -254,11 +235,12 @@ class WindowDecider:
         return anchor
 
     def note_fill(self, cell: Mapping[str, Any]) -> None:
-        """Record an accepted fill — consumes the window for BOTH sides.
+        """Record an accepted fill, which consumes the market for both sides.
 
-        No-op in first-commit mode (the window is already consumed at first
-        commit); in consume-on-fill mode this is the ONLY thing (besides window
-        end) that spends the window."""
+        No-op in first-commit mode (the window was consumed at commit); in
+        consume-on-fill mode this, or the window ending, is the only thing that
+        consumes it.
+        """
         if self.consume_on_fill:
             self._filled.add(self._market_key(cell))
 

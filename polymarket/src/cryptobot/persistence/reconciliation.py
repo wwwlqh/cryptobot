@@ -1,27 +1,21 @@
-"""Per-order CLOB fill ↔ ledger row reconciliation + stale-attempt recovery.
+"""Reconcile CLOB fills with ledger rows, and recover stale order attempts.
 
-Per the 2026-05-24-001 per-strategy LIVE deploy plan §U7:
+  * ``reconcile_open_orders(conn, order_client)``: for each live PENDING
+    ledger row with a ``live_order_id``, query the CLOB and update
+    ``live_filled_size`` / ``live_filled_price`` / ``live_fill_ts``. When
+    the CLOB reports CANCELLED or EXPIRED with nothing filled, the row
+    becomes ``outcome='CANCELLED'`` with ``pnl_net=0`` so its exposure is
+    released right away.
 
-  * `reconcile_open_orders(conn, order_client)` — for each LIVE PENDING
-    ledger row with a `live_order_id`, query the CLOB and update
-    `live_filled_size` / `live_filled_price` / `live_fill_ts`.
-    Per D-LIVE-17, when the CLOB reports CANCELLED / EXPIRED with
-    `live_filled_size=0`, the row transitions to `outcome='CANCELLED'`
-    with `pnl_net=0` so the group exposure cap releases immediately on
-    the reconciler tick.
+  * ``reconcile_stale_attempts(conn, order_client, *, stale_seconds)``:
+    scan ``live_order_attempts`` rows in SUBMITTING/SUBMITTED with
+    ``ledger_id IS NULL`` older than ``stale_seconds``. For each, look the
+    order up on the CLOB (by ``client_order_id`` when supported, else by
+    funder, token, side, price, size and time window). On a match, create or
+    link the missing ledger row; with no match, mark the attempt FAILED
+    (``error_kind='not_found_after_timeout'``) and release its reservation.
 
-  * `reconcile_stale_attempts(conn, order_client, *, stale_seconds)` —
-    scan `live_order_attempts` rows in SUBMITTING/SUBMITTED with
-    `ledger_id IS NULL` older than `stale_seconds`. For each:
-        - Query the CLOB by `client_order_id` (when supported) or by
-          (funder, token, side, price, size, time-window). On match,
-          create/link the missing LIVE ledger row.
-        - On no match after `stale_seconds`, mark the attempt FAILED with
-          `error_kind='not_found_after_timeout'` and release the
-          reservation.
-
-Both helpers are idempotent: re-running on the same DB is a no-op for
-rows already in their terminal state.
+Both are idempotent: rows already in a terminal state are left alone.
 """
 
 from __future__ import annotations
@@ -46,7 +40,7 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Order ↔ ledger reconciliation (D-LIVE-17)
+# Order <-> ledger reconciliation
 # ---------------------------------------------------------------------------
 
 
@@ -133,7 +127,7 @@ def reconcile_open_orders(
 
 
 # ---------------------------------------------------------------------------
-# Stale-attempt recovery (D-LIVE-28)
+# Stale-attempt recovery
 # ---------------------------------------------------------------------------
 
 
@@ -146,29 +140,28 @@ def reconcile_stale_attempts(
         Callable[[], list[dict[str, Any]]]
     ] = None,
 ) -> dict[str, int]:
-    """Recover or release `live_order_attempts` reservations the bot can no
-    longer reason about.
+    """Recover or release ``live_order_attempts`` reservations the bot has lost
+    track of.
 
-    For each stale SUBMITTING/SUBMITTED row with `ledger_id IS NULL`:
+    For each stale SUBMITTING/SUBMITTED row with ``ledger_id IS NULL``:
 
-      1. Query the CLOB's recent funder orders for a match by
-         (token, side, price, size, time-window). When the CLOB supports
-         `client_order_id` echo, prefer that.
-      2. On match WITHOUT a ledger row (audit P0 #2): RECONSTRUCT the LIVE
-         PENDING ledger row from the attempt's persisted `signal_json` and
-         LINK it. A crash between the FAK fill and `record_bet` otherwise
-         leaves real on-chain USDC exposure invisible to the exposure cap,
-         PnL, and redeem accounting. Double-insert is prevented by a
-         `live_client_order_id` dedup query (a crash AFTER record_bet but
-         before link LINKs to the existing row). When the signal cannot be
-         reconstructed, escalate via a CRITICAL pipeline_health row + notify.
-      3. On NO match after `stale_seconds`: mark the attempt FAILED
-         with `error_kind='not_found_after_timeout'` so the group cap
-         reservation is released.
+      1. Look for a matching order among the funder's recent CLOB orders, by
+         ``client_order_id`` when the CLOB echoes it, else by (token, side,
+         price, size, time window).
+      2. Match but no ledger row: rebuild the live PENDING ledger row from the
+         attempt's saved ``signal_json`` and link it. Otherwise a crash between
+         the fill and ``record_bet`` would leave real on-chain exposure invisible
+         to the exposure cap, PnL and redemption. A ``live_client_order_id``
+         lookup prevents a double insert (a crash after record_bet but before
+         linking links to the existing row). If the row cannot be rebuilt,
+         write a CRITICAL pipeline_health row and notify.
+      3. No match after ``stale_seconds``: mark the attempt FAILED with
+         ``error_kind='not_found_after_timeout'`` so its reservation is
+         released.
 
-    Returns `{'recovered': N, 'released': K, 'still_active': M, 'orphaned': O}`,
-    where `orphaned` counts matches that could not be auto-reconstructed and
-    were escalated for manual resolution.
+    Returns ``{'recovered': N, 'released': K, 'still_active': M, 'orphaned':
+    O}``; ``orphaned`` counts matches that could not be rebuilt and were
+    escalated.
     """
     counts = {"recovered": 0, "released": 0, "still_active": 0, "orphaned": 0}
     stale = stale_active_attempts(conn, older_than_seconds=stale_seconds)
@@ -211,9 +204,9 @@ def reconcile_stale_attempts(
             clob_by_order_id=clob_by_order_id,
         )
         if match is not None:
-            # The CLOB has the order but our ledger row is missing (audit
-            # P0 #2): a crash between the FAK fill and record_bet. Recover
-            # the ledger row instead of leaving a manual-only CRITICAL.
+            # The CLOB has the order but there is no ledger row: a crash
+            # between the fill and record_bet. Rebuild the row rather than
+            # leave it for manual repair.
             try:
                 recovered_id = _recover_orphan_ledger_row(conn, attempt, match)
             except Exception:  # noqa: BLE001
@@ -295,7 +288,7 @@ def _backfill_subminute_fill(
 
 
 # ---------------------------------------------------------------------------
-# Orphan ledger-row recovery (audit P0 #2)
+# Orphan ledger-row recovery
 # ---------------------------------------------------------------------------
 
 
@@ -461,24 +454,20 @@ def _read_fill_price(
     intent_amount_usd: Optional[float] = None,
     intent_price: Optional[float] = None,
 ) -> Optional[float]:
-    """Extract a realized fill price for a matched CLOB order.
+    """Extract a fill price for a matched CLOB order.
 
-    Polymarket's `get_order` can return a FAK market-buy order with
-    `size_matched` and `price`, but no `avg_fill_price`. The precise paths are
-    tried first, most-accurate first: an explicit VWAP field, then
-    `filled_value / size_matched`, then (for a cash-sized buy that spent the
-    full stake) `intent_amount_usd / size_matched` when the implied price is at
-    or below the executable cap.
+    ``get_order`` can return a FAK buy with ``size_matched`` and ``price`` but
+    no average fill price. The precise sources are tried first, most accurate
+    first: an explicit VWAP field, then ``filled_value / size_matched``, then
+    (for a cash-sized buy that spent its full stake) ``intent_amount_usd /
+    size_matched`` if that is at or below the limit.
 
-    Root-cause fix for LIVE row 571 (2026-07-09): a PARTIAL fill that did NOT
-    spend the full cash amount has an implied price above the cap (bet_size is
-    the INTENDED stake, not cash spent), so every precise path is rejected. The
-    order still has a KNOWN conservative fill price — the order's executable
-    limit `price`. A marketable FAK/limit BUY only matches book levels AT OR
-    BELOW that limit, so booking it over-states cost (never over-books a win,
-    never under-books a loss) while guaranteeing we never persist
-    `live_filled_size` WITHOUT a `live_filled_price` again — the exact state
-    that stranded the resolution sweep on every 5-min cycle, forever.
+    A partial fill that did not spend the full amount gives an implied price
+    above the limit (bet_size is the intended stake, not cash spent), so all of
+    those are rejected. The order's limit ``price`` is still a safe fallback: a
+    marketable buy only matches levels at or below its limit, so it can only
+    overstate cost. Using it guarantees ``live_filled_size`` is never stored
+    without a ``live_filled_price``, which would leave the row unsettleable.
     """
     explicit = _first_value(
         payload,
