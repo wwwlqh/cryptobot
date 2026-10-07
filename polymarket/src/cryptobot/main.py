@@ -1,20 +1,19 @@
-"""Live scanner process entrypoint.
+"""Live scanner process entry point.
 
-Boot sequence (per plan U14):
-  1. Load config + parse CLI
-  2. Init DB + apply schema (idempotent)
-  3. Load v6 sleeves + compute config_sha256
-  4. Live-mode safety: REFUSE non-loopback DASHBOARD_BIND_HOST unless the
-     operator has explicitly set CRYPTOBOT_ALLOW_REMOTE_DASHBOARD=1. The
-     SSE stream is unauthenticated; binding beyond loopback exposes the
-     full ledger / PnL / position state to anyone on the network.
-  5. Reconcile orphan PENDING rows from prior runs
-  6. Load RF + LUT artifacts (boot-blocking on missing / mismatched)
-  7. Start BackgroundScheduler (1Hz tick + 5min F3 sweep)
-  8. Start SSE server on (DASHBOARD_BIND_HOST, DASHBOARD_HTTP_PORT)
-  9. Log boot summary into pipeline_health
- 10. Install SIGTERM handler → graceful shutdown
- 11. serve_forever()
+Boot sequence:
+
+   1. Load config and parse the command line
+   2. Open the database and apply the schema (idempotent)
+   3. Validate the wallet setup and relayer URL
+   4. Load the strategy sleeves and hash the config
+   5. Refuse an unsafe dashboard bind (non-loopback needs explicit opt-in,
+      TLS and a password)
+   6. Settle orphan PENDING rows left by a previous run
+   7. Load the TWAP model (boot fails if it is missing or mismatched) and
+      start the Chainlink TWAP mirror
+   8. Build the order client, book sources and background jobs
+   9. Start the scheduler (1 Hz tick plus periodic jobs) and the dashboard
+  10. Log the boot, then serve until SIGINT/SIGTERM
 """
 
 from __future__ import annotations
@@ -34,10 +33,7 @@ from typing import Callable, Optional
 
 import httpx
 
-# TYPE_CHECKING imports keep the deferred string annotations on
-# ``_build_deps_factory`` resolvable to ``mypy``/IDEs without paying the
-# import cost at boot — the concrete loads still happen inside ``main()``
-# behind a feature flag check.
+# Type-only imports for the string annotations on ``_build_deps_factory``.
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -48,7 +44,7 @@ logger = logging.getLogger(__name__)
 
 
 def _disk_free_mb() -> float:
-    """Cross-platform disk-free probe in MB for the disk gate (R39)."""
+    """Free disk space in MB, for the disk gate."""
     import shutil
     try:
         usage = shutil.disk_usage(".")
@@ -73,13 +69,11 @@ def _build_deps_factory(
     book_shadow: Optional[object] = None,
     conn_factory: Optional[Callable[[], sqlite3.Connection]] = None,
 ) -> Callable[[], "TickDeps"]:
-    """Closure returning fresh TickDeps each tick.
+    """Return a closure that builds fresh TickDeps for each tick.
 
-    Persistent ``httpx.Client`` instances are passed in via the caller so
-    every adapter call reuses one TCP+TLS connection per host (review
-    finding #11). Without reuse, each qualifying tick pays ~19-27 TLS
-    handshakes (50-150ms each) and routinely breaches the 900ms soft
-    deadline.
+    The persistent ``httpx.Client`` objects are passed in so every call reuses
+    one TCP+TLS connection per host; without reuse a tick could pay ~20 TLS
+    handshakes and miss its 900ms soft deadline.
     """
     from cryptobot import config
     from cryptobot.execution.pipeline import TickDeps
@@ -101,8 +95,7 @@ def _build_deps_factory(
     fetch_spots = partial(_fetch_spots_impl, client=spot_client)
     fetch_market = partial(_fetch_market_impl, client=gamma_client)
     fetch_book = partial(_fetch_book_impl, client=clob_client)
-    # A2 latency: batched POST /books — one round trip for every qualifying
-    # cell's tokens per tick (pipeline falls back to fetch_book on failure).
+    # Batched book fetch: one round trip per tick for every cell's tokens.
     fetch_books = partial(_fetch_books_impl, client=clob_client)
 
     def factory() -> TickDeps:
@@ -110,9 +103,8 @@ def _build_deps_factory(
             partial_ret_engine=partial_ret_engine,
             config_sha256=config_sha256,
             fetch_spots=fetch_spots,
-            # Cache-only spot read for the fast-trigger rungs — SAME adapter,
-            # SAME bucket math, but it can never spend a GET (no ``client``
-            # bound at all). See TickDeps.peek_spots.
+            # Cache-only spot read for the fast-entry scans (no client bound,
+            # so it can never fetch).
             peek_spots=_peek_spots_impl,
             fetch_market=fetch_market,
             fetch_book=fetch_book,
@@ -122,16 +114,13 @@ def _build_deps_factory(
             notify=notify,
             twap_hgb_artifact=twap_hgb,
             twap_mirror=twap_mirror,
-            # A3 latency: cached balance (BalanceCache.get) — zero network
-            # on the tick path; None keeps the legacy inline check_balance.
+            # Cached balance: no network call on the tick path.
             live_balance_fetcher=live_balance_fetcher,
-            # A8 latency: boundary book prefetcher; None = inline batch only.
+            # Book read-ahead chain; None = inline fetch only.
             book_prefetch=book_prefetch,
-            # W3 shadow-compare: WS-vs-REST divergence observer; None = off.
+            # WebSocket-vs-REST comparator; None = off.
             book_shadow=book_shadow,
-            # Per-thread DB handle for the Pass-1 Gamma fan-out: executor
-            # workers resolve their OWN connection here instead of sharing the
-            # tick conn (SQLITE_MISUSE silent-miss fix).
+            # Per-thread DB handle for the parallel market lookups.
             conn_factory=conn_factory,
         )
     return factory
@@ -143,21 +132,13 @@ def _build_sweep_job(
     *,
     gamma_client: httpx.Client,
 ) -> Callable[[], None]:
-    """Closure that invokes the F3 resolution sweep on every scheduler fire.
+    """Closure that runs the resolution sweep on every scheduler fire.
 
-    Gamma/Polymarket final outcome is the live settlement source: the scheduler
-    leaves rows PENDING until Gamma publishes final ``outcomePrices`` so the
-    ledger matches Polymarket's actual result. No oracle-spot fallback is wired
-    — the legacy Chainlink resolver in ``execution.resolution`` is a test-only
-    path and this job never supplies it a fetcher.
-
-    Audit w19oxqf24 finding #1 supersedes the old REL-07 db_write_lock
-    mitigation. The sweep now resolves its OWN connection from ``conn_factory``
-    (one per scheduler-pool thread), so its ``UPDATE ledger`` + commit can no
-    longer end the tick's open ``BEGIN IMMEDIATE`` transaction — they are on
-    different connections, and SQLite's WAL file lock + busy_timeout serialize
-    the two writers correctly. The in-process lock, which the tick never held,
-    is gone.
+    Settlement uses Gamma's final ``outcomePrices``; rows stay PENDING until
+    the market is decisively resolved. The sweep uses its own connection from
+    ``conn_factory`` (one per scheduler thread), so its writes can never end
+    the tick's open transaction; SQLite's WAL lock and busy_timeout serialize
+    the two writers.
     """
     from cryptobot import config
     from cryptobot.scheduler.resolution_sweep import run_resolution_sweep
@@ -216,7 +197,9 @@ def _warm_start_partial_ret_from_binance(
     *,
     spot_client: httpx.Client,
 ) -> bool:
-    """Seed PartialRetEngine from Binance 1m klines so restart can score."""
+    """Seed the PartialRetEngine from Binance 1m klines so a restart can score
+    immediately.
+    """
     from cryptobot import config
     from cryptobot.data.binance import fetch_recent_minute_bars
     from cryptobot.strategy.partial_ret import MinuteBar, _MIN_RV_1H_SAMPLES
@@ -272,7 +255,7 @@ def _warm_start_partial_ret_from_binance(
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Boot + serve_forever entry point. Returns process exit code."""
+    """Boot and serve; returns the process exit code."""
     parser = argparse.ArgumentParser(
         description=(
             "cryptobot live scanner. Reads CRYPTOBOT_DB_PATH "
@@ -317,14 +300,10 @@ def main(argv: list[str] | None = None) -> int:
     from cryptobot.strategy.partial_ret import PartialRetEngine
     from cryptobot.strategy.portfolio_loader import load_sleeves
 
-    # Step 2: DB
-    # init_db applies schema.sql + migrations once on the boot (main) thread.
-    # Audit w19oxqf24 finding #1 (P0): every other thread (tick worker,
-    # scheduler-job pool, dashboard POST) must NOT share this connection —
-    # they get their own via `conns`. For an in-memory DB (tests / --once
-    # smoke) the handle shares the one boot connection, since a second
-    # :memory: connection would see an empty DB. `conn` below is the main
-    # thread's connection used for the boot gates, backfills, and _log_boot.
+    # Step 2: database. The schema is applied once on this thread. Every other
+    # thread (tick, scheduler jobs, dashboard) gets its own connection through
+    # ``conns``; an in-memory DB (tests) shares the one connection, since a
+    # second ``:memory:`` connection would be empty.
     boot_conn = init_db(config.DB_PATH)
     if str(config.DB_PATH) == ":memory:":
         conns = ThreadLocalConnections(config.DB_PATH, shared=boot_conn)
@@ -333,11 +312,8 @@ def main(argv: list[str] | None = None) -> int:
         conns.register_current_thread(boot_conn)
     conn = conns.get()
 
-    # Step 2.5 (plan §U2 / D-LIVE-7): Polymarket wallet topology gate. Boot
-    # fails closed when SIG=3 (POLY_1271 deposit wallet) is set without a
-    # POLY_FUNDER — without this guard the first LIVE order placement would
-    # silently sign against the wrong address. The Pydantic singleton is
-    # cached for the rest of boot via get_config().
+    # Wallet setup check: signature type 3 (deposit wallet) without POLY_FUNDER
+    # would sign the first live order against the wrong address, so boot fails.
     runtime_cfg = get_config()
     try:
         _validate_wallet_config(
@@ -357,22 +333,15 @@ def main(argv: list[str] | None = None) -> int:
             )
             conn.commit()
         except sqlite3.DatabaseError:
-            # Refuse to mask the underlying validation error if we can't
-            # write the audit row — boot still fails closed.
+            # Boot still fails even if the audit row cannot be written.
             pass
         logger.error(msg)
         conns.close_all()
         return 1
 
-    # D-LIVE-27: RELAYER_URL prefix check. Adversarial finding #12 wants
-    # explicit operator acknowledgement so a typo / homoglyph URL can't
-    # silently slip past CRITICAL logs that the operator missed.
-    # `CRYPTOBOT_RELAYER_URL_OVERRIDE=1` is the explicit acknowledgement.
-    # Without it, an unknown URL refuses boot (rather than the previous
-    # log-and-continue) when LIVE wallets could become reachable. Phase 1
-    # deploys with no relayer wired (the common shape) still need the
-    # override because a future operator action could promote any wallet
-    # to LIVE and immediately hit the bad relayer.
+    # An unknown RELAYER_URL refuses boot unless
+    # ``CRYPTOBOT_RELAYER_URL_OVERRIDE=1`` acknowledges it, so a typo or
+    # look-alike URL cannot slip through.
     if not runtime_cfg.relayer_url_is_known():
         warn_msg = (
             f"relayer_url={runtime_cfg.relayer_url!r} does not start with a "
@@ -399,15 +368,12 @@ def main(argv: list[str] | None = None) -> int:
             conns.close_all()
             return 1
 
-    # Step 3: portfolio + sha
+    # Step 3: portfolio and config hash.
     portfolio = load_sleeves()
     sha = portfolio.config_sha256
 
-    # Step 3.5 (plan §U1 / §U4): portfolio-dependent backfill + seed.
-    # _migrate_db is portfolio-free (D-LIVE-15) so we run the two helpers
-    # here once load_sleeves() has the JSON-derived wallet→group mapping
-    # and the wallet_default_modes dict. Idempotent: re-running on a
-    # populated DB is a no-op.
+    # Portfolio-dependent backfill and seed (wallet groups, default wallet
+    # modes). Idempotent.
     backfill_counts = backfill_wallet_groups(conn, portfolio)
     op_state, wallet_modes = boot_operator_state(
         conn, portfolio, boot_dry_run=runtime_cfg.dry_run
@@ -424,11 +390,9 @@ def main(argv: list[str] | None = None) -> int:
         wallet_modes,
     )
 
-    # Step 4: live-mode safety. The SSE /events stream has NO authentication
-    # — its only access control is the loopback bind. Refuse to boot on a
-    # non-loopback bind unless the operator has explicitly opted in via
-    # CRYPTOBOT_ALLOW_REMOTE_DASHBOARD=1 (which assumes they have placed
-    # the dashboard behind their own auth proxy).
+    # Step 4: live-mode safety. The dashboard's read stream is protected by its
+    # loopback bind, so a non-loopback bind needs
+    # ``CRYPTOBOT_ALLOW_REMOTE_DASHBOARD=1``.
     loopback_hosts = {"127.0.0.1", "::1", "localhost"}
     bind_is_loopback = config.DASHBOARD_BIND_HOST in loopback_hosts
     if not bind_is_loopback:
@@ -442,13 +406,10 @@ def main(argv: list[str] | None = None) -> int:
             )
             conns.close_all()
             return 1
-        # Audit w19oxqf24 finding #4 (P1): a remote bind without TLS sends the
-        # operator-control session cookie in cleartext and without the Secure
-        # attribute (the cookie is only marked Secure when TLS_TERMINATED=1).
-        # That cookie is a bearer token for wallet-mode flips, operator
-        # start/stop, and fund transfers. Match the D-LIVE-13 spec: refuse boot
-        # on a non-loopback bind unless BOTH ALLOW_REMOTE_DASHBOARD=1 AND
-        # DASHBOARD_TLS_TERMINATED=1.
+        # A remote bind also needs TLS
+        # (``CRYPTOBOT_DASHBOARD_TLS_TERMINATED=1``): the operator session
+        # cookie authorizes wallet-mode changes, stop/start and transfers, and
+        # without TLS it would travel in cleartext.
         if not config.DASHBOARD_TLS_TERMINATED:
             logger.error(
                 "DASHBOARD_BIND_HOST=%s is non-loopback and "
@@ -468,11 +429,8 @@ def main(argv: list[str] | None = None) -> int:
             config.DASHBOARD_BIND_HOST,
         )
 
-    # Security finding #1: refuse boot when CRYPTOBOT_DASHBOARD_PASS is
-    # empty AND the operator has not explicitly opted out of auth via
-    # CRYPTOBOT_DASHBOARD_AUTH_DISABLED=1. The opt-out is itself refused
-    # on a non-loopback bind because "anyone on the network" cannot
-    # safely be the audience for mode-flip / transfer POSTs without auth.
+    # Refuse to boot with an empty dashboard password unless auth is explicitly
+    # disabled, and never allow disabled auth on a non-loopback bind.
     dashboard_pass = os.environ.get("CRYPTOBOT_DASHBOARD_PASS", "")
     auth_disabled = (
         os.environ.get("CRYPTOBOT_DASHBOARD_AUTH_DISABLED", "0") == "1"
@@ -506,21 +464,10 @@ def main(argv: list[str] | None = None) -> int:
                 "bind only."
             )
 
-    # Review-pass #6 closeout: PartialRetEngine's prev-tick anchor (the
-    # divergence #4 fix) only fires when the previous tick is within 5
-    # seconds of the interval boundary. At TICK_SECONDS >= 6 the
-    # previous tick is always stale and we silently fall back to
-    # first-after-boundary, re-introducing the open-vs-close timing
-    # bias the fix removed. Refuse to boot rather than degrade
-    # silently. Operator override via CRYPTOBOT_TICK_SECONDS is the
-    # source of truth — refuse at boot so the misconfiguration shows
-    # up loudly before any bets are placed.
-    # Validate the EFFECTIVE cadence the scheduler will actually run at:
-    # start_scheduler uses `args.tick_seconds or config.TICK_SECONDS`
-    # (tick.py IntervalTrigger), so an operator passing `--tick-seconds 10`
-    # would otherwise boot cleanly yet trade at 10s, defeating this guard and
-    # re-introducing the live/backtest entry-anchor divergence the >5s refusal
-    # exists to prevent. Also reject sub-1s cadences.
+    # The window-open anchor needs the previous tick to be within 5 seconds of
+    # the boundary, so a tick interval above 5s would silently reintroduce a
+    # timing bias. Validate the effective interval (``--tick-seconds``
+    # overrides the config) and refuse anything outside 1-5 seconds.
     effective_tick = (
         args.tick_seconds if args.tick_seconds is not None else config.TICK_SECONDS
     )
@@ -536,13 +483,9 @@ def main(argv: list[str] | None = None) -> int:
         conns.close_all()
         return 1
 
-    # Step 5: orphan reconcile. Main leaves resolvers unwired here so boot
-    # avoids network dependency before the persistent clients exist; expired
-    # rows stay PENDING and the scheduled Gamma-first sweep resolves them.
-    # Guarded against DB exceptions (locked DB after a crash, schema
-    # mismatch on a stale data dir, etc.) so a transient failure here
-    # does NOT block RF+LUT load and the rest of boot. The orphan rows
-    # stay PENDING and the next F3 sweep retries them.
+    # Step 5: orphan reconcile, without network resolvers (the HTTP clients do
+    # not exist yet); unresolved rows stay PENDING for the scheduled sweep. A
+    # DB error here is logged and boot continues.
     try:
         reconcile_orphan_pending(conn)
     except (sqlite3.DatabaseError, sqlite3.OperationalError) as exc:
@@ -552,12 +495,11 @@ def main(argv: list[str] | None = None) -> int:
             exc,
         )
 
-    # Step 6: model artifacts (boot-blocking).
+    # Step 6: model (boot-blocking).
     #
-    # The sleeves' serve-time selection knobs (threshold, ask band, book
-    # consumption, side filter) are not baked into the model file, so a config
-    # typo would otherwise pass every boot check. Refuse to boot unless they
-    # match the manifest the model was selected on.
+    # The sleeves' selection settings (threshold, ask band, book consumption,
+    # side filter) live in the config, not the model file, so check them
+    # against the model's manifest and refuse to boot on a mismatch.
     from cryptobot.strategy.twap_loader import (
         load_twap_symmetric_model,
         validate_twap_coin_universe,
@@ -588,24 +530,14 @@ def main(argv: list[str] | None = None) -> int:
     twap_mirror.start()
     logger.info("Chainlink TWAP mirror started (60s boundary TWAP, Price To Beat fallback)")
 
-    # Persistent HTTP clients — one per upstream host. Reused across every
-    # tick so TLS handshakes amortize over the whole run (#11). Closed in
-    # the shutdown finalizer below.
-    #
-    # A2 latency: the Polymarket read clients get http2=True (multiplexed
-    # streams over one connection — the batch /books POST + any fallback
-    # GETs share it) and explicit pool limits. Fail-soft to HTTP/1.1 when
-    # the `h2` extra is absent so a missing optional dep can't block boot.
-    # Read/write/pool timeout is the CRYPTOBOT_DECISION_READ_TIMEOUT_S knob
-    # (default 3.0 = the previous hardcoded value, so an unpinned deploy is
-    # behavior-identical); the operator can pin a tighter fail-fast timeout
-    # on decision-path reads without a code change. connect stays at 2.0s.
+    # Persistent HTTP clients, one per host, reused for the whole run and
+    # closed at shutdown. The Polymarket read clients use HTTP/2 when the
+    # ``h2`` extra is installed (the batched book POST and fallback GETs share
+    # one connection). Read timeout is ``CRYPTOBOT_DECISION_READ_TIMEOUT_S``;
+    # connect is 2s.
     http_timeout = httpx.Timeout(config.DECISION_READ_TIMEOUT_S, connect=2.0)
-    # keepalive_expiry=65.0: httpx's default 5s idle-expiry silently closed
-    # the kept-alive sockets between spaced-out reads (spot cache refills,
-    # per-window gamma lookups, the 60s scheduler jobs), so nearly every such
-    # read paid a fresh TCP+TLS handshake (~50-150ms) despite the pool. 65s
-    # comfortably outlives the 60s job cadences and the between-window gaps.
+    # Keep idle sockets for 65s (httpx defaults to 5s), longer than the 60s job
+    # intervals, so spaced-out reads do not each pay a new handshake.
     http_limits = httpx.Limits(
         max_connections=20, max_keepalive_connections=10, keepalive_expiry=65.0
     )
@@ -633,12 +565,10 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     # ------------------------------------------------------------------
-    # Step 7a: LIVE execution surface — OrderClient + scheduler jobs.
+    # Live execution: order client and scheduler jobs.
     # ------------------------------------------------------------------
-    # OrderClient is fail-soft: when py_clob_client_v2 is missing OR
-    # credentials are empty, we boot in DRY-only mode (Phase 1). The
-    # pipeline + scheduler jobs treat `order_client=None` as
-    # `clob_unavailable` — LIVE wallets emit SKIP, DRY wallets continue.
+    # Without the CLOB SDK or credentials the bot boots DRY-only:
+    # ``order_client=None`` makes LIVE wallets skip with ``clob_unavailable``.
     from cryptobot.venues import get_adapter
 
     order_client: Optional[object] = get_adapter(config.VENUE).build_order_client(
@@ -647,9 +577,8 @@ def main(argv: list[str] | None = None) -> int:
 
     from cryptobot.execution.live_readiness import build_venue_balance_fetcher
 
-    # A3 latency: cached funder balance — the tick reads this instead of a
-    # synchronous CLOB round trip every LIVE tick; the 60s readiness job
-    # keeps it fresh (store() below reuses that job's own fetch).
+    # Cached balance: the tick reads this instead of calling the exchange; the
+    # 60s readiness job keeps it fresh.
     balance_cache: Optional[BalanceCache] = None
     if order_client is not None:
         balance_cache = BalanceCache(order_client.check_balance)
@@ -662,13 +591,8 @@ def main(argv: list[str] | None = None) -> int:
     transfer_relayer_submitter: Optional[
         Callable[[dict[str, object]], dict[str, object]]
     ] = None
-    # Reliability finding: import the relayer names in their OWN guarded block.
-    # Previously RelayerSubmitError was imported inside the same try whose
-    # `except RelayerSubmitError` referenced it; if that import itself raised
-    # (missing transitive dep on a fresh LIVE box), evaluating the except clause
-    # would hit NameError, which propagates past the broad `except Exception`
-    # and crashes boot instead of degrading to DRY. Splitting the import out
-    # guarantees the name is bound before the build-logic except runs.
+    # Import the relayer names in their own guarded block, so a failed import
+    # degrades to DRY instead of a NameError in the except clause below.
     try:
         from cryptobot_polymarket.relayer import (
             RelayerSubmitError,
@@ -698,13 +622,8 @@ def main(argv: list[str] | None = None) -> int:
         except Exception:  # noqa: BLE001
             logger.exception("Polymarket relayer submitter setup raised")
 
-    # Config finding: a wallet flipped LIVE places real CLOB orders, but with no
-    # relayer wired (RELAYER_API_KEY / RELAYER_API_KEY_ADDRESS / poly_funder /
-    # private_key / url) the transfer surface is silently dead — pUSD cannot be
-    # withdrawn. Surface a CRITICAL pipeline_health row so the half-broken LIVE
-    # state is loud (the relayer env stays optional for DRY-only deploys, so we
-    # only escalate when a wallet is actually LIVE).
-    # `wallet_modes` is the boot-resolved {id: mode} map.
+    # A LIVE wallet without a relayer can place orders but cannot withdraw
+    # pUSD. Record a CRITICAL row so that half-configured state is visible.
     any_wallet_live = any(
         str(m).upper() == "LIVE" for m in wallet_modes.values()
     )
@@ -727,32 +646,16 @@ def main(argv: list[str] | None = None) -> int:
         except sqlite3.DatabaseError:
             pass
 
-    # Latency finding (stop-fill notify + venue-degradation alert): send_event
-    # ran its blocking Telegram POST (5s timeout) on the calling thread — on
-    # the tick worker that stalled the serial per-position held-position loop
-    # and the post-POST reject tail (pipeline.py
-    # _maybe_alert_venue_degradation) — so one Telegram RTT delayed the next
-    # position's cut / next cell's POST and pushed the tick toward its hard
-    # deadline. _notify now enqueues NON-CRITICAL events to a bounded daemon
-    # dispatcher (the SSE publisher off-thread pattern) and returns
-    # immediately; send_event runs UNCHANGED in the worker (rate limiter +
-    # CRITICAL.log semantics intact). critical=True bypasses the queue and
-    # sends inline — criticals are rare and allowed to block (their pre-diff
-    # contract); queued they could be shed on overflow or lost to a crash
-    # before dequeue. Every _notify caller already discards the NotifyResult
-    # and the non-critical notify contract is documented best-effort, so
-    # fire-and-forget is semantics-identical. Stopped (drained, bounded
-    # join) on shutdown below.
+    # Non-critical notifications go through a background dispatcher so a
+    # Telegram request never blocks the tick thread. Critical ones are sent
+    # inline. The dispatcher is drained on shutdown.
     notify_dispatcher = NotifyDispatcher()
     notify_dispatcher.start()
 
     def _notify(event_type: str, message: str, *, wallet_id=None, critical=False) -> None:
-        """Wrap `cryptobot.execution.notify.send_event` so pipeline + jobs
-        share one dispatch path. Non-critical events are fire-and-forget:
-        they queue to the dispatcher's daemon worker so the Telegram POST
-        never runs on the calling (tick) thread. critical=True sends
-        inline (blocking) — the pre-dispatcher guarantee. Failures are
-        logged but never raised."""
+        """Send a notification. Non-critical events are queued; critical ones
+        are sent inline. Failures are logged, never raised.
+        """
         try:
             notify_dispatcher.enqueue(
                 event_type, message, wallet_id=wallet_id, critical=critical
@@ -760,24 +663,15 @@ def main(argv: list[str] | None = None) -> int:
         except Exception:  # noqa: BLE001
             logger.warning("notify dispatch failed", exc_info=True)
 
-    # Step 7-8: scheduler + SSE
+    # Steps 7-8: scheduler and dashboard server.
     broadcaster: Optional[Broadcaster] = None
     httpd = None
     post_router: Optional[PostRouter] = None
     if not args.no_sse:
         broadcaster = Broadcaster()
-        # PostRouter wires the dashboard mutation surface (D-LIVE-13).
-        # Relayer submitter is None on Phase 1 deploys — submit endpoint
-        # returns 503 until U10 wires the real relayer client. `dashboard_pass`
-        # and `auth_disabled` are resolved earlier in the boot gate above.
-        #
-        # Audit w19oxqf24 finding #1 (P0): the dashboard mutation surface gets
-        # its OWN dedicated connection, not the tick's. PostRouter already
-        # serializes every handler with its internal self._lock, so one
-        # connection is safe across the HTTP server's per-request threads, and
-        # it is isolated from the tick/sweep connections so an operator wallet
-        # flip / transfer can never commit or roll back the tick's open
-        # transaction. For an in-memory DB this returns the one shared conn.
+        # The dashboard's POST handlers get their own connection, separate from
+        # the tick's, so an operator action can never commit or roll back the
+        # tick's transaction. PostRouter serializes its handlers internally.
         dashboard_conn = conns.get() if str(config.DB_PATH) == ":memory:" else get_connection(config.DB_PATH)
         if dashboard_conn is not conn:
             conns.register_extra(dashboard_conn)
@@ -793,22 +687,10 @@ def main(argv: list[str] | None = None) -> int:
         )
         httpd, _ = start_server(broadcaster, post_router=post_router)
 
-    # Snapshot publisher: hook fires after each successful tick.
-    #
-    # Latency item #1: the SSE publish is OFF the tick-gating path. The
-    # scheduler runs on_tick INLINE after the tick body (scheduler/tick.py,
-    # max_instances=1), so the old synchronous build_payload + json.dumps +
-    # broadcast counted against the wall time gating the NEXT tick fire.
-    # on_tick now only raises a latest-wins pending flag and returns; a
-    # dedicated daemon thread consumes the flag and does the whole payload
-    # build/publish on its OWN sqlite connection (conns.get() resolves
-    # per-thread — audit finding #1). Ordering is preserved by construction:
-    # the flag is a single collapsed "a tick is waiting" signal and there is
-    # exactly one consumer that always rebuilds from the NEWEST sqlite state,
-    # so an older tick can never publish after a newer one — a busy publisher
-    # simply skips the intermediate ticks (dashboard gains at most ~1 tick of
-    # lag, accepted). `state` is now touched ONLY by the publisher thread, so
-    # the old state_lock is gone.
+    # Snapshot publisher. After each tick, on_tick only sets a latest-wins
+    # flag; a daemon thread rebuilds the payload from SQLite on its own
+    # connection and broadcasts it. Publishing therefore never delays the next
+    # tick, and an older tick can never publish after a newer one.
     state = {
         "max_ledger_id": 0,
         "last_bootstrap_ts": 0.0,
@@ -819,24 +701,20 @@ def main(argv: list[str] | None = None) -> int:
     publish_wake = threading.Event()
     publish_stop = threading.Event()
 
-    # The scheduler invokes this with the TickResult; the payload no longer
-    # reads it (the per-sleeve markets decision subtree was dropped with the
-    # retired Live markets & gates tab) and it is not retained — the flag is
-    # only the "a tick completed" token; the publisher rebuilds from sqlite.
+    # Called with the TickResult, which the publisher does not need: the flag
+    # only signals that a tick completed.
     def on_tick(_tick_result):
         if broadcaster is None:
             return
         nonlocal publish_pending
-        # Latest-wins signal: a burst of ticks collapses to one pending flag.
+        # A burst of ticks collapses to one pending flag.
         with publish_lock:
             publish_pending = True
         publish_wake.set()
 
     def _publish_latest(tick_conn: sqlite3.Connection) -> None:
-        # Same per-tick balance sizing reads (BalanceCache) → the cash headline;
-        # the off-tick book source → the open-position mark. Bound once and
-        # reused by both build_payload calls below (live tick + late-joiner
-        # bootstrap).
+        # Cash headline from the cached balance; open positions marked from the
+        # cached book source.
         live_balance_get = balance_cache.get if balance_cache is not None else None
         book_mark_get = book_prefetch.get if book_prefetch is not None else None
         last_seen = state["max_ledger_id"]
@@ -850,21 +728,14 @@ def main(argv: list[str] | None = None) -> int:
         )
         state["max_ledger_id"] = new_max
         broadcaster.publish(payload)
-        # Performance finding #6 (PERF-01): the late-joiner bootstrap
-        # cache was being rebuilt on EVERY tick — a second full
-        # `build_payload` call (full ledger scan + every aggregate) at
-        # 1 Hz. Most ticks land no new ledger rows, so the bootstrap
-        # only needs to refresh when new rows actually arrived OR a
-        # cap-30s ceiling so a stale page still gets a periodic
-        # update. Reuses the just-built payload when the ledger
-        # contains every row needed.
+        # Rebuild the late-joiner bootstrap payload only when new ledger rows
+        # arrived, or at least every 30 seconds.
         now = time.time()
         if new_max == last_bootstrap_max and (now - last_bootstrap_ts) < 30.0:
             return
         if last_seen <= 0:
-            # First post-boot publish IS the bootstrap (we passed
-            # last_seen_ledger_id=0 above, so `payload.ledger` is the
-            # full snapshot). Reuse it without a second build.
+            # The first publish after boot is already a full snapshot; reuse
+            # it.
             bootstrap_payload = payload
         else:
             bootstrap_payload, _ = build_payload(
@@ -878,9 +749,7 @@ def main(argv: list[str] | None = None) -> int:
         state["last_bootstrap_max"] = new_max
 
     def _publisher_loop() -> None:
-        # This thread's OWN connection (ThreadLocalConnections hands the
-        # publisher its own handle on a file-backed DB; the :memory: test
-        # path shares the one boot connection exactly like every thread).
+        # This thread's own connection.
         nonlocal publish_pending
         tick_conn = conns.get()
         while not publish_stop.is_set():
@@ -899,8 +768,7 @@ def main(argv: list[str] | None = None) -> int:
 
     publisher_thread: Optional[threading.Thread] = None
     if broadcaster is not None:
-        # daemon=True: the publisher must never block process exit even if a
-        # payload build hangs; _stop_publisher below is the polite half.
+        # Daemon thread so a hung build can never block process exit.
         publisher_thread = threading.Thread(
             target=_publisher_loop,
             name="cryptobot-sse-publisher",
@@ -909,24 +777,23 @@ def main(argv: list[str] | None = None) -> int:
         publisher_thread.start()
 
     def _stop_publisher() -> None:
-        """Signal + briefly join the publisher BEFORE conns.close_all() so a
-        mid-build publish isn't cut off by its connection closing under it.
-        The join is bounded — a hung build is abandoned (daemon thread)."""
+        """Signal and briefly join the publisher before connections are closed.
+        """
         if publisher_thread is None:
             return
         publish_stop.set()
         publish_wake.set()
         publisher_thread.join(timeout=5.0)
 
-    # Book read-ahead sources feeding the SAME TickDeps.book_prefetch seam.
-    # Priority order (BookSourceChain.get returns the first fresh hit):
-    #   1. WS mirror (CRYPTOBOT_BOOK_WS_ENABLED) — venue-timestamped snapshots
-    #      off the CLOB market channel; real staleness (audit #12).
-    #   2. A8 REST prefetch-ahead (CRYPTOBOT_BOOK_PREFETCH_ENABLED) — re-fetches
-    #      the previous tick's POST /books token set LEAD_MS before each second
-    #      boundary; freshness bounded by CRYPTOBOT_BOOK_PREFETCH_MAX_AGE_MS.
-    # Whatever neither serves fresh falls through to the pipeline's inline REST
-    # batch exactly as today. Both default OFF.
+    # Book read-ahead sources, in priority order (the first fresh hit wins):
+    #
+    #  1. WebSocket mirror (``CRYPTOBOT_BOOK_WS_ENABLED``): exchange-timestamped
+    #     snapshots from the market channel.
+    #  2. REST prefetch (``CRYPTOBOT_BOOK_PREFETCH_ENABLED``): re-fetches the
+    #     previous tick's tokens just before each second.
+    #
+    # Anything neither serves fresh falls through to the pipeline's inline
+    # fetch.
     book_sources: list = []
     book_shadow = None
     # The authoritative mirror, kept for the stall watchdog below (None in
@@ -937,12 +804,10 @@ def main(argv: list[str] | None = None) -> int:
             order_client=order_client
         )
         if _ws_setup.shadow is not None:
-            # W3: the mirror runs ALONGSIDE REST and is NOT appended to
-            # book_sources — REST stays authoritative for every decision.
+            # Shadow mode: the mirror runs alongside REST but never decides.
             book_shadow = _ws_setup.shadow
         elif _ws_setup.mirror is not None:
-            # Authoritative: sit FIRST in the chain so a fresh WS snapshot
-            # outranks the REST prefetch cache.
+            # Authoritative: first in the chain, ahead of the REST prefetch.
             book_sources.append(_ws_setup.mirror)
             ws_mirror_authoritative = _ws_setup.mirror
     if config.BOOK_PREFETCH_ENABLED:
@@ -976,10 +841,7 @@ def main(argv: list[str] | None = None) -> int:
         ),
         book_prefetch=book_prefetch,
         book_shadow=book_shadow,
-        # Executor-thread DB access for the Gamma fan-out: hand the pipeline the
-        # same ThreadLocalConnections handle the tick/sweep/dashboard threads
-        # use, so each fan-out worker gets its own connection (audit finding #1
-        # pattern; SQLITE_MISUSE silent-miss fix).
+        # Each parallel market lookup gets its own connection.
         conn_factory=conns.get,
     )
     runner = TickRunner(
@@ -989,17 +851,13 @@ def main(argv: list[str] | None = None) -> int:
         on_tick=on_tick,
     )
 
-    # Step 9: boot log
+    # Step 9: boot log.
     _log_boot(conn, sha=sha, bankroll=portfolio.bankroll,
               host=config.DASHBOARD_BIND_HOST, port=config.DASHBOARD_HTTP_PORT)
 
-    # Review-pass #25 closeout: when Binance warm-start fails,
-    # ~30 minutes of 1m-return history accumulate (training-parity
-    # formula needs rv_1h_at_open). In that fallback window,
-    # active cells fire SKIP:no_feature; without a distinct signal
-    # this is indistinguishable from a broken feature pipeline. Write
-    # ONE pipeline_health WARN so operators have a stable
-    # bookmark — "this is warmup, not breakage".
+    # Without the Binance warm start the engine needs ~30 minutes of 1m returns
+    # before it can score, and cells skip with no_feature meanwhile. Write one
+    # WARN row so that reads as warm-up, not breakage.
     if not partial_ret_bootstrapped:
         from cryptobot.strategy.partial_ret import _MIN_RV_1H_SAMPLES
         conn.execute(
@@ -1038,12 +896,8 @@ def main(argv: list[str] | None = None) -> int:
             conns.close_all()
         return 0
 
-    # Audit w19oxqf24 finding #1 (P0): cross-thread DB-transaction safety is
-    # now provided by per-thread connections (each writer thread holds its own
-    # connection; SQLite's WAL file lock + busy_timeout serialize BEGIN
-    # IMMEDIATE writers across them). `db_write_lock` is retained only to
-    # serialize the few scheduler jobs that share it; it is no longer
-    # load-bearing for the tick race, which the tick never participated in.
+    # Each writer thread has its own connection, and SQLite serializes them.
+    # ``db_write_lock`` only serializes the few scheduler jobs that share it.
     db_write_lock = threading.Lock()
 
     sweep_job = _build_sweep_job(
@@ -1053,11 +907,8 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     def _on_job_missed(job_id: str) -> None:
-        """Review-pass #18 closeout: APScheduler may drop a fire when
-        ``max_instances=1`` AND a prior fire is still running past the
-        next schedule time. Surface the drop into pipeline_health so
-        operators have a queryable trail when the sweep / tick
-        cadence silently degrades.
+        """Record a scheduler fire that APScheduler dropped (a previous run
+        still going), so degraded cadence leaves a trail in pipeline_health.
         """
         try:
             conn = conns.get()  # this listener thread's own connection
@@ -1072,9 +923,8 @@ def main(argv: list[str] | None = None) -> int:
             logger.exception("failed to record missed-fire for job_id=%s", job_id)
 
     # ------------------------------------------------------------------
-    # Live-execution scheduler jobs (U7 + U8 + U9 + U10). Each is wired
-    # only when the corresponding execution surface is available so a
-    # Phase 1 deploy (no OrderClient) still boots cleanly.
+    # Live-execution jobs, each wired only when what it needs exists, so a
+    # DRY-only deploy still boots.
     # ------------------------------------------------------------------
     wallet_recon_job: Optional[Callable[[], None]] = None
     readiness_job: Optional[Callable[[], None]] = None
@@ -1094,10 +944,8 @@ def main(argv: list[str] | None = None) -> int:
 
         def _wallet_recon_job() -> None:
             try:
-                # Reliability finding REL-06: CLOB fetches (up to 30s each
-                # x 3 calls) run OUTSIDE the db_write_lock so other jobs
-                # (_on_job_missed and friends) aren't blocked for 90s.
-                # Only the persist_run DB writes are serialized.
+                # Exchange calls run outside db_write_lock; only the DB writes
+                # are serialized.
                 conn = conns.get()  # this scheduler-pool thread's own connection
                 fetched = wallet_reconciler.fetch_external_state()
                 with db_write_lock:
@@ -1113,16 +961,13 @@ def main(argv: list[str] | None = None) -> int:
 
         def _readiness_job() -> None:
             try:
-                # Reliability finding REL-08: CLOB balance check runs
-                # OUTSIDE db_write_lock so other jobs aren't blocked
-                # while CLOB hangs near its 30s timeout.
+                # The balance check runs outside db_write_lock.
                 conn = conns.get()  # this scheduler-pool thread's own connection
                 prefetched = prefetch_readiness_state(
                     order_client=order_client,
                     chain_balance_fetcher=chain_balance_fetcher,
                 )
-                # A3 latency: feed the tick's balance cache from the balance
-                # this job just fetched — zero extra network.
+                # Feed the tick's balance cache from this fetch.
                 if balance_cache is not None:
                     balance_cache.store(prefetched.clob_balance)
                 with db_write_lock:
@@ -1140,13 +985,10 @@ def main(argv: list[str] | None = None) -> int:
                 logger.exception("evaluate_readiness raised")
         readiness_job = _readiness_job
 
-        # Audit w19oxqf24 findings #3 + #6: reconcile LIVE fills and release
-        # stale SUBMITTING attempt reservations. Without this scheduled job,
-        # LIVE PENDING rows never get their realized live_filled_size/price
-        # (so finding #7's settlement starves), and a SUBMITTING attempt the
-        # CLOB rejected counts toward the wallet-group cap forever. Runs every
-        # 60s on its own thread connection; CLOB fetches are inside the
-        # reconcilers and the DB writes are serialized via db_write_lock.
+        # Reconcile live fills and release stale SUBMITTING reservations every
+        # 60s. Without it, LIVE rows never get their realized fill size and
+        # price, and a rejected attempt would count against the group cap
+        # forever.
         from cryptobot.persistence.reconciliation import (
             reconcile_open_orders,
             reconcile_stale_attempts,
@@ -1168,18 +1010,10 @@ def main(argv: list[str] | None = None) -> int:
                 logger.exception("order_reconciliation raised")
         order_recon_job = _order_recon_job
 
-        # Latency finding #8: order-socket warmth ping. Between orders the
-        # signing pool's ONLY steady traffic is the 60s readiness balance
-        # read vs the pool's keepalive_expiry=65s — a 5s margin — and a
-        # readiness fire delayed past misfire_grace_time=2 is dropped
-        # outright, opening a ~120s gap that guarantees the socket expires
-        # and the next order POST pays a cold DNS+TCP+TLS handshake inside
-        # post_ms. This job fires a lightweight unauthenticated GET /ok on
-        # the SAME pool every CLOB_PING_SECONDS (default 20s); the
-        # skip-if-recent guard + short per-request timeout live in
-        # OrderClient.ping_order_pool, so it never duplicates traffic or
-        # pins a scheduler-pool worker. CRYPTOBOT_CLOB_PING_SECONDS=0
-        # disables (start_scheduler registers no job — byte-identical).
+        # Keep the order connection warm. Between orders the signing pool's
+        # only traffic is the 60s balance read, close to its 65s idle expiry,
+        # so the next order could pay a full handshake. A lightweight GET every
+        # ``CLOB_PING_SECONDS`` (20s) prevents that; 0 disables it.
         def _clob_ping_job() -> None:
             try:
                 order_client.ping_order_pool()
@@ -1187,15 +1021,8 @@ def main(argv: list[str] | None = None) -> int:
                 logger.warning("clob_ping job raised", exc_info=True)
         clob_ping_job = _clob_ping_job
 
-    # Transfer watchdog always runs — it only inspects operator state
-    # and doesn't need the OrderClient. Releases stuck TRANSFER_LOCKs
-    # older than 15 minutes (D-LIVE-21 watchdog).
-    #
-    # The watchdog is CORE (panel verdict D4-1). It used to be imported
-    # from cryptobot_polymarket, which meant this ALWAYS-ON job could not start
-    # unless the Polymarket package was installed — on any venue. It does not
-    # make a venue call: it is SQLite hygiene over operator_control_state,
-    # a core-owned table.
+    # The transfer watchdog always runs: it releases TRANSFER_LOCK states older
+    # than 15 minutes and needs no order client.
     from cryptobot.execution.operator_control import release_stale_transfer_lock
 
     def _transfer_watchdog_job() -> None:
@@ -1216,21 +1043,16 @@ def main(argv: list[str] | None = None) -> int:
             logger.exception("transfer_watchdog raised")
     transfer_watchdog_job = _transfer_watchdog_job
 
-    # Reject re-quote telemetry drain (observation only — no order is placed).
-    # Re-reads the book ~1s after each LIVE FAK reject and back-fills
-    # requote_ask/age. Uses only the read-only CLOB client + a scheduler-pool
-    # connection, so it runs unconditionally (no OrderClient dependency).
+    # Reject telemetry: re-read the book about a second after each rejected
+    # order. Observation only; needs only the read client.
     _rr_fetch_book = get_adapter(config.VENUE).fetch_top_book
     from cryptobot.execution.reject_requote import drain_requote_queue
 
     def _requote_drain_job() -> None:
         try:
             conn = conns.get()  # this scheduler-pool thread's own connection
-            # write_lock is passed INTO the drain (REL-08 pattern): at the 2s
-            # cadence the CLOB book re-reads must run outside db_write_lock so
-            # a fetch hanging toward its timeout can't stall the other jobs;
-            # the drain takes the lock only around its batched UPDATE and not
-            # at all when idle.
+            # The drain takes db_write_lock only around its batched UPDATE, so
+            # a slow book read cannot stall other jobs.
             counters = drain_requote_queue(
                 conn,
                 fetch_book=partial(
@@ -1244,13 +1066,10 @@ def main(argv: list[str] | None = None) -> int:
             logger.exception("reject_requote_drain raised")
     requote_drain_job = _requote_drain_job
 
-    # Latency item #4: periodic PASSIVE WAL checkpoint. Pairs with
-    # db/connection.py's wal_autocheckpoint=20000 — the raised bound keeps
-    # SQLite's default inline checkpoint (which runs ON the committing
-    # writer, i.e. usually the tick's own autocommit at 1 Hz) off the
-    # decision path, and this job drains the WAL from a scheduler-pool
-    # thread instead. PASSIVE never blocks readers or writers; cadence via
-    # CRYPTOBOT_WAL_CHECKPOINT_SECONDS (default 60s, 0 disables).
+    # Periodic PASSIVE WAL checkpoint from a scheduler thread. db/connection.py
+    # raises SQLite's inline checkpoint threshold so the tick's commits never
+    # pay for it; this job drains the WAL instead.
+    # ``CRYPTOBOT_WAL_CHECKPOINT_SECONDS`` (default 60, 0 disables).
     def _wal_checkpoint_job() -> None:
         try:
             passive_wal_checkpoint(conns.get())
@@ -1258,13 +1077,9 @@ def main(argv: list[str] | None = None) -> int:
             logger.warning("wal_checkpoint job raised", exc_info=True)
 
 
-    # Catch-all issue alert (operator decision 2026-07-03): several code
-    # paths record CRITICAL pipeline_health rows without notifying (dd_halt,
-    # boot relayer gap, future additions). This job forwards every NEW
-    # CRITICAL row to Telegram so a recorded issue is never silent. Spam
-    # control: send_event's per-(event_type) rate limit at 30 min — dd_halt
-    # re-inserts a row every ~60s while halted but the operator gets one
-    # ping per stage per half hour.
+    # Forward every new CRITICAL pipeline_health row to Telegram, so no
+    # recorded issue is silent. send_event rate-limits each event type to one
+    # per 30 min.
     _critical_alert_state: dict[str, int] = {}
     try:
         _seed_row = conn.execute(
@@ -1299,10 +1114,9 @@ def main(argv: list[str] | None = None) -> int:
         except Exception:  # noqa: BLE001
             logger.warning("critical_alert job raised", exc_info=True)
 
-    # A7 latency: spot prefetch-ahead — a daemon thread warms the spot bucket
-    # cache ~LEAD_MS before each second boundary so the tick's inline spot
-    # fetch is a zero-network cache hit. Same adapter + client + bucket math
-    # as deps.fetch_spots; kill switch CRYPTOBOT_SPOT_PREFETCH_ENABLED=false.
+    # Spot prefetch: a daemon thread warms the spot cache just before each
+    # second so the tick's spot read is a cache hit.
+    # ``CRYPTOBOT_SPOT_PREFETCH_ENABLED``.
     spot_prefetcher = None
     if config.SPOT_PREFETCH_ENABLED:
         from cryptobot.data.binance import fetch_all_spots as _prefetch_spots_impl
@@ -1315,20 +1129,11 @@ def main(argv: list[str] | None = None) -> int:
         )
         spot_prefetcher.start()
 
-    # WS mirror stall watchdog (operator order 2026-08-06). The mirror's
-    # freshness cap was removed because snapshot age = market quietness on these
-    # books; the residual risk is a STALLED-BUT-CONNECTED subscription, which no
-    # in-mirror signal can see. This job cross-checks only SUSPECT (old-ladder)
-    # tokens against the venue's REST book on the SCHEDULER POOL — never the
-    # tick/order path — and evicts a token whose top-of-book has drifted, so the
-    # next entry-path read falls through to REST truth. Fail-open throughout.
-    #
-    # Wired only when the mirror is AUTHORITATIVE (not shadow — shadow already
-    # cross-checks every tick against REST) and the venue's mirror exposes the
-    # serving-set + evict API. Registered through the start_scheduler param
-    # pattern (the clob_ping precedent) so start_scheduler stays the single
-    # owner of the job set; flag-off wiring stays byte-identical (param defaults
-    # None) and the import happens only inside the `if`.
+    # WebSocket mirror stall watchdog. A subscription can stall while the
+    # socket stays connected; this job cross-checks old-looking books against
+    # REST on the scheduler pool (never the order path) and evicts any that
+    # drifted, so the next read falls back to REST. Only wired when the mirror
+    # is authoritative.
     _book_ws_watchdog_job: Optional[Callable[[], None]] = None
     if config.BOOK_WS_WATCHDOG_ENABLED and ws_mirror_authoritative is not None:
         from cryptobot.scheduler.book_ws_watchdog import (
@@ -1341,9 +1146,7 @@ def main(argv: list[str] | None = None) -> int:
             _wd_adapter = get_adapter(config.VENUE)
             _watchdog = BookWsWatchdog(
                 ws_mirror_authoritative,
-                # Same venue-dispatched batch fetch + read-only client the A8
-                # prefetcher uses; one POST /books per pass, one rate-limit
-                # token regardless of token count.
+                # One batched REST book request per pass.
                 partial(_wd_adapter.fetch_books_batch, client=clob_client),
                 stall_suspect_ms=config.BOOK_WS_WATCHDOG_STALL_SUSPECT_MS,
                 max_tokens_per_pass=config.BOOK_WS_WATCHDOG_MAX_TOKENS_PER_PASS,
@@ -1365,30 +1168,20 @@ def main(argv: list[str] | None = None) -> int:
                 "serving_snapshots/evict API"
             )
 
-    # On-chain miss forensics (operator 2026-07-30): classify every
-    # venue-rejected FAK as FASTER_TAKER / REPRICED_ONLY / MAKER_CANCEL from
-    # the trade tape and persist the verdict for the dashboard. Registered
-    # through the start_scheduler param pattern (the clob_ping precedent) so
-    # start_scheduler stays the single owner of the job set; flag-off wiring
-    # stays byte-identical (param defaults None) and the heavy import happens
-    # only inside the `if`.
+    # On-chain miss forensics: classify each rejected order (faster taker,
+    # repriced, maker cancel) from the trade tape for the dashboard.
     _miss_forensics_job: Optional[Callable[[], None]] = None
     if config.MISS_FORENSICS_ENABLED:
         from cryptobot.scheduler.miss_forensics import run_miss_forensics
 
         def _run_miss_forensics_job() -> None:
             try:
-                # Own connection per scheduler-pool thread (audit finding #1).
-                # The venue fetches run OUTSIDE db_write_lock (REL-06): the
-                # lock is taken per-verdict inside run_miss_forensics, so a
-                # slow data-api page can never block the sweep or the tick.
+                # Own connection; exchange reads run outside db_write_lock.
                 counters = run_miss_forensics(
                     conns.get(),
                     funder=runtime_cfg.poly_funder,
                     rpc_url=runtime_cfg.polygon_rpc_url,
-                    # Ride the process-wide read client's keep-alive pool
-                    # instead of a fresh TLS handshake per row (the
-                    # `fetch_book=partial(..., client=clob_client)` pattern).
+                    # Reuse the shared read client's keep-alive pool.
                     client=clob_client,
                     write_lock=db_write_lock,
                 )
@@ -1399,16 +1192,10 @@ def main(argv: list[str] | None = None) -> int:
 
         _miss_forensics_job = _run_miss_forensics_job
 
-    # Fast-trigger entry rungs (operator 2026-07-30): a 250ms in-window sweep +
-    # event-driven firing off WS ask-side book pushes, both converging on the
-    # tick's OWN single-cell evaluation (pipeline.run_fast_entry_scan ->
-    # _resolve_net_cells -> _commit_cell), so every guard the tick binds — band,
-    # gate, V2_EDGE_CAP, sizing/caps/DD-brake, one-per-window dedup,
-    # _attempted_offsets, first-attempt-only, multifill — binds here unchanged.
-    # Registered through the start_scheduler param pattern (the clob_ping
-    # precedent) so start_scheduler stays the single owner of the job set;
-    # MASTER OFF => no job passed, no WS callback registered, and the tick takes
-    # no single-flight lock (byte-identical runtime).
+    # Fast-entry triggers: a 250ms sweep plus WebSocket ask-update events, both
+    # running the tick's own evaluation (``pipeline.run_fast_entry_scan``), so
+    # every gate applies unchanged. Master switch off: no job, no callback, and
+    # the tick takes no lock.
     from cryptobot.scheduler.fast_entry import FastEntryTrigger, fast_trigger_seconds
 
     _fast_trigger: Optional[FastEntryTrigger] = None
@@ -1416,8 +1203,7 @@ def main(argv: list[str] | None = None) -> int:
     _fast_trigger_seconds = 0.0
     if config.FAST_TRIGGER_ENABLED:
         _fast_trigger = FastEntryTrigger(
-            # Own connection per calling thread (audit finding #1) — the sweep
-            # runs on an APScheduler pool thread, the event rung on its own.
+            # Own connection per calling thread.
             conn_factory=conns.get,
             portfolio=portfolio,
             deps_factory=deps_factory,
@@ -1425,10 +1211,8 @@ def main(argv: list[str] | None = None) -> int:
         )
         _fast_trigger_job = _fast_trigger.run_sweep
         _fast_trigger_seconds = fast_trigger_seconds()
-        # EVENT rung: the chain fans the hook out over whatever sources expose
-        # `set_ask_update_callback` (today the venue WS mirror) and reports how
-        # many accepted, so a venue without the hook — or with no WS mirror at
-        # all — keeps the sweep rung instead of failing the boot.
+        # Event trigger: register the ask-update hook on any source that
+        # supports it (the WebSocket mirror); without one, only the sweep runs.
         _event_rung = "disabled by CRYPTOBOT_FAST_TRIGGER_EVENT_ENABLED=0"
         if config.FAST_TRIGGER_EVENT_ENABLED:
             if book_prefetch is not None and book_prefetch.set_ask_update_callback(
@@ -1468,7 +1252,7 @@ def main(argv: list[str] | None = None) -> int:
         on_job_missed=_on_job_missed,
     )
 
-    # Step 10: SIGTERM handler
+    # Step 10: signal handling.
     stop = threading.Event()
 
     def _shutdown(_signum, _frame):
@@ -1483,13 +1267,9 @@ def main(argv: list[str] | None = None) -> int:
         while not stop.is_set():
             stop.wait(1.0)
     finally:
-        # Drain any in-flight tick before closing the DB connection. With
-        # wait=False a mid-tick record_bet inside BEGIN IMMEDIATE would be
-        # rolled back by conn.close()'s implicit rollback — silent bet loss
-        # on SIGTERM (#10). Reliability finding #59: APScheduler's
-        # `shutdown(wait=True)` takes no timeout. Run on a helper thread
-        # joined at 35s so a hung CLOB-touching job can't stall the
-        # systemd grace window indefinitely.
+        # Wait for an in-flight tick before closing the DB, or a mid-tick write
+        # would be rolled back. APScheduler's shutdown(wait=True) has no
+        # timeout, so run it on a helper thread joined for at most 35s.
         shutdown_thread = threading.Thread(
             target=lambda: scheduler.shutdown(wait=True),
             name="cryptobot-scheduler-shutdown",
@@ -1502,25 +1282,17 @@ def main(argv: list[str] | None = None) -> int:
                 "scheduler.shutdown did not return within 35s; "
                 "proceeding with conn.close() — orphan jobs may roll back"
             )
-        # Stop the fast-trigger event worker after the scheduler drains (so the
-        # sweep can no longer fire) and BEFORE conns.close_all() closes the
-        # worker's own connection. Daemon thread + bounded join, so a hung scan
-        # can never stall the SIGTERM grace window.
+        # Stop the fast-entry worker after the scheduler drains and before
+        # closing connections. Bounded join.
         if _fast_trigger is not None:
             try:
                 _fast_trigger.stop()
             except Exception:  # noqa: BLE001 — shutdown must not raise
                 logger.warning("fast_trigger stop raised", exc_info=True)
-        # Stop the SSE publisher after the scheduler drains (no more on_tick
-        # enqueues) and BEFORE conns.close_all() closes its connection. It is
-        # a daemon thread with a bounded join, so it can never stall the
-        # SIGTERM grace window.
+        # Stop the publisher after the scheduler drains and before closing
+        # connections. Bounded join.
         _stop_publisher()
-        # Drain + stop the notify dispatcher after the scheduler drains (tick
-        # + jobs are the only producers) so queued non-critical events get a
-        # best-effort flush before exit (criticals never queue — they send
-        # inline at the call site). Daemon thread + bounded join — a hung
-        # Telegram can't stall the SIGTERM grace window either.
+        # Flush queued notifications before exit. Bounded join.
         notify_dispatcher.stop()
         if httpd is not None:
             httpd.shutdown()
@@ -1535,9 +1307,7 @@ def main(argv: list[str] | None = None) -> int:
         spot_client.close()
         gamma_client.close()
         clob_client.close()
-        # Close every per-thread connection opened through the handle plus the
-        # dashboard's dedicated connection (audit finding #1). The scheduler is
-        # already drained above, so no writer thread is mid-transaction.
+        # Close every per-thread connection and the dashboard's connection.
         conns.close_all()
         logger.info("shutdown complete")
 
