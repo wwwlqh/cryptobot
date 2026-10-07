@@ -5,7 +5,6 @@ import pytest
 from decimal import Decimal
 from types import SimpleNamespace
 
-from cryptobot import config
 from cryptobot.strategy.hgb_loader import HgbArtifact
 from cryptobot.strategy.partial_ret import PartialRetEngine
 from cryptobot.strategy.portfolio_loader import Sleeve

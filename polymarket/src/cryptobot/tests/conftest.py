@@ -13,7 +13,6 @@ from pathlib import Path
 
 import pytest
 
-from cryptobot import config
 from cryptobot.db import init_db
 
 

@@ -54,36 +54,3 @@ def test_passes_filter_requires_selected_offsets_and_thresholds() -> None:
     assert s._passes_filter(df, cfg).tolist() == [False, True, False]
 
 
-def test_dedup_collapses_second_offsets_but_keeps_entry_minute_decisions() -> None:
-    # Same (market, side, entry_minute) replicated at 4 seconds -> ONE bet (earliest
-    # second). A different entry_minute on the same market+side is a separate live
-    # decision and must survive. A different side likewise survives.
-    df = pd.DataFrame(
-        {
-            "market_slug": ["m1", "m1", "m1", "m1", "m1", "m1", "m2"],
-            "side": ["Up", "Up", "Up", "Up", "Up", "Down", "Up"],
-            "entry_minute": [2, 2, 2, 2, 3, 2, 2],
-            "entry_ts": [1040, 1030, 1050, 1035, 1200, 1030, 2000],
-            "offset_sec": [40, 30, 50, 35, 0, 30, 0],
-        }
-    )
-    out = s._dedup_one_per_market(df)
-    # (m1,Up,min2)x1, (m1,Up,min3)x1, (m1,Down,min2)x1, (m2,Up,min2)x1
-    assert len(out) == 4
-    m1_up2 = out[(out["market_slug"] == "m1") & (out["side"] == "Up") & (out["entry_minute"] == 2)]
-    assert m1_up2["entry_ts"].tolist() == [1030] and m1_up2["offset_sec"].tolist() == [30]
-
-
-def test_dedup_is_noop_for_offset0_baseline() -> None:
-    # Offset-0 has one second per (market,side,minute) decision, so dedup must not
-    # drop anything -> sec0 stays identical to the live baseline.
-    df = pd.DataFrame(
-        {
-            "market_slug": ["m1", "m1", "m2"],
-            "side": ["Up", "Down", "Up"],
-            "entry_minute": [2, 2, 3],
-            "entry_ts": [1000, 1000, 2000],
-            "offset_sec": [0, 0, 0],
-        }
-    )
-    assert len(s._dedup_one_per_market(df)) == 3

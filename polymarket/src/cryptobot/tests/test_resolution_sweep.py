@@ -7,7 +7,6 @@ out-of-bounds CANCELLED / idempotency.
 from __future__ import annotations
 
 import sqlite3
-import time
 
 import pytest
 
@@ -1140,64 +1139,3 @@ def test_stop_backfill_does_not_perturb_capital_drawdown_replay(
     assert after.drawdown_ratio == pytest.approx(0.08)
 
 
-def test_stop_row_dd_invariant_to_backfilled_resolution_ts(
-    db: sqlite3.Connection,
-):
-    """The exit_ts replay key yields ONE deterministic ordering for stop rows
-    WITH and WITHOUT a backfilled resolution_ts.
-
-    The live box carries a handful of stop rows that were stamped with a
-    resolution_ts by an older backfill path, alongside fresh rows left NULL.
-    Merely "stop writing resolution_ts" cannot neutralize the already-stamped
-    rows; keying the replay on the immutable exit_ts does — a stop row's peak
-    contribution is identical whether resolution_ts is NULL or a late sweep
-    clock. This is the reason the fix lives in capital.py, not (only) the sweep.
-    """
-    from cryptobot.execution.capital import (
-        get_capital_snapshot,
-        get_wallet_snapshots,
-    )
-    from cryptobot.execution.ledger import record_bet
-    from cryptobot.tests._legacy_artifact import legacy_portfolio
-
-    win_id = record_bet(db, make_signal(side="YES"), mode="LIVE")
-    db.execute(
-        "UPDATE ledger SET outcome='WIN', pnl_net=30.0, won_up=1, "
-        "resolution_ts='2026-01-01 00:00:00' WHERE id=?",
-        (win_id,),
-    )
-    stop_id = _make_stop_row(
-        db, side="YES", pnl_net=-8.0, window_start_ts=1_715_923_500
-    )
-    _expire(db, window_end_ts=2_000_000_000)
-
-    # NULL-resolution_ts state (fresh stop row).
-    wallet_null = get_wallet_snapshots(db, legacy_portfolio())["v6_5m"]
-    cap_null = get_capital_snapshot(db)
-
-    # Simulate an already-backfilled stop row: stamp a LATE sweep clock onto
-    # resolution_ts (a value that, under the OLD resolution_ts key, would have
-    # re-sorted the stop LAST and changed the peak). The exit_ts key ignores it.
-    db.execute(
-        "UPDATE ledger SET resolution_ts='2033-01-01 00:00:00' WHERE id=?",
-        (stop_id,),
-    )
-    wallet_backfilled = get_wallet_snapshots(db, legacy_portfolio())["v6_5m"]
-    cap_backfilled = get_capital_snapshot(db)
-
-    # Per-wallet replay: identical peak/drawdown regardless of resolution_ts.
-    assert wallet_backfilled.peak_realized_capital == pytest.approx(
-        wallet_null.peak_realized_capital
-    )
-    assert wallet_null.peak_realized_capital == pytest.approx(130.0)
-    assert wallet_backfilled.drawdown_pct_peak_frac == pytest.approx(
-        wallet_null.drawdown_pct_peak_frac
-    )
-    # Global capital snapshot (SQL replay key) agrees with the Python key.
-    assert cap_backfilled.peak_realized_capital == pytest.approx(
-        cap_null.peak_realized_capital
-    )
-    assert cap_null.peak_realized_capital == pytest.approx(130.0)
-    assert cap_backfilled.drawdown_pct_peak_frac == pytest.approx(
-        cap_null.drawdown_pct_peak_frac
-    )

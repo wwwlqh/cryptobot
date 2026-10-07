@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import logging
 import math
-from typing import Callable, Optional, Union
+from typing import Optional, Union
 
 logger = logging.getLogger(__name__)
 

@@ -17,10 +17,10 @@ import logging
 import sys
 import threading
 import time
-from concurrent.futures import Future, TimeoutError as FuturesTimeoutError
+from concurrent.futures import Future
 from types import ModuleType, SimpleNamespace
 from typing import Optional
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 

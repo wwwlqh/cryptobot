@@ -32,7 +32,6 @@ import sqlite3
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 
-from cryptobot.db.connection import utc_now_sql
 from cryptobot.execution.ledger import BetSignal, record_bet
 from cryptobot.execution.order_attempts import (
     LiveOrderAttempt,

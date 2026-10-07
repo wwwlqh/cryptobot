@@ -20,7 +20,6 @@ from cryptobot.strategy.spec_v2 import (
     in_offset_window,
     WindowDecider,
 )
-from cryptobot.strategy.score import _ask_in_bucket
 
 # Reference evaluator lives under polymarket/backtest/lib; the repo root is on
 # sys.path via pyproject's pythonpath (same as test_canonical_evaluator.py).

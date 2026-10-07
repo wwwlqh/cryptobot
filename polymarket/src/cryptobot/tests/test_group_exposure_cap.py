@@ -15,14 +15,12 @@ import pytest
 from cryptobot.db import backfill_wallet_groups, init_db
 from cryptobot.db.connection import utc_now_sql
 from cryptobot.execution.capital import (
-    GroupCapState,
     get_group_state,
     get_wallet_snapshots,
 )
 from cryptobot.execution.gates import GateInput, evaluate_gates
 from cryptobot.execution.operator_control import LIVE, OperatorState
 from cryptobot.execution.pipeline import _live_wallet_skip_reason
-from cryptobot.strategy.portfolio_loader import load_sleeves
 from cryptobot.tests._legacy_artifact import legacy_portfolio
 
 

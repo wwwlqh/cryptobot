@@ -29,7 +29,7 @@ from concurrent.futures import (
     ThreadPoolExecutor,
     TimeoutError as FuturesTimeoutError,
 )
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Optional
 
@@ -39,7 +39,6 @@ from cryptobot.execution.capital import (
 )
 from cryptobot.execution.operator_control import (
     LIVE,
-    TRANSFER_LOCK,
     OperatorControlError,
     clear_transfer_lock,
     enter_transfer_lock,

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import sqlite3
 
-import pytest
 
 from cryptobot.execution.ledger import record_bet
 from cryptobot.reconciliation.orphan_pending import reconcile_orphan_pending

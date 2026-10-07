@@ -10,7 +10,6 @@ built from a snapshot + deltas rather than a single payload.
 """
 from __future__ import annotations
 
-import time
 
 from cryptobot_polymarket.ws_mirror import ClobBookWsMirror
 from cryptobot_polymarket.clob import TokenBucket, fetch_books_batch

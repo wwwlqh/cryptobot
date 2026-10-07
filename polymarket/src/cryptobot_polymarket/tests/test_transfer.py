@@ -15,16 +15,13 @@ test_operator_control.py, alongside the function (panel verdict D4-1).
 from __future__ import annotations
 
 import sqlite3
-from typing import Any
 
 import pytest
 
 from cryptobot.db import init_db
 from cryptobot.execution.operator_control import (
     LIVE,
-    STOPPED_PROCESSING,
     TRANSFER_LOCK,
-    enter_transfer_lock,
     get_operator_state,
     seed_operator_control_state,
     start_processing,

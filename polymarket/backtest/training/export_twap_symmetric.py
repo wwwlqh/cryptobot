@@ -13,17 +13,12 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import time
 from pathlib import Path
 
-import joblib
-import numpy as np
 import pandas as pd
-from sklearn.ensemble import HistGradientBoostingClassifier
 
 from polymarket.backtest import REPO_ROOT
 from polymarket.backtest.studies.tick_latency.run_twap_wfo_full import (
-    SEED,
     _load_side_frame,
 )
 

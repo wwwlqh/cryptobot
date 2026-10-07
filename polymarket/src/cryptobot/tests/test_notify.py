@@ -20,8 +20,6 @@ import pytest
 from cryptobot.execution import notify
 from cryptobot.execution.notify import (
     NotifyDispatcher,
-    NotifyResult,
-    _emit_critical,
     _format_message,
     reset_rate_limit,
     send_event,

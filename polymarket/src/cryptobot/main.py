@@ -314,7 +314,6 @@ def main(argv: list[str] | None = None) -> int:
     from cryptobot.reconciliation.orphan_pending import reconcile_orphan_pending
     from cryptobot.runtime_secrets import get_config
     from cryptobot.scheduler.tick import TickRunner, start_scheduler
-    from cryptobot.scheduler.resolution_sweep import run_resolution_sweep
     from cryptobot.strategy.partial_ret import PartialRetEngine
     from cryptobot.strategy.portfolio_loader import load_sleeves
 

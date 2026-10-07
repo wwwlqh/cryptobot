@@ -22,7 +22,6 @@ import pytest
 
 from cryptobot.db import init_db
 from cryptobot.persistence.wallet_reconciliation import (
-    ReconciliationRun,
     WalletReconciler,
 )
 

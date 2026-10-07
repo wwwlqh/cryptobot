@@ -32,7 +32,6 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace as dataclass_replace
 from datetime import datetime, timezone
-from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Callable, Optional
 from zoneinfo import ZoneInfo
 
@@ -76,7 +75,6 @@ from cryptobot.execution.order_attempts import (
 )
 from cryptobot.execution.operator_control import (
     LIVE,
-    STOPPED_PROCESSING,
     TRANSFER_LOCK,
     OperatorState,
     get_operator_state,
@@ -683,15 +681,6 @@ def _bucket_or_none(b: Optional[int]) -> Optional[int]:
     if b is None or b < 0:
         return None
     return b
-
-
-def _finite_float_or_none(value: Optional[float]) -> Optional[float]:
-    if not isinstance(value, (int, float)):
-        return None
-    value_f = float(value)
-    if not math.isfinite(value_f):
-        return None
-    return value_f
 
 
 def _score_cell_for(

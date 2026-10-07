@@ -21,7 +21,6 @@ from cryptobot.execution.operator_control import (
     set_wallet_mode,
     start_processing,
 )
-from cryptobot.strategy.portfolio_loader import load_sleeves
 from cryptobot.tests._legacy_artifact import legacy_portfolio
 
 
@@ -83,7 +82,6 @@ def test_full_group_cap_blocks_sibling_wallet_in_same_group(
     pending would jump to $104, above the $100 cap."""
     from cryptobot.execution.capital import get_group_state
     from cryptobot.execution.gates import GateInput, evaluate_gates
-    from cryptobot.strategy.portfolio_loader import Sleeve
 
     portfolio = legacy_portfolio()
     start_processing(db)

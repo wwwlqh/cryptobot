@@ -240,29 +240,6 @@ def _flat_metrics(df: pd.DataFrame) -> dict:
 DECISION_KEY = ["market_slug", "side", "entry_minute"]
 
 
-def _dedup_one_per_market(df: pd.DataFrame) -> pd.DataFrame:
-    """Collapse the second-offset replication to one bet per *decision*.
-
-    A "decision" is (market, side, entry_minute) — the integer minute slice the
-    live HGB/ORB strategy acts on. A config that admits several offsets
-    (e.g. {30,35,40,50}) does NOT get to bet the same decision four times: in live
-    trading you enter that minute once, at the first second whose gate fires.
-    Keying on (market, side, entry_minute) and keeping the earliest passing second
-    removes the replicated near-duplicate offset bets WITHOUT touching legitimate
-    separate entry-minute decisions on the same market.
-
-    Critically, this is a no-op for the offset-0 baseline (one second per decision),
-    so sec0 stays identical to the parity-certified live baseline.
-    """
-    if df.empty:
-        return df
-    return (
-        df.sort_values(DECISION_KEY + ["entry_ts"])
-        .drop_duplicates(DECISION_KEY, keep="first")
-        .reset_index(drop=True)
-    )
-
-
 TRAIN_FOLDS = ("A", "B", "C")
 OOS_FOLD = "D"
 

@@ -20,7 +20,6 @@ artifact) and is skipped when that gitignored bundle is absent.
 from __future__ import annotations
 
 import pandas as pd
-import pytest
 
 from cryptobot.strategy.hgb_loader import (
     HgbArtifact,

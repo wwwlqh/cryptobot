@@ -17,7 +17,6 @@ import argparse
 import datetime as dt
 import json
 import math
-import time
 import zipfile
 from pathlib import Path
 

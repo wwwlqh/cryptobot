@@ -21,7 +21,6 @@ Exit codes:
 from __future__ import annotations
 
 import argparse
-import json
 import logging
 import sys
 from typing import Optional

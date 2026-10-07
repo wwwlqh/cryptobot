@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import os
 import sys
-from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
@@ -20,7 +19,6 @@ for p in (_REPO, os.path.join(_REPO, "core", "src")):
         sys.path.insert(0, p)
 
 from polymarket.backtest.training import modeling as ev  # noqa: E402
-from polymarket.backtest.training import checkpoint as cg  # noqa: E402
 
 from polymarket.backtest import BT_RUNS_DIR  # noqa: E402
 
@@ -148,65 +146,6 @@ def side_frame(pool: pd.DataFrame) -> pd.DataFrame:
 
 def fee(ask: np.ndarray) -> np.ndarray:
     return ev.POLY_FEE_THETA * ask * (1.0 - ask)
-
-
-def train_mask(sf: pd.DataFrame, test_fold: str) -> pd.Series:
-    """Expanding window: all folds strictly before test_fold, with embargo."""
-    idx = FOLD_ORDER.index(test_fold)
-    train_folds = FOLD_ORDER[:idx]
-    m = sf["fold"].isin(train_folds)
-    test_start = sf.loc[sf["fold"] == test_fold, "entry_ts"].min()
-    if np.isfinite(test_start):
-        m &= sf["entry_ts"] < (test_start - EMBARGO_S)
-    return m
-
-
-def fit_rf_features(sf_train: pd.DataFrame, sf_all: pd.DataFrame, seed: int = 42) -> pd.DataFrame:
-    """Fit per-(coin, interval, sec) RF slices on train rows and attach
-    model_p_side / rf_edge to ALL rows (mirrors cg._fit_rf_slices semantics)."""
-    # n_jobs capped (not -1): full-core RF fits have spiked RAM on this laptop
-    args = SimpleNamespace(rf_n_estimators=200, rf_n_jobs=4, seed=seed)
-    params = cg._rf_params(args)
-    train_rows = sf_train[sf_train["side_up"] == 1]  # RF is per-market, not per-side
-    estimators, _ = cg._fit_rf_slices(train_rows, params)
-    probs = cg._rf_probs_checkpoint(sf_all, estimators)
-    out = sf_all.copy()
-    p_up = np.asarray(probs, dtype=float)
-    out["model_p_side"] = np.where(out["side_up"] == 1, p_up, 1.0 - p_up)
-    out["rf_edge"] = out["model_p_side"] - out["ask"] - fee(out["ask"].to_numpy())
-    return out
-
-
-def fit_hgb(sf_train: pd.DataFrame, feature_cols: list[str], seed: int = 42,
-            sample_weight_mode: str = "recent_chunk_boost"):
-    """Fit one HGB pipeline (5m manifest hyperparams) via the committed trainer."""
-    pipe = ev._build_hgb_pipe(
-        seed=seed, hgb_max_iter=120, hgb_learning_rate=0.04,
-        hgb_max_leaf_nodes=63, hgb_l2_regularization=0.02,
-    )
-    train = sf_train.copy()
-    train["y"] = train["win"].astype(np.int8)
-    return ev._fit_pipe(pipe, train, feature_cols, sample_weight_mode)
-
-
-def score_hgb(pipe, sf: pd.DataFrame, feature_cols: list[str]) -> np.ndarray:
-    return pipe.predict_proba(sf[feature_cols])[:, 1]
-
-
-def block_bootstrap_ci(pnl: np.ndarray, days: np.ndarray, n_boot: int = 1000, alpha: float = 0.10, seed: int = 0):
-    """Day-block bootstrap CI on mean pnl (PROTOCOL uncertainty rule)."""
-    rng = np.random.default_rng(seed)
-    uniq = np.unique(days)
-    if len(uniq) < 2 or len(pnl) == 0:
-        return (np.nan, np.nan)
-    per_day = {d: pnl[days == d] for d in uniq}
-    means = np.empty(n_boot)
-    for b in range(n_boot):
-        pick = rng.choice(uniq, size=len(uniq), replace=True)
-        sample = np.concatenate([per_day[d] for d in pick])
-        means[b] = sample.mean()
-    lo, hi = np.quantile(means, [alpha / 2, 1 - alpha / 2])
-    return (float(lo), float(hi))
 
 
 # ============================================================================

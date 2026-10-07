@@ -4,7 +4,6 @@ messages are fed directly and the connection is a fake context manager."""
 from __future__ import annotations
 
 import json
-import threading
 import time
 
 import pytest

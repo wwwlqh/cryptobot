@@ -21,15 +21,12 @@ from cryptobot.db import backfill_wallet_groups, init_db
 from cryptobot.db.connection import utc_now_sql
 from cryptobot.execution.operator_control import (
     boot_operator_state,
-    set_wallet_mode,
     start_processing,
-    stop_processing,
 )
 from cryptobot.observability.sse_server import (
     PostRouter,
     derive_session_token,
 )
-from cryptobot.strategy.portfolio_loader import load_sleeves
 from cryptobot.tests._legacy_artifact import legacy_portfolio
 
 

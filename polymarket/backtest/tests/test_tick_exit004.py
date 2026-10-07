@@ -1,6 +1,5 @@
 """Tests for the canonical subminute + exit004 tick engine."""
 import numpy as np
-import pandas as pd
 import pytest
 
 from polymarket.backtest.engine import tick_exit004 as te
@@ -82,15 +81,6 @@ def test_fak_allows_partial_fill_under_padded_limit():
     assert fill.cash_usd == pytest.approx(1.205)
     assert fill.shares == pytest.approx(1.5)
     assert fill.vwap == pytest.approx(1.205 / 1.5)
-
-
-def test_fok_requires_full_size_and_respects_trigger_bid():
-    levels = ((0.72, 1.0), (0.70, 1.0), (0.69, 10.0))
-    assert te.fok_sell(levels, 2.5, 0.70) is None
-    fill = te.fok_sell(levels, 2.0, 0.70)
-    assert fill is not None
-    assert fill.cash_usd == pytest.approx(1.42)
-    assert fill.vwap == pytest.approx(0.71)
 
 
 def _tick(seconds, *, asks, ask_sizes, bids, bid_sizes):

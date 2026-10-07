@@ -5,7 +5,6 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pandas as pd
-import pytest
 
 from polymarket.backtest.engine import tick_exit004 as te
 from polymarket.backtest.lib import tick_store

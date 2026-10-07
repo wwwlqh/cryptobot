@@ -18,7 +18,6 @@ wallet_reconciliation_runs (those land in Phase 2 — U7 + U9).
 from __future__ import annotations
 
 import sqlite3
-import time
 from dataclasses import dataclass, field
 
 import pytest
@@ -28,7 +27,6 @@ from cryptobot.execution.operator_control import (
     BlockedError,
     ConcurrentMutationError,
     DRY,
-    LIVE,
     OperatorControlError,
     RateLimitError,
     get_wallet_mode,

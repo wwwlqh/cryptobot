@@ -32,7 +32,6 @@ import logging
 import sqlite3
 import weakref
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from typing import Callable, Optional, TYPE_CHECKING
 
 from cryptobot.db.connection import utc_now_sql
@@ -519,7 +518,6 @@ def load_wallet_mode_state(conn: sqlite3.Connection) -> dict[str, str]:
 
 
 from cryptobot.execution._time_utils import (
-    parse_iso as _parse_iso,
     seconds_since as _seconds_since,
 )
 

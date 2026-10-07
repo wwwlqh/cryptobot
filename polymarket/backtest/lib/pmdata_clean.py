@@ -94,19 +94,6 @@ def load_outcomes(path: str = OUTCOMES_PATH, ok_only: bool = True) -> pd.DataFra
     return out
 
 
-def _coerce_price_array(value) -> np.ndarray | None:
-    if value is None or (isinstance(value, float) and np.isnan(value)):
-        return None
-    if isinstance(value, np.ndarray):
-        return value.astype(np.float64, copy=False)
-    if isinstance(value, (list, tuple)):
-        return np.asarray(value, dtype=np.float64)
-    if isinstance(value, str):
-        # object-of-str variant: "[0.54 0.55 ...]" possibly with newlines
-        return np.fromstring(value.strip("[]"), sep=" ", dtype=np.float64)
-    return np.asarray(value, dtype=np.float64)
-
-
 # RETIRED 2026-08-03: ``flag_degenerate_books`` (QA flags for a pool builder),
 # ``SnapshotAudit`` / ``audit_snapshot_dir`` / ``audit_report_frame`` (the raw
 # ``poly_snapshot/`` tree audit) and ``SNAPSHOT_ROOT``. That tree was deleted

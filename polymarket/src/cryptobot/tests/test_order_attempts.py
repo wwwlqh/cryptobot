@@ -15,14 +15,12 @@ Per the 2026-05-24-001 per-strategy LIVE deploy plan §U5 / D-LIVE-28:
 from __future__ import annotations
 
 import sqlite3
-import time
 
 import pytest
 
 from cryptobot.db import init_db
 from cryptobot.execution.ledger import BetSignal
 from cryptobot.execution.order_attempts import (
-    LiveOrderAttempt,
     SUBMITTING,
     SUBMITTED,
     LINKED,

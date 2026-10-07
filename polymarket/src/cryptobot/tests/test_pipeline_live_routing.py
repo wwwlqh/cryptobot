@@ -16,12 +16,11 @@ Covers the per-strategy mode router in `_commit_cell` and
 from __future__ import annotations
 
 import sqlite3
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Optional
 
 import pytest
 
-from cryptobot import config
 from cryptobot.venues.types import BookSnapshot
 from cryptobot_polymarket.gamma import PolyMarket
 from cryptobot.data.binance import BinanceSpot
@@ -35,7 +34,7 @@ from cryptobot.execution.operator_control import (
 from cryptobot.execution.pipeline import TickDeps, run_scanner_tick
 from cryptobot.execution.types import OrderResult
 from cryptobot.strategy.partial_ret import PartialRetEngine
-from cryptobot.strategy.portfolio_loader import V6Portfolio, load_sleeves
+from cryptobot.strategy.portfolio_loader import V6Portfolio
 from cryptobot.tests._legacy_artifact import legacy_portfolio
 from cryptobot.tests._fixtures import seed_for_tests
 from cryptobot.tests._stub_scorer import install_fake_scorer

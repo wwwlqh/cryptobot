@@ -10,8 +10,6 @@ scheduler ticked ~60 times and the SSE broadcaster received events.
 
 from __future__ import annotations
 
-import sqlite3
-import threading
 import time
 from pathlib import Path
 

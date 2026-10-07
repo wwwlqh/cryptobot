@@ -7,13 +7,11 @@ drawdown denominator is INITIAL_BANKROLL (constant), NOT realized_capital.
 from __future__ import annotations
 
 import sqlite3
-import time
 
 import pytest
 
-from cryptobot.execution.capital import get_capital_snapshot, get_wallet_snapshots
+from cryptobot.execution.capital import get_wallet_snapshots
 from cryptobot.execution.ledger import BetSignal, record_bet
-from cryptobot.strategy.portfolio_loader import load_sleeves
 from cryptobot.tests._legacy_artifact import legacy_portfolio
 from cryptobot.tests.test_slot_state import make_signal
 
@@ -82,67 +80,6 @@ class TestExtractablePnl:
         # 20 realized minus 8 in-flight = 12.
         assert extractable_pnl_for_wallet(db, "v6_5m") == pytest.approx(12.0)
         assert extractable_pnl_by_wallet(db).get("v6_5m") == pytest.approx(12.0)
-
-
-class TestCapitalSnapshot:
-    def test_empty_ledger_returns_bankroll(self, db: sqlite3.Connection) -> None:
-        snap = get_capital_snapshot(db)
-        assert snap.realized_capital == 100.0
-        assert snap.peak_realized_capital == 100.0
-        assert snap.pending_exposure == 0.0
-        assert snap.drawdown_ratio == 0.0
-        assert snap.drawdown_pct_peak_frac == 0.0
-        assert snap.n_settled == 0
-
-    def test_settled_pnl_aggregated(self, db: sqlite3.Connection) -> None:
-        for pnl, outcome in ((2.0, "WIN"), (-1.0, "LOSS"), (3.0, "WIN")):
-            record_bet(db, make_signal(bet_size=1.0))
-            time.sleep(0.01)
-            _settle_last(db, pnl, outcome)
-        snap = get_capital_snapshot(db)
-        assert snap.realized_capital == pytest.approx(104.0)
-        assert snap.peak_realized_capital == pytest.approx(104.0)
-        assert snap.drawdown_ratio == 0.0
-        assert snap.n_settled == 3
-
-    def test_drawdown_uses_initial_bankroll_denominator(
-        self, db: sqlite3.Connection
-    ) -> None:
-        # D14: peak=105, realized=97 â†’ drawdown = (105-97)/100 = 0.08
-        # NOT (105-97)/97 = 0.0825. The denominator pin matters.
-        for pnl, outcome in ((5.0, "WIN"), (-8.0, "LOSS")):
-            record_bet(db, make_signal(bet_size=1.0))
-            time.sleep(0.01)
-            _settle_last(db, pnl, outcome)
-        snap = get_capital_snapshot(db)
-        assert snap.realized_capital == pytest.approx(97.0)
-        assert snap.peak_realized_capital == pytest.approx(105.0)
-        assert snap.drawdown_ratio == pytest.approx(0.08, abs=1e-6)
-        assert snap.drawdown_pct_peak_frac == pytest.approx(8.0 / 105.0, abs=1e-6)
-
-    def test_pending_exposure_sums(self, db: sqlite3.Connection) -> None:
-        record_bet(db, make_signal(bet_size=4.0))
-        record_bet(db, make_signal(bet_size=4.0, sleeve="v6_15m", entry_minute=7))
-        snap = get_capital_snapshot(db)
-        assert snap.pending_exposure == pytest.approx(8.0)
-        assert snap.pending_by_sleeve == {"v6_5m": 4.0, "v6_15m": 4.0}
-
-    def test_pnl_by_sleeve_breakdown(self, db: sqlite3.Connection) -> None:
-        # one settled WIN per sleeve
-        record_bet(db, make_signal(bet_size=1.0, sleeve="v6_5m"))
-        time.sleep(0.01)
-        _settle_last(db, 2.0)
-        record_bet(db, make_signal(bet_size=1.0, sleeve="v6_15m", entry_minute=7))
-        time.sleep(0.01)
-        _settle_last(db, -0.5, outcome="LOSS")
-        snap = get_capital_snapshot(db)
-        assert snap.pnl_by_sleeve == {"v6_5m": 2.0, "v6_15m": -0.5}
-
-    def test_pending_not_in_realized(self, db: sqlite3.Connection) -> None:
-        record_bet(db, make_signal(bet_size=10.0))
-        snap = get_capital_snapshot(db)
-        assert snap.realized_capital == 100.0
-        assert snap.pending_exposure == 10.0
 
 
 class TestWalletSnapshots:

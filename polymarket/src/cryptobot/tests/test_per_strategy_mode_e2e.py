@@ -28,12 +28,9 @@ from cryptobot.execution.operator_control import (
     boot_operator_state,
     get_operator_state,
     get_wallet_mode,
-    seed_operator_control_state,
-    seed_wallet_modes,
     set_wallet_mode,
     start_processing,
 )
-from cryptobot.strategy.portfolio_loader import load_sleeves
 from cryptobot.tests._legacy_artifact import legacy_portfolio
 
 
@@ -240,7 +237,6 @@ class TestModeFlipAudit:
         on the same wallet, the stale one raises and must refetch."""
         from cryptobot.execution.operator_control import (
             ConcurrentMutationError,
-            DRY,
         )
 
         start_processing(boot_db)

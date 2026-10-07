@@ -210,21 +210,6 @@ def _worst_rolling_dd_frac(pls: np.ndarray, capital: float, window: int = 30) ->
     return float((dd / np.maximum(roll_peak.to_numpy(), 1e-9)).max())
 
 
-def _empty_calibration() -> dict:
-    return {
-        "n_bets": 0,
-        "n_buckets": 0,
-        "mean_pred": None,
-        "realized_wr": None,
-        "calibration_gap": None,
-        "high_conf_n": 0,
-        "high_conf_mean_pred": None,
-        "high_conf_realized_wr": None,
-        "high_conf_gap": None,
-        "buckets": [],
-    }
-
-
 def _prepare_base_frame(coins: set[str], intervals: set[str], label_col: str) -> pd.DataFrame:
     t0 = time.time()
     df = _load_full_table().copy()

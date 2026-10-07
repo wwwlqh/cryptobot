@@ -6,7 +6,6 @@ in test_pipeline_tick.py.
 """
 from __future__ import annotations
 
-import sqlite3
 
 import pytest
 

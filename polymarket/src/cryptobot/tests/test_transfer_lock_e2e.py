@@ -17,15 +17,13 @@ from pathlib import Path
 import pytest
 
 from cryptobot.db import backfill_wallet_groups, init_db
-from cryptobot.db.connection import utc_now_sql
 from cryptobot.execution.operator_control import (
     boot_operator_state,
     enter_transfer_lock,
     set_wallet_mode,
     start_processing,
 )
-from cryptobot.execution.pipeline import TickDeps, run_scanner_tick
-from cryptobot.strategy.portfolio_loader import load_sleeves
+from cryptobot.execution.pipeline import run_scanner_tick
 from cryptobot.tests._legacy_artifact import legacy_portfolio
 from cryptobot.tests._fixtures import seed_for_tests
 from cryptobot.tests.test_pipeline_live_routing import (

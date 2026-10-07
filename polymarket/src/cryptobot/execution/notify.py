@@ -23,7 +23,6 @@ import logging
 import logging.handlers
 import os
 import queue
-import sqlite3
 import threading
 import time
 from dataclasses import dataclass

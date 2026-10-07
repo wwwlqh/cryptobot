@@ -9,7 +9,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
-from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -45,31 +44,6 @@ class Fill:
     cash_usd: float
     shares: float
     vwap: float
-
-
-@dataclass(frozen=True)
-class EntryQuote:
-    """Decision-book amount and limit before the live FAK pad."""
-
-    amount_usd: float
-    shares: float
-    vwap: float
-    limit_price: float
-    realized_edge: float
-
-
-@dataclass(frozen=True)
-class ExitResult:
-    """Gross close result; the bankroll replay applies fill fees."""
-
-    stopped: bool
-    stop_triggered: bool
-    attempts: int
-    close_ts: float
-    gross_return_usd: float
-    exit_fill: Fill | None
-    trigger_bid: float | None
-    trigger_model_p: float | None
 
 
 @dataclass
@@ -160,11 +134,6 @@ def entry_fee_usd(price: float, shares: float) -> float:
     return _live_entry_fee(entry_price=float(price), shares=float(shares))
 
 
-def model_probability(pred_edge, ask):
-    """Recover side-specific HGB probability from WFO edge and ask."""
-    return pred_edge + ask + fee(ask)
-
-
 def fak_buy(
     levels: tuple[tuple[float, float], ...], amount_usd: float, limit_price: float
 ) -> Fill | None:
@@ -186,36 +155,6 @@ def fak_buy(
     if shares <= 0:
         return None
     return Fill(cash, shares, cash / shares)
-
-
-def fok_sell(
-    levels: tuple[tuple[float, float], ...], shares: float, limit_price: float
-) -> Fill | None:
-    """Full-size FOK SELL at or above the trigger bid."""
-    if shares <= 0 or not math.isfinite(shares):
-        return None
-    remaining = shares
-    proceeds = sold = 0.0
-    for price, size in levels:
-        if price + 1e-12 < limit_price:
-            break
-        take = min(size, remaining)
-        proceeds += take * price
-        sold += take
-        remaining -= take
-        if remaining <= 1e-9:
-            break
-    if remaining > max(1e-8, shares * 1e-8):
-        return None
-    return Fill(proceeds, sold, proceeds / sold)
-
-
-def should_stop(*, bid: float, model_p: float, entry_fill: float, band: float) -> bool:
-    """PURE_STOP_04 predicate, equivalent to the live implementation."""
-    values = (bid, model_p, entry_fill, band)
-    if not all(math.isfinite(float(value)) for value in values):
-        return False
-    return bid < entry_fill and bid >= model_p + band
 
 
 def _levels(

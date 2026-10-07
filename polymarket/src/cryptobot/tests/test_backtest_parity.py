@@ -36,7 +36,6 @@ import pytest
 from cryptobot import config
 from cryptobot.strategy.parity import cash_pnl as live_cash_pnl
 from cryptobot.strategy.parity import unit_pnl as live_unit_pnl
-from cryptobot.strategy.portfolio_loader import load_sleeves
 from cryptobot.tests._legacy_artifact import legacy_portfolio
 
 
@@ -226,7 +225,7 @@ class TestParityExposureCapBinary:
     partial-fill. Mirrors `backtest/optimize.py:404 continue`."""
 
     def test_gate_fires_at_breach(self):
-        from cryptobot.execution.gates import GateInput, evaluate_gates
+        from cryptobot.execution.gates import evaluate_gates
         from cryptobot.tests.test_gates import make_input
 
         # pending just below the live exposure cap + new bet -> breach -> SKIP,

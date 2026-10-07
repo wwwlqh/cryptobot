@@ -10,9 +10,6 @@ from __future__ import annotations
 
 import json
 import os
-import sqlite3
-import threading
-import time
 import urllib.error
 import urllib.request
 from http.cookies import SimpleCookie
@@ -28,7 +25,6 @@ from cryptobot.observability.sse_server import (
     derive_session_token,
     start_server,
 )
-from cryptobot.strategy.portfolio_loader import load_sleeves
 from cryptobot.tests._legacy_artifact import legacy_portfolio
 
 

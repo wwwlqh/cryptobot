@@ -138,15 +138,6 @@ def erc20_transfer_calldata(to_address: str, amount_base_units: int) -> str:
     )
 
 
-def _validate_bytes32(value: str, *, name: str) -> bytes:
-    text = (value or "").strip()
-    if text.startswith("0x"):
-        text = text[2:]
-    if len(text) != 64 or any(c not in "0123456789abcdefABCDEF" for c in text):
-        raise ValueError(f"{name} must be a 32-byte hex value.")
-    return bytes.fromhex(text)
-
-
 def derive_wallets(
     private_key: str,
     *,

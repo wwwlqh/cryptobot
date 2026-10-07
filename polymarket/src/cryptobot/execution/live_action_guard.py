@@ -24,7 +24,6 @@ Phase 1 deploy because no live machinery exists yet.
 from __future__ import annotations
 
 import sqlite3
-from datetime import datetime, timezone
 from typing import Optional
 
 from cryptobot.execution.operator_control import (
@@ -40,7 +39,6 @@ from cryptobot.execution.strategy_constants import (
 
 
 from cryptobot.execution._time_utils import (
-    parse_iso as _parse_iso,
     seconds_since as _seconds_since,
 )
 

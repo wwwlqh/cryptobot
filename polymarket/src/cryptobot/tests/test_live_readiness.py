@@ -14,14 +14,12 @@ import json
 import sqlite3
 from types import SimpleNamespace
 from typing import Optional
-from unittest.mock import MagicMock
 
 import pytest
 
 from cryptobot.db import init_db
 from cryptobot.db.connection import utc_now_sql
 from cryptobot.execution.live_readiness import (
-    ReadinessReport,
     _REPORT_FIELD_WHITELIST,
     _derive_topology,
     evaluate_readiness,

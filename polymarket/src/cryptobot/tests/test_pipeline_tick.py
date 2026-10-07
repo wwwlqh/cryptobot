@@ -6,9 +6,7 @@ plan, plus the D5 two-phase loop and the D10 market-level dedup.
 
 from __future__ import annotations
 
-import shutil
 import sqlite3
-import math
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from types import SimpleNamespace

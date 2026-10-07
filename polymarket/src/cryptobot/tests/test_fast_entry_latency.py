@@ -11,7 +11,6 @@ Pins the two things that must hold for the cache to be safe:
 
 from __future__ import annotations
 
-import math
 import time
 from types import SimpleNamespace
 

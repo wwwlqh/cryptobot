@@ -6,11 +6,7 @@ so install_remote.sh's pre-deploy probe can fail closed.
 
 from __future__ import annotations
 
-import sqlite3
-import sys
 from pathlib import Path
-from types import ModuleType
-from unittest.mock import MagicMock, patch
 
 import pytest
 

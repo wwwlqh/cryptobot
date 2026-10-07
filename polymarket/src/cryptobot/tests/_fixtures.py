@@ -12,7 +12,6 @@ from __future__ import annotations
 
 from cryptobot.strategy.partial_ret import (
     PartialRetEngine,
-    RV_1H_WINDOW_MINUTES,
     _floor_to,
 )
 

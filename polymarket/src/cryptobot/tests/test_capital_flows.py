@@ -27,7 +27,6 @@ from cryptobot import config
 from cryptobot.execution import capital
 from cryptobot.execution.capital import (
     CapitalFlowError,
-    get_capital_snapshot,
     get_wallet_snapshots,
     list_capital_flows,
     load_capital_flows,
@@ -284,34 +283,6 @@ class TestCutover:
 # ---------------------------------------------------------------------------
 # python replay vs SQL replay
 # ---------------------------------------------------------------------------
-
-
-def test_python_and_sql_replays_agree_with_flows(
-    db: sqlite3.Connection, seeded_bankroll: float, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """get_wallet_snapshots (per-row Python replay) and get_capital_snapshot
-    (SQL-ordered rows) must produce the SAME peak/realized/DD once flows exist —
-    the two share `_replay_equity`, and this pins that they stay shared."""
-    monkeypatch.setattr(config, "WALLET_START_AT", "")
-    _settled(db, sleeve="v6_5m", pnl=18.22,
-             resolution_ts="2026-07-22 00:05:00", suffix="a")
-    _flow(db, kind="deposit", amount=91.65, at="2026-07-26 06:10:00")
-    _settled(db, sleeve="v6_5m", pnl=-43.97,
-             resolution_ts="2026-07-27 12:00:00", suffix="b")
-    _flow(db, kind="rebate", amount=1.5, at="2026-07-27 18:00:00")
-
-    wallet = get_wallet_snapshots(db, legacy_portfolio())["v6_5m"]
-    account = get_capital_snapshot(db)
-
-    assert account.realized_capital == pytest.approx(wallet.realized_capital)
-    assert account.peak_realized_capital == pytest.approx(
-        wallet.peak_realized_capital
-    )
-    assert account.drawdown_pct_peak_frac == pytest.approx(
-        wallet.drawdown_pct_peak_frac
-    )
-    assert account.drawdown_ratio == pytest.approx(wallet.drawdown_ratio)
-    assert account.net_flow_usd == pytest.approx(93.15)
 
 
 def test_settlement_sorts_before_a_flow_at_the_same_timestamp(

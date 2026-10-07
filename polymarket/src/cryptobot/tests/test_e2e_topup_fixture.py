@@ -11,8 +11,6 @@ without relying on live market behavior.
 from __future__ import annotations
 
 import sqlite3
-from dataclasses import dataclass
-from typing import Optional
 
 import pytest
 
@@ -25,7 +23,6 @@ from cryptobot.strategy.partial_ret import PartialRetEngine
 from cryptobot.tests._fixtures import seed_for_tests
 from cryptobot.tests._legacy_artifact import legacy_portfolio
 from cryptobot.tests._stub_scorer import install_fake_scorer
-from cryptobot.strategy.portfolio_loader import load_sleeves
 
 
 # 2026-07-31: the stub RF forest + synthetic LUT this fixture used to build fed
