@@ -1,47 +1,36 @@
-"""Binance public-market live spot adapter.
+"""Live spot prices from Binance's public market-data API.
 
-The legacy mode uses ``GET /api/v3/ticker/24hr`` with a batched ``symbols``
-parameter and ``type=MINI``.  The production TWAP mode instead uses one
-``GET /api/v3/klines?interval=1s`` request per configured coin and column 4
-(``close``), matching the ``binance_1s_forward`` tape used by the backtest.
-The ticker mode remains available for non-TWAP callers and existing tests.
+Two modes. Production (TWAP) mode makes one ``GET /api/v3/klines?interval=1s``
+request per coin and uses column 4 (``close``), the same field as the
+``binance_1s_forward`` tape the backtest uses. Ticker mode uses one batched
+``GET /api/v3/ticker/24hr`` (``type=MINI``) and is kept for other callers and
+tests.
 
-Freshness model (audit w19oxqf24, findings #2 + #11)
-----------------------------------------------------
-The 24h-ticker ``closeTime`` is WALL-CLOCK: it advances on every request
-regardless of whether ``lastPrice`` actually moved. It is therefore NOT a
-genuine freshness signal — using it directly as ``publish_time`` made
-downstream ``spot_age_s = now_ts - publish_time`` always ~0, so the gates.py
-``stale_spot`` gate could never fire and a frozen/halted feed would silently
-keep feeding live bets (finding #2). It also failed OPEN when ``closeTime`` was
-missing/0 by substituting ``now_ts`` — fresh in exactly the money-unsafe
-direction (finding #11).
+Ticker freshness
+----------------
+The 24h ticker's ``closeTime`` is wall-clock time: it advances on every request
+whether or not ``lastPrice`` moved, so using it as ``publish_time`` would make
+``spot_age_s`` always ~0 and the ``stale_spot`` gate could never fire on a
+frozen feed. Substituting ``now_ts`` when it is missing would be just as bad.
 
-This adapter does NOT trust ``closeTime`` as a clock. Instead it derives a
-real freshness stamp itself:
+So in ticker mode:
 
-  * ``closeTime`` is treated only as a structural "the venue returned a
-    complete row" marker. A row missing it (absent or <= 0) is REJECTED
-    (``_decode_row`` returns None), which downgrades the whole batch via the
-    existing incomplete-batch path — rejecting on a missing publish time
-    instead of fabricating a timestamp (#11).
-  * ``BinanceSpot.publish_time`` is a FIRST-SEEN stamp, not ``closeTime``: the
-    module remembers, per coin, the ``now_ts`` of the first distinct fetch
-    bucket at which the current ``lastPrice`` value was observed. While the
-    price stays frozen across consecutive distinct buckets, ``publish_time``
-    keeps pointing at that first-seen time, so ``spot_age_s`` grows and the
-    existing ``stale_spot`` gate fires once the price has been frozen longer
-    than ``config.SPOT_STALENESS_S`` — without touching gates.py/pipeline.py
-    (finding #2). A genuine price move resets the stamp to ``now_ts``.
+  * ``closeTime`` only marks a complete row. A row without it (absent or
+    <= 0) is rejected, which marks the whole batch incomplete.
+  * ``BinanceSpot.publish_time`` is a first-seen time: per coin, the
+    ``now_ts`` of the first fetch bucket that saw the current ``lastPrice``.
+    While the price stays frozen across buckets, ``spot_age_s`` grows and
+    ``stale_spot`` fires once it exceeds ``config.SPOT_STALENESS_S``. A real
+    price change resets it to ``now_ts``.
 
-Bucket-scoped cache: the 1Hz scheduler reuses one response batch for
-``config.SPOT_FETCH_INTERVAL_SECONDS`` seconds, and a
-failed bucket is negative-cached so outages do not hammer the free endpoint.
-The store keeps the last :data:`_MAX_BUCKETS` buckets rather than one, so the
-CURRENT bucket and the prefetcher's NEXT bucket coexist instead of evicting
-each other (regression 2026-07-30 — see :data:`_MAX_BUCKETS`).
-:func:`peek_all_spots` is the cache-only reader for callers that must never
-spend a GET.
+Kline mode uses the candle's own time and needs none of this.
+
+Caching: the 1 Hz scheduler reuses one batch for
+``config.SPOT_FETCH_INTERVAL_SECONDS``, and a failed bucket is negative-cached
+so an outage does not hammer the free endpoint. The cache keeps the last
+:data:`_MAX_BUCKETS` buckets, so the current bucket and the prefetcher's next
+bucket do not evict each other. :func:`peek_all_spots` reads the cache only and
+never fetches.
 """
 
 from __future__ import annotations
@@ -90,39 +79,35 @@ class BinanceMinuteBar:
     is_closed: bool
 
 
-# Number of distinct fetch buckets the store keeps (regression 2026-07-30).
+# Number of fetch buckets the cache keeps.
 #
-# THREE consumers read spot on OVERLAPPING bucket keys: the 1Hz tick reads
-# bucket S, ``scheduler.spot_prefetch`` warms bucket S+1 ~200ms before the
-# boundary, and the fast-trigger rungs re-read bucket S at 4Hz+. This store used
-# to be a single slot (one ``bucket`` field), so the warm S+1 entry and the live
-# S entry evicted each other several times a second — and every eviction turned
-# the next read into an inline network GET on the decision path. Measured cost:
-# main tick loop p50 115ms -> 315ms with ``stale_spot`` skips x6.9 (p=1e-8).
-# Four buckets holds S-1 / S / S+1 with a slot of slack.
+# Three readers use overlapping buckets: the 1 Hz tick reads bucket S,
+# ``scheduler.spot_prefetch`` warms S+1 ~200ms before the boundary, and the
+# fast-trigger scans re-read S several times a second. With a single slot those
+# entries evicted each other constantly, and every eviction made the next read
+# a network call on the decision path (tick p50 rose from 115ms to 315ms). Four
+# slots hold S-1, S and S+1 with one spare.
 _MAX_BUCKETS = 4
 
-# ``(bucket, coins) -> batch``, where a stored ``None`` is a NEGATIVE-cached
-# (failed) bucket and an ABSENT key is an unknown one. Both meanings are now
-# per-bucket, so a failure at S can no longer blank a good batch at S+1.
-# Guarded by ``_cache_lock``; pruned by age on every write (``_store_locked``).
+# ``(bucket, coins) -> batch``. A stored ``None`` is a failed (negative-cached)
+# bucket; a missing key is an unknown one. Both are per bucket, so a failure at
+# S cannot blank a good batch at S+1. Guarded by ``_cache_lock``; pruned on
+# every write (``_store_locked``).
 _cache: dict[tuple[int, tuple[str, ...]], Optional[dict[str, BinanceSpot]]] = {}
 _cache_lock = threading.Lock()
 
-# Distinguishes "no entry for this bucket" from "negative-cached None".
+# Tells "no entry for this bucket" apart from a negative-cached None.
 _MISSING = object()
 
-# In-flight fetch registry (latency: same-bucket coalescing). Keyed like the
-# bucket cache on (bucket, coins) and guarded by ``_cache_lock``. The first
-# caller for an unresolved bucket registers an Event and performs the GET;
-# concurrent same-bucket callers (the tick racing the SpotPrefetcher's
-# boundary fetch) wait on it — bounded by the adapter timeout — and re-read
-# the cache instead of paying a duplicate GET on the decision path.
+# In-flight fetches, keyed like the cache and guarded by ``_cache_lock``. The
+# first caller for an unresolved bucket registers an Event and does the GET;
+# other callers for the same bucket (typically the tick racing the prefetcher)
+# wait on it, bounded by the timeout, and then read the cache instead of making
+# a duplicate GET.
 _inflight: dict[tuple[int, tuple[str, ...]], threading.Event] = {}
 
-# F2: minimum residual deadline budget (seconds) a coalesced waiter must have
-# left to be worth an independent fallback GET after its wait resolves to an
-# unresolved or negative-cached bucket; below this it returns None instead.
+# Minimum time left (seconds) for a waiter to make its own fallback GET after
+# the shared fetch failed or never finished; with less it returns None.
 _MIN_FALLBACK_BUDGET_S = 0.2
 
 
@@ -130,12 +115,11 @@ def _store_locked(
     key: tuple[int, tuple[str, ...]],
     value: Optional[dict[str, BinanceSpot]],
 ) -> None:
-    """Write one bucket entry and prune the store back to :data:`_MAX_BUCKETS`.
+    """Write one bucket entry and prune the cache back to :data:`_MAX_BUCKETS`.
 
-    Caller must hold ``_cache_lock``. Bucket ids are monotonic in time, so
-    "newest by bucket id" IS "youngest by age"; pruning by RANK rather than by
-    distance from the newest bucket also guarantees the entry just written is
-    never the one evicted.
+    Caller holds ``_cache_lock``. Bucket ids increase with time, so keeping the
+    newest ids keeps the youngest entries, and the entry just written is never
+    the one evicted.
     """
     _cache[key] = value
     if len(_cache) > _MAX_BUCKETS:
@@ -145,14 +129,13 @@ def _store_locked(
 
 @dataclass
 class _FreshSeen:
-    """Per-coin first-seen freshness anchor for the frozen-price detector.
+    """Per-coin first-seen anchor for the frozen-price detector.
 
-    ``price`` is the last distinct ``lastPrice`` observed for the coin and
-    ``first_seen_ts`` is the ``now_ts`` of the bucket at which that price value
-    was first seen. ``last_bucket`` is the fetch bucket of the most recent
-    update, so we only advance the detector on a genuinely NEW fetch bucket
-    (a cached re-read inside the same bucket must not be mistaken for a fresh
-    confirmation that the price is still moving) — audit w19oxqf24 #2.
+    ``price`` is the last distinct ``lastPrice`` seen for the coin and
+    ``first_seen_ts`` the ``now_ts`` of the bucket where that value first
+    appeared. ``last_bucket`` is the bucket of the latest update; the detector
+    only advances on a new bucket, so a cached re-read is not mistaken for a
+    new confirmation.
     """
 
     price: float
@@ -160,30 +143,27 @@ class _FreshSeen:
     last_bucket: int
 
 
-# Frozen-price detector state (audit w19oxqf24 #2). Keyed by coin; updated
-# only on a new fetch bucket so that the bucket-scoped cache's repeated reads
-# do not reset the staleness clock.
+# Frozen-price detector state, keyed by coin. Updated only on a new fetch
+# bucket so repeated cache reads do not reset the staleness clock.
 _seen: dict[str, _FreshSeen] = {}
 _seen_lock = threading.Lock()
 
 
 def _freshness_publish_time(coin: str, price: float, *, now_ts: int, bucket: int) -> int:
-    """Return the first-seen publish_time for ``(coin, price)`` (audit #2).
+    """Return the first-seen publish_time for ``(coin, price)``.
 
-    On the first observation of a coin, or when ``price`` differs from the
-    previously seen value, the anchor resets to ``now_ts`` (the price just
-    moved → genuinely fresh). When ``price`` is unchanged across a NEW distinct
-    fetch bucket, the original ``first_seen_ts`` is retained so downstream
-    ``spot_age_s = now_ts - publish_time`` keeps growing and the ``stale_spot``
-    gate fires once the freeze exceeds ``config.SPOT_STALENESS_S``.
+    On a coin's first observation, or when ``price`` changed, the anchor resets
+    to ``now_ts``. When the price is unchanged in a new bucket the original
+    ``first_seen_ts`` is kept, so ``spot_age_s = now_ts - publish_time`` grows
+    and ``stale_spot`` fires once the freeze exceeds
+    ``config.SPOT_STALENESS_S``.
 
-    Re-reads within the same bucket (``bucket == last_bucket``) do not advance
-    the detector and return the existing anchor unchanged.
+    A re-read in the same bucket (``bucket == last_bucket``) changes nothing.
     """
     with _seen_lock:
         prev = _seen.get(coin)
         if prev is not None and prev.price == price and bucket != prev.last_bucket:
-            # Unchanged price across a new distinct bucket → keep aging it.
+            # Same price in a new bucket: keep aging it.
             _seen[coin] = _FreshSeen(
                 price=price,
                 first_seen_ts=prev.first_seen_ts,
@@ -191,21 +171,20 @@ def _freshness_publish_time(coin: str, price: float, *, now_ts: int, bucket: int
             )
             return prev.first_seen_ts
         if prev is not None and prev.price == price and bucket == prev.last_bucket:
-            # Same bucket re-read; do not touch the clock.
+            # Same-bucket re-read: leave the clock alone.
             return prev.first_seen_ts
-        # First observation or a genuine price move → fresh anchor at now_ts.
+        # First observation or a real price change: anchor at now_ts.
         _seen[coin] = _FreshSeen(price=price, first_seen_ts=now_ts, last_bucket=bucket)
         return now_ts
 
 
 def _decode_row(row: dict, *, now_ts: int, bucket: int) -> Optional[BinanceSpot]:
-    """Convert one ticker row to a BinanceSpot, or None if malformed/stale.
+    """Convert one ticker row to a BinanceSpot, or None if malformed.
 
-    ``publish_time`` is the first-seen freshness stamp (audit w19oxqf24 #2),
-    NOT the wall-clock ``closeTime``. ``closeTime`` is required only as a
-    structural completeness marker: a row missing it (absent or <= 0) is
-    rejected rather than having a ``now_ts`` fabricated for it, so it fails
-    CLOSED via the incomplete-batch path (audit w19oxqf24 #11).
+    ``publish_time`` is the first-seen time, not ``closeTime``. ``closeTime``
+    is only required as a completeness marker: a row without it is rejected
+    rather than given a made-up ``now_ts``, so it fails closed via the
+    incomplete-batch path.
     """
     from cryptobot import config
 
@@ -215,10 +194,8 @@ def _decode_row(row: dict, *, now_ts: int, bucket: int) -> Optional[BinanceSpot]
     except (KeyError, TypeError, ValueError):
         return None
 
-    # audit w19oxqf24 #11: do NOT substitute now_ts for a missing/zero
-    # closeTime. A row without a real closeTime is rejected (returns None →
-    # incomplete batch → whole bucket downgraded to None), instead of being
-    # waved through as perfectly fresh in the money-unsafe direction.
+    # Never substitute now_ts for a missing or zero closeTime; reject the row
+    # (the whole bucket then becomes None) rather than treat it as fresh.
     try:
         close_time_ms = int(row.get("closeTime"))
     except (TypeError, ValueError):
@@ -243,10 +220,9 @@ def _decode_row(row: dict, *, now_ts: int, bucket: int) -> Optional[BinanceSpot]
             )
             return None
 
-    # audit w19oxqf24 #2: stamp publish_time with the FIRST-SEEN time of this
-    # price value, not closeTime. While the price is frozen across distinct
-    # fetch buckets the stamp ages, so the existing gates.py stale_spot gate
-    # eventually fires; a genuine move resets it to now.
+    # publish_time is when this price value was first seen, not closeTime.
+    # While the price is frozen across buckets it ages, so stale_spot
+    # eventually fires; a real move resets it.
     publish_time = _freshness_publish_time(coin, price, now_ts=now_ts, bucket=bucket)
 
     return BinanceSpot(
@@ -267,11 +243,10 @@ def _decode_completed_1s_kline(
 ) -> Optional[BinanceSpot]:
     """Decode the latest completed kline at or before the target second.
 
-    The forward PMData tape is fetched from this exact Binance kline endpoint
-    and uses column 4 (the finalized kline close) as its per-second spot.  Live
-    must therefore reject the still-open current candle. Binance omits empty
-    seconds for quieter pairs; the backtest's ``_spot_at`` uses the latest row
-    at or before the target second, so live applies that same fallback.
+    The backtest's forward tape comes from this same endpoint and uses column 4
+    (the final close) as its per-second spot, so the still-open current candle
+    must be rejected. Binance skips empty seconds on quiet pairs; like the
+    backtest's ``_spot_at``, use the latest row at or before the target second.
     """
     from cryptobot import config
 
@@ -310,9 +285,8 @@ def _decode_completed_1s_kline(
                 hi,
             )
             return None
-    # Klines carry a genuine venue event time. Unlike the legacy ticker mode,
-    # do not synthesize first-seen freshness: a missing run of candles should
-    # age naturally and trip the existing stale-spot gate.
+    # Klines carry a real venue time, so no first-seen tracking: a run of
+    # missing candles ages naturally and trips stale_spot.
     publish_time = (start_ms + 1_000) // 1_000
     return BinanceSpot(
         coin=coin,
@@ -328,17 +302,17 @@ def fetch_all_spots(
     client: httpx.Client | None = None,
     timeout: float = 3.0,
 ) -> Optional[dict[str, BinanceSpot]]:
-    """Return a {coin: BinanceSpot} batch covering configured live coins."""
+    """Return a {coin: BinanceSpot} batch for the configured coins."""
     from cryptobot import config
 
     if now_ts is None:
         now_ts = time.time()
-    # F2: one deadline budget covers this whole call — a coalesced wait and
-    # any fallback GET both draw from it, so the worst case is ``timeout``
-    # total, never a full wait PLUS a second full-timeout GET (2x).
+    # One deadline covers the whole call: waiting on a shared fetch and any
+    # fallback GET both draw from it, so the worst case is ``timeout`` in
+    # total, not a wait plus a second full-timeout GET.
     deadline = time.monotonic() + timeout
-    # Owner GETs keep the client's configured timeout (unchanged); a waiter
-    # falling back to its own GET tightens this to its residual budget.
+    # The owner's GET uses the client's configured timeout; a waiter that falls
+    # back to its own GET shortens it to the time left.
     request_timeout = httpx.USE_CLIENT_DEFAULT
     bucket = int(now_ts // max(1, tick_seconds))
     coins = tuple(config.COINS)
@@ -352,30 +326,27 @@ def fetch_all_spots(
     with _cache_lock:
         cached = _cache.get(key, _MISSING)
         if cached is not _MISSING:
-            # A resolved bucket: the batch, or None for a negative-cached one.
+            # A resolved bucket: the batch, or None if negative-cached.
             return cached  # type: ignore[return-value]
         inflight = _inflight.get(key)
         if inflight is None:
-            # No fetch airborne for this bucket — this caller owns it.
+            # No fetch in flight for this bucket; this caller does it.
             my_event = threading.Event()
             _inflight[key] = my_event
 
     if my_event is None:
-        # A fetch for this exact bucket is already airborne (typically the
-        # SpotPrefetcher's boundary fetch). Wait for it instead of paying a
-        # duplicate GET — bounded by the shared deadline, not a fresh full
-        # timeout — then reuse a successfully cached batch.
+        # A fetch for this bucket is already in flight (usually the
+        # prefetcher's). Wait for it, bounded by the shared deadline, and reuse
+        # its result.
         inflight.wait(timeout=max(0.0, deadline - time.monotonic()))
         with _cache_lock:
             cached = _cache.get(key)
             if cached is not None:
                 return cached
-        # Bucket unresolved (owner hung/crashed) OR negative-cached (owner's
-        # GET failed). Pre-coalescing, this caller's duplicate GET was an
-        # independent success path — restore it, bounded by the RESIDUAL
-        # deadline budget so wait + GET never exceeds ``timeout``. With no
-        # meaningful budget left, give up like a failed fetch instead of
-        # stacking a second full-timeout GET on top of the wait (F2).
+        # The bucket is still unresolved (owner hung or crashed) or
+        # negative-cached (owner's GET failed). Make an independent GET with
+        # the time left, so wait plus GET never exceed ``timeout``; with too
+        # little time left, give up as a failed fetch.
         remaining = deadline - time.monotonic()
         if remaining <= _MIN_FALLBACK_BUDGET_S:
             return None
@@ -392,18 +363,17 @@ def fetch_all_spots(
                 client.close()
 
         if config.SPOT_USE_1S_KLINES:
-            # One request per configured coin is intentional: Binance's kline
-            # REST endpoint has no multi-symbol form. Run the four requests in
-            # parallel and pin all of them to the SAME completed candle. This
-            # avoids both sequential ~800ms decision lag and a mixed-second
-            # batch when requests straddle a wall-clock boundary.
+            # Binance's kline endpoint has no multi-symbol form, so make one
+            # request per coin, in parallel, all pinned to the same completed
+            # candle. That avoids ~800ms of sequential latency and a batch that
+            # mixes two seconds when requests straddle a boundary.
             by_coin: dict[str, BinanceSpot] = {}
             now_ts_int = int(now_ts)
             target_start_ms = (now_ts_int - 1) * 1_000
 
-            # The boundary prefetch intentionally asks for bucket S before S
-            # begins. Candle S-1 is not final until S, so wait for that boundary
-            # inside the prefetch worker instead of caching a partial close.
+            # The prefetcher asks for bucket S before S begins, but candle S-1
+            # is not final until S. Wait for the boundary in the prefetch
+            # worker rather than cache a partial close.
             wait_s = float(now_ts_int) - time.time()
             if wait_s > 0.0:
                 remaining = deadline - time.monotonic()
@@ -571,9 +541,8 @@ def fetch_all_spots(
             _store_locked(key, by_coin)
         return by_coin
     finally:
-        # Resolve the in-flight marker on EVERY exit path — success, negative
-        # cache, or a raised exception — so waiters are never stranded past
-        # their bound.
+        # Resolve the in-flight marker on every exit (success, negative cache
+        # or exception) so waiters are never left hanging.
         if my_event is not None:
             with _cache_lock:
                 _inflight.pop(key, None)
@@ -588,7 +557,8 @@ def fetch_recent_minute_bars(
     client: httpx.Client | None = None,
     timeout: float = 3.0,
 ) -> list[BinanceMinuteBar]:
-    """Fetch recent Binance 1m klines for partial-ret boot warm-start."""
+    """Fetch recent Binance 1m klines to warm-start PartialRetEngine at boot.
+    """
     from cryptobot import config
 
     symbol = SYMBOLS.get(coin.upper())
@@ -666,19 +636,13 @@ def peek_all_spots(
     now_ts: float | None = None,
     tick_seconds: int = 1,
 ) -> Optional[dict[str, BinanceSpot]]:
-    """Cache-ONLY read of this bucket's batch. NEVER touches the network.
+    """Read this bucket's batch from the cache only; never touches the network.
 
-    The fast-trigger rungs' spot access (regression 2026-07-30). They fire at
-    4Hz+ and are structurally forbidden from spending a venue round trip — the
-    same cache-only contract they already hold for books (``fetch_book=None``)
-    and market metadata (``_venue_market_cache_has``). A cold bucket returns
-    None and the rung ABSTAINS from the fire; it does not fetch, does not
-    register an in-flight marker, does not negative-cache, and does not wait on
-    anyone else's GET. The 1Hz tick's ``fetch_all_spots`` remains the ONLY
-    fetch-on-miss path, so the network cadence is exactly what it was before the
-    fast rungs existed.
-
-    A negative-cached (failed) bucket also reads as None — abstain either way.
+    For the fast-trigger scans, which run several times a second and must never
+    make a venue call (they read books and market metadata from cache too). A
+    cold or negative-cached bucket returns None and the scan skips; it never
+    fetches, registers an in-flight marker, negative-caches or waits. The 1 Hz
+    tick's ``fetch_all_spots`` is the only path that fetches on a miss.
     """
     from cryptobot import config
 
@@ -698,13 +662,13 @@ def _mark_bucket_failed(bucket: int, coins: tuple[str, ...]) -> None:
 def reset_cache() -> None:
     with _cache_lock:
         _cache.clear()
-        # Wake any coalesced waiter and drop the in-flight markers so a fresh
-        # test / process restart never inherits a stranded registration.
+        # Wake any waiter and drop in-flight markers so a test or restart never
+        # inherits a stuck one.
         for event in _inflight.values():
             event.set()
         _inflight.clear()
-    # Also clear the frozen-price detector anchors (audit w19oxqf24 #2) so a
-    # fresh test / process restart does not inherit a stale freshness clock.
+    # Clear the frozen-price anchors too, so a test or restart starts with a
+    # fresh staleness clock.
     with _seen_lock:
         _seen.clear()
 

@@ -1,25 +1,21 @@
-"""SSE server + static file server + dashboard POST endpoints.
+"""Dashboard HTTP server: static files, the SSE stream and operator POST
+endpoints.
 
-`http.server.HTTPServer` with a `SimpleHTTPRequestHandler` subclass that
-serves `dashboard/` files; the `/events` route holds a long-lived
-connection and broadcasts JSON-serialized payloads as SSE; the
-`/api/v2/` POST routes mutate operator state, wallet mode, and
-transfers per D-LIVE-10 / D-LIVE-13 / D-LIVE-21.
+An ``http.server.HTTPServer`` with a ``SimpleHTTPRequestHandler`` subclass
+serves ``dashboard/``. ``/events`` holds a long-lived connection and streams
+JSON payloads as server-sent events; the ``/api/v2/`` POST routes change
+operator state, wallet mode and transfers.
 
-Security note (R-NEW-11 + D-LIVE-13): cookie auth on every `/api/v2/*`
-POST is required, regardless of bind interface. With
-`CRYPTOBOT_DASHBOARD_PASS` empty the router rejects every POST with
-`dashboard_pass_unset`; main.py refuses boot in that mode unless the
-operator explicitly sets `CRYPTOBOT_DASHBOARD_AUTH_DISABLED=1` for
-local-dev (which itself refuses when bound non-loopback). The previous
-"empty pass + loopback = allow" behavior was removed because loopback
-is shared with every process on the host -- not an access control
-boundary.
+Every ``/api/v2/*`` POST needs the session cookie, whatever interface the
+server is bound to (loopback is shared by every process on the host, so it is
+not an access boundary). With ``CRYPTOBOT_DASHBOARD_PASS`` empty the router
+rejects every POST with ``dashboard_pass_unset``, and main.py refuses to boot
+unless ``CRYPTOBOT_DASHBOARD_AUTH_DISABLED=1`` is set for local development
+(itself refused on a non-loopback bind).
 
-POST request bodies are capped at `MAX_POST_BODY_BYTES` (8 KiB) to bound
-attacker-controlled memory. `/api/v2/auth/login` is rate-limited per
-client IP via an in-memory sliding window so empty/short-password brute
-force is throttled.
+POST bodies are capped at ``MAX_POST_BODY_BYTES`` (8 KiB), and
+``/api/v2/auth/login`` is rate-limited per client IP with an in-memory sliding
+window.
 """
 
 from __future__ import annotations
@@ -48,17 +44,16 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Cookie auth helpers (D-LIVE-13 / D-LIVE-26)
+# Cookie auth helpers
 # ---------------------------------------------------------------------------
 
 
 _BOOT_SALT = secrets.token_hex(16)
 
-# Hard cap on POST body size (security finding #34). API bodies are
-# small JSON envelopes; anything larger is either misuse or attack.
+# API bodies are small JSON objects; anything bigger is misuse.
 MAX_POST_BODY_BYTES = 8 * 1024
 
-# Login throttling (security finding #35). Sliding window per client IP.
+# Login throttling: sliding window per client IP.
 LOGIN_RATE_LIMIT_ATTEMPTS = 5
 LOGIN_RATE_LIMIT_WINDOW_S = 60.0
 
@@ -79,14 +74,9 @@ _ALLOWED_DASHBOARD_STATIC = frozenset({
     "/pages-subminute.jsx",
     "/app.jsx",
     "/snapshot.json",
-    # RETIRED 2026-08-01 (predict.fun Tokyo cutover) — do NOT re-add:
-    #   /predictfun_paper.json  (paper-instance ledger dump)
-    #   /predictfun_live.json   (full predict.fun venue snapshot)
-    # Both existed so the :8800 Polymarket console could render the OTHER
-    # venue. Each console is single-venue by deployment now, so nothing polls
-    # them, their producers are deleted, and serving trading rows / wallet
-    # addresses off a stale file is pure attack surface. Whatever replaces a
-    # cross-venue view must be a real read-only API, not a dumped file.
+    # Only these files are served. Keep the list minimal: every JSON file added
+    # here is readable without a session unless it is also in the auth-gated
+    # list in ``do_GET``.
 })
 _ALLOWED_ASSET_EXTENSIONS = frozenset({
     ".svg", ".png", ".jpg", ".jpeg", ".webp", ".ico",
@@ -94,9 +84,9 @@ _ALLOWED_ASSET_EXTENSIONS = frozenset({
 
 
 def derive_session_token(dashboard_pass: str) -> str:
-    """Stable per-process session token derived from
-    `CRYPTOBOT_DASHBOARD_PASS` + a fresh `_BOOT_SALT`. Restart rotates
-    the token, forcing the operator to re-auth on a process bounce."""
+    """Session token derived from ``CRYPTOBOT_DASHBOARD_PASS`` and a
+    per-process ``_BOOT_SALT``, so a restart invalidates existing sessions.
+    """
     return hashlib.sha256(
         f"{dashboard_pass}:{_BOOT_SALT}".encode("utf-8")
     ).hexdigest()
@@ -105,9 +95,8 @@ def derive_session_token(dashboard_pass: str) -> str:
 def derive_csrf_token(session_token: str) -> str:
     """Derive the browser-readable CSRF token for a session cookie.
 
-    The token is deterministic so the HTTP handler does not need another
-    mutable session store. It is still bound to the process-rotated session
-    token, so a stale CSRF cookie cannot outlive a restart.
+    Deterministic, so no extra session store is needed, but bound to the
+    per-process session token, so a CSRF cookie cannot outlive a restart.
     """
     return hmac.new(
         session_token.encode("utf-8"),
@@ -175,26 +164,19 @@ def _is_allowed_dashboard_static(raw_path: str) -> bool:
 
 
 class Broadcaster:
-    """Per-server fan-out: any thread can call ``publish(payload)``; each
-    connected SSE client has its own bounded queue.
+    """Fans payloads out to SSE clients: any thread can call
+    ``publish(payload)``, and each connected client has its own bounded
+    queue.
 
-    Payloads ship as ``(event_id, json)`` tuples so the per-client handler
-    can emit an ``id:`` SSE field. Audit w19oxqf24 (P3) correction: the
-    ``id:`` field is currently INFORMATIONAL only. The handler does NOT read
-    the ``Last-Event-ID`` request header on reconnect — every reconnect
-    re-bootstraps the full ledger snapshot via ``register()``. This is not a
-    data-integrity bug (the dashboard's ``live-bridge.js`` ``mergeLedger``
-    dedupes by row id, so re-bootstrapping cannot double-count), but the
-    earlier docstring claim of ``Last-Event-ID`` resume was false and is
-    corrected here. Implementing real resume (read the header, replay only
-    events past it, skip the bootstrap) remains a possible optimization.
+    Payloads are ``(event_id, json)`` tuples so the handler can send an ``id:``
+    field. The id is informational only: ``Last-Event-ID`` is not read on
+    reconnect, and every reconnect gets the full ledger bootstrap from
+    ``register()``. That is safe because the dashboard's ``mergeLedger`` (in
+    ``live-bridge.js``) dedupes rows by id.
 
-    Late-joiner bootstrap: ``publish()`` carries ``last_ledger_bootstrap``
-    which holds the most-recent built payload with ``last_seen_ledger_id=0``
-    (i.e. the full ledger snapshot). When a new client connects via
-    ``register()``, that cached bootstrap is queued first so the dashboard
-    sees the existing ledger rows on its initial render instead of waiting
-    for new fills to land.
+    Late joiners: the most recent full-ledger payload (built with
+    ``last_seen_ledger_id=0``) is cached, and ``register()`` queues it first so
+    a new client sees existing rows immediately.
     """
 
     def __init__(self, max_clients: int = config.MAX_SSE_CLIENTS) -> None:
@@ -203,29 +185,27 @@ class Broadcaster:
         self._lock = threading.Lock()
         self.last_broadcast_ts: float = 0.0
         self._event_id: int = 0
-        # Reliability finding: ids of client queues that dropped a delta event
-        # on queue.Full. On the next set_bootstrap we re-send the full-ledger
-        # bootstrap to ONLY these clients so a slow client self-heals without
-        # paying a full-snapshot cost on every tick. Guarded by self._lock.
+        # Ids of client queues that dropped a delta on queue.Full. The next
+        # set_bootstrap re-sends the full ledger to just those clients, so a
+        # slow client recovers without every client paying for a full snapshot
+        # each tick. Guarded by self._lock.
         self._needs_bootstrap: set[int] = set()
-        # Cached (event_id, json) bootstrap event for late joiners. Updated
-        # by main.py on every tick via ``set_bootstrap`` so newly connecting
-        # clients get the current ledger snapshot without waiting for the
-        # next live fill.
+        # Cached (event_id, json) bootstrap for late joiners, refreshed every
+        # tick by main.py via ``set_bootstrap``.
         self._bootstrap: Optional[tuple[int, str]] = None
 
     def set_bootstrap(self, payload: dict) -> None:
-        """Replace the cached bootstrap event. Called every tick from
-        main.py with a payload built with ``last_seen_ledger_id=0`` so the
-        cached version always reflects the latest ledger snapshot.
+        """Replace the cached bootstrap. main.py calls this every tick with a
+        payload built with ``last_seen_ledger_id=0``, so it always holds the
+        current ledger.
         """
         data = json.dumps(payload, separators=(",", ":"))
         with self._lock:
             self._event_id += 1
             self._bootstrap = (self._event_id, data)
-            # Re-sync any client that previously dropped a delta on queue.Full.
-            # live-bridge.js mergeLedger dedupes by row id, so re-sending the
-            # full ledger to a client that is already current is harmless.
+            # Re-send the full ledger to clients that dropped a delta.
+            # mergeLedger dedupes by row id, so this is harmless for a client
+            # that is already current.
             if self._needs_bootstrap:
                 for q in list(self.clients):
                     if id(q) in self._needs_bootstrap:
@@ -242,8 +222,8 @@ class Broadcaster:
             q: queue.Queue = queue.Queue(maxsize=64)
             self.clients.append(q)
             if self._bootstrap is not None:
-                # Best-effort: if the queue is somehow full at register
-                # time, the client will still get the next live tick.
+                # If the queue is somehow full already, the client still gets
+                # the next tick.
                 try:
                     q.put_nowait(self._bootstrap)
                 except queue.Full:
@@ -261,8 +241,7 @@ class Broadcaster:
     def publish(self, payload: dict) -> None:
         data = json.dumps(payload, separators=(",", ":"))
         with self._lock:
-            # Concurrency hygiene: keep every Broadcaster mutable-state write
-            # under self._lock (was the only unlocked shared-state write).
+            # All Broadcaster state is written under self._lock.
             self.last_broadcast_ts = time.time()
             self._event_id += 1
             event = (self._event_id, data)
@@ -270,9 +249,9 @@ class Broadcaster:
                 try:
                     q.put_nowait(event)
                 except queue.Full:
-                    # Drop on slow client — never block the broadcast thread.
-                    # Flag the client so the next set_bootstrap re-sends the
-                    # full ledger and the dropped delta rows are recovered.
+                    # Slow client: drop rather than block the broadcast thread,
+                    # and flag it so the next set_bootstrap re-sends the full
+                    # ledger.
                     self._needs_bootstrap.add(id(q))
 
 
@@ -282,12 +261,11 @@ class _ThreadingServer(ThreadingMixIn, HTTPServer):
 
 
 class PostRouter:
-    """Holds the durable resources the POST endpoints need.
+    """Holds what the POST endpoints need.
 
-    Decoupled from the HTTP handler so tests can drive the router with
-    a fake `Request` payload without spinning up an HTTP server. Each
-    handler returns ``(status_code, body_dict)``; the HTTP server
-    serializes the body as JSON.
+    Separate from the HTTP handler so tests can drive the router with a fake
+    payload and no server. Each handler returns ``(status_code, body_dict)``,
+    which the server sends as JSON.
     """
 
     def __init__(
@@ -305,25 +283,18 @@ class PostRouter:
         self._portfolio = portfolio
         self._session_token = session_token
         self._relayer_submitter = relayer_submitter
-        # Security finding #2 / #23: arbitrary `to_wallet` in transfer
-        # POST bodies was previously committed to `transfer_requests`
-        # before any allowlist check. Operator configures
-        # `POLY_RETURN_WALLET` and main.py threads it here; the transfer
-        # handlers reject any other destination at the router edge AND
-        # again inside submit_transfer for defense-in-depth.
+        # Transfers may only go to ``POLY_RETURN_WALLET``, which main.py passes
+        # in. Any other ``to_wallet`` is rejected here, before anything is
+        # written, and again inside submit_transfer.
         self._transfer_to_wallet_allowlist = transfer_to_wallet_allowlist or ""
-        # `_actor` is the immutable HTTP-origin actor stamped on every
-        # mutation. Security finding #15: the body's `actor` field was
-        # previously honored, letting any HTTP caller pollute the audit
-        # trail with `actor=boot` or any other identity. HTTP-originated
-        # mutations now always stamp `self._actor`; the CLI bypass uses
-        # the operator_control primitives directly with its own actor.
+        # The actor recorded on every HTTP-originated change. The body's
+        # ``actor`` field is ignored so a caller cannot write a false identity
+        # into the audit trail; the CLI uses the operator_control functions
+        # with its own actor.
         self._actor = actor
-        # `auth_disabled` is the explicit opt-out for local-dev workflows
-        # where the operator runs the bot without setting a password.
-        # main.py wires this from CRYPTOBOT_DASHBOARD_AUTH_DISABLED and
-        # refuses to set it on a non-loopback bind. Defaults to False so
-        # every production deploy authenticates.
+        # Explicit opt-out for local development without a password. main.py
+        # sets it from CRYPTOBOT_DASHBOARD_AUTH_DISABLED and refuses it on a
+        # non-loopback bind. Defaults to False.
         self._auth_disabled = bool(auth_disabled)
         self._lock = threading.Lock()
 
@@ -332,14 +303,11 @@ class PostRouter:
     def check_auth(self, cookie_header: Optional[str]) -> bool:
         """Return True when the request carries a valid session token.
 
-        Security model (finding #1):
-        * `auth_disabled=True` (opt-in via `CRYPTOBOT_DASHBOARD_AUTH_DISABLED=1`,
-          loopback-only per main.py) permits everything. Local-dev escape hatch.
-        * Empty `_session_token` without the explicit opt-out rejects every
-          request -- a previous Phase 1 footgun let any local process flip
-          wallet mode without a cookie. Boot now refuses this state.
-        * Non-empty `_session_token` requires a matching cookie via
-          `hmac.compare_digest`.
+        * ``auth_disabled=True`` (``CRYPTOBOT_DASHBOARD_AUTH_DISABLED=1``, loopback
+          only) allows everything; for local development.
+        * An empty ``_session_token`` without that opt-out rejects every request
+          (boot also refuses this state).
+        * Otherwise the cookie must match, compared with ``hmac.compare_digest``.
         """
         if self._auth_disabled:
             return True
@@ -351,7 +319,8 @@ class PostRouter:
     def check_csrf(
         self, cookie_header: Optional[str], csrf_header: Optional[str]
     ) -> bool:
-        """Validate the double-submit token for an authenticated session."""
+        """Validate the double-submit CSRF token for an authenticated session.
+        """
         if self._auth_disabled:
             return True
         if not self.check_auth(cookie_header):
@@ -369,7 +338,7 @@ class PostRouter:
         if not self.check_auth(cookie_header):
             return HTTPStatus.UNAUTHORIZED, {"reason": "unauthorized"}
 
-        # Mode-toggle: /api/v2/wallet/<id>/mode
+        # Mode toggle: /api/v2/wallet/<id>/mode
         if path.startswith("/api/v2/wallet/") and path.endswith("/mode"):
             wallet_id = path[len("/api/v2/wallet/"): -len("/mode")]
             return self._handle_wallet_mode(wallet_id, body)
@@ -408,14 +377,14 @@ class PostRouter:
             return HTTPStatus.BAD_REQUEST, {
                 "reason": "invalid_expected_version",
             }
-        # Security finding #15: actor is the HTTP-origin actor; not body-overridable.
+        # The actor is always the HTTP-origin actor, never taken from the body.
         actor = self._actor
         if target not in ("DRY", "LIVE"):
             return HTTPStatus.BAD_REQUEST, {
                 "reason": "invalid_target",
                 "detail": "target must be DRY or LIVE",
             }
-        # `force` is CLI-only (D-LIVE-19). Silently drop any body field.
+        # ``force`` is CLI-only; any body field is ignored.
         with self._lock:
             try:
                 state = set_wallet_mode(
@@ -479,10 +448,9 @@ class PostRouter:
     ) -> tuple[int, dict[str, Any]]:
         """Shared transition path for start / stop / transfer_lock.
 
-        Security finding #10: thread `expected_version` through to
-        `set_operator_state` so two concurrent POSTs cannot silently flip
-        state in opposite directions. Security finding #15: `actor` is
-        always `self._actor`, never body-overridable.
+        Passes ``expected_version`` to ``set_operator_state`` so two concurrent
+        POSTs cannot flip state in opposite directions. The actor is always
+        ``self._actor``.
         """
         from cryptobot.execution.operator_control import (
             ConcurrentMutationError,
@@ -539,7 +507,7 @@ class PostRouter:
         from_wallet = body.get("from_wallet") or ""
         to_wallet = body.get("to_wallet") or ""
         source_wallet_id = body.get("source_wallet_id")
-        # Security finding #15: actor is the HTTP-origin actor; not body-overridable.
+        # The actor is always the HTTP-origin actor, never taken from the body.
         actor = self._actor
         if not from_wallet or not to_wallet:
             return HTTPStatus.BAD_REQUEST, {"reason": "invalid_addresses"}
@@ -569,7 +537,7 @@ class PostRouter:
             submit_transfer,
         )
         idempotency_key = body.get("idempotency_key") or ""
-        # Security finding #15: actor is the HTTP-origin actor; not body-overridable.
+        # The actor is always the HTTP-origin actor, never taken from the body.
         actor = self._actor
         if not idempotency_key:
             return HTTPStatus.BAD_REQUEST, {"reason": "missing_idempotency_key"}
@@ -598,13 +566,12 @@ class PostRouter:
 
 
 class _LoginRateLimiter:
-    """Sliding-window rate limiter for `/api/v2/auth/login` (security finding #35).
+    """Sliding-window rate limiter for ``/api/v2/auth/login``.
 
-    Per client IP tracks attempt timestamps. When the count in the
-    trailing `LOGIN_RATE_LIMIT_WINDOW_S` exceeds
-    `LOGIN_RATE_LIMIT_ATTEMPTS`, the next attempt is rejected. State is
-    process-local (resets on restart) -- adequate for an in-process auth
-    surface that's already restart-rotated via `_BOOT_SALT`.
+    Tracks attempt times per client IP; once the count in the trailing
+    ``LOGIN_RATE_LIMIT_WINDOW_S`` exceeds ``LOGIN_RATE_LIMIT_ATTEMPTS`` further
+    attempts are rejected. State is in memory and resets on restart, which also
+    rotates sessions.
     """
 
     def __init__(self) -> None:
@@ -634,33 +601,29 @@ def _make_handler(
     login_limiter = _LoginRateLimiter()
 
     class Handler(SimpleHTTPRequestHandler):
-        # Audit w19oxqf24 (P3): per-connection read deadline applied to the
-        # accepted socket BEFORE the request line/headers are read. Without it,
-        # a slowloris client that dribbles header bytes holds a worker thread
-        # indefinitely — the existing self.connection.settimeout() in
-        # _handle_sse fires only AFTER auth + header parsing, and the
-        # MAX_SSE_CLIENTS cap is enforced later still, so neither bounds a
-        # pre-auth connection. socketserver applies Handler.timeout to the
-        # connection socket, so a stalled pre-auth client is closed here.
-        # _handle_sse resets its own (longer) write timeout once streaming.
+        # Read deadline for the request line and headers. Without it a
+        # slowloris client could hold a worker thread forever: the write
+        # timeout in _handle_sse is only set after auth and header parsing, and
+        # MAX_SSE_CLIENTS is enforced later still. socketserver applies
+        # Handler.timeout to the connection socket; _handle_sse sets its own
+        # longer timeout once streaming.
         timeout = config.SSE_HEADER_READ_TIMEOUT_S
 
-        # Anchor the file handler at the dashboard directory.
+        # Serve files from the dashboard directory.
         def __init__(self, *args, **kwargs):
             super().__init__(*args, directory=str(dashboard_dir), **kwargs)
 
         def log_message(self, fmt, *args):
-            # Quiet — the default goes to stderr and pollutes the dashboard run.
+            # Log at debug; the default writes every request to stderr.
             logger.debug(fmt, *args)
 
-        # No-cache for any dashboard asset (dev iteration).
+        # No caching for dashboard assets.
         def end_headers(self):
             self.send_header("Cache-Control", "no-store, must-revalidate")
             self.send_header("Pragma", "no-cache")
-            # Defense-in-depth (security finding): deny framing (clickjacking)
-            # and content-type sniffing. CSP is intentionally omitted — the
-            # dashboard's Babel-standalone transpile needs 'unsafe-eval', which
-            # would weaken the policy; frame-denial + nosniff are caveat-free.
+            # Deny framing (clickjacking) and content-type sniffing. No CSP:
+            # the dashboard's in-browser Babel transpile needs 'unsafe-eval',
+            # which would weaken it.
             self.send_header("X-Frame-Options", "SAMEORIGIN")
             self.send_header("X-Content-Type-Options", "nosniff")
             super().end_headers()
@@ -677,16 +640,12 @@ def _make_handler(
             if path == "/api/v2/auth/status":
                 self._handle_auth_status()
                 return
-            # Leakage/security finding: snapshot.json carries operator/mode
-            # state, per-wallet DRY/LIVE, group cap_usd, live CLOB balance, and
-            # strategy thresholds. Gate it behind the same auth as /events when
-            # an auth surface exists (JS/CSS stay open so the login page can
-            # render). Standalone mode (post_router is None) is handled by
-            # _handle_auth_status returning 503.
-            # This tuple and _ALLOWED_DASHBOARD_STATIC change TOGETHER: an
-            # allowlisted JSON that is not in this tuple leaks unauthenticated.
-            # The two predictfun_*.json entries were dropped from BOTH on
-            # 2026-08-01 with the cross-venue view.
+            # snapshot.json holds operator and mode state, per-wallet DRY/LIVE,
+            # group caps, the live CLOB balance and strategy thresholds, so it
+            # needs the same auth as /events (JS and CSS stay open so the login
+            # page can load). Without a router, _handle_auth_status returns
+            # 503. Keep this tuple and _ALLOWED_DASHBOARD_STATIC in sync: an
+            # allowlisted JSON file missing from here is served without auth.
             if path in ("/snapshot.json",):
                 if post_router is None:
                     self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {
@@ -776,45 +735,39 @@ def _make_handler(
             return hmac.compare_digest(referer_origin, expected_origin)
 
         def _handle_login(self) -> None:
-            """Issue a `session_token` cookie when the request carries the
-            shared dashboard password. POST `{ "password": "..." }`.
+            """Set a ``session_token`` cookie when the request carries the
+            dashboard password. POST ``{ "password": "..." }``.
 
-            Security finding #35: per-IP sliding-window rate limit so a
-            brute-force attempt against `CRYPTOBOT_DASHBOARD_PASS` is
-            throttled to `LOGIN_RATE_LIMIT_ATTEMPTS` attempts per
-            `LOGIN_RATE_LIMIT_WINDOW_S` window. The 429 response keeps
-            the attacker's signal noisy without locking the operator out
-            permanently.
+            Rate-limited per IP to ``LOGIN_RATE_LIMIT_ATTEMPTS`` attempts per
+            ``LOGIN_RATE_LIMIT_WINDOW_S``. The 429 slows guessing without
+            locking the operator out for good.
             """
             if post_router is None:
                 self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {
                     "reason": "post_router_not_configured",
                 })
                 return
-            # Security finding: a credential endpoint must not be invoked via a
-            # safe/cacheable method. GET /api/v2/auth/login routes here (do_GET);
-            # reject any non-POST before reading the body or charging the
-            # limiter so a proxy-stripped GET body cannot burn rate-limit slots.
+            # A credential endpoint must not answer a safe, cacheable method.
+            # GET routes here too (do_GET), so reject anything but POST before
+            # reading the body or counting an attempt.
             if self.command != "POST":
                 self._send_json(HTTPStatus.METHOD_NOT_ALLOWED, {
                     "reason": "method_not_allowed",
                 })
                 return
-            # Security finding: if no dashboard password is set there is
-            # nothing to brute-force — short-circuit BEFORE charging the
-            # limiter so unset-pass requests don't burn an operator's budget.
+            # With no password set there is nothing to guess; return before
+            # counting an attempt.
             if not post_router._session_token:  # type: ignore[attr-defined]
                 self._send_json(HTTPStatus.UNAUTHORIZED, {
                     "reason": "dashboard_pass_unset",
                 })
                 return
-            # Behind the supported TLS-terminating proxy the socket peer is the
-            # proxy's single IP, collapsing per-IP throttling into one shared
-            # bucket that locks out every real operator. Derive the client from
-            # the first X-Forwarded-For hop, but ONLY when the trusted-proxy
-            # flag is set (otherwise XFF is attacker-spoofable on the loopback
-            # default). The in-memory limiter is per-instance and bypassable by
-            # IP rotation — it is a noise throttle, not an access control.
+            # Behind a TLS-terminating proxy every request comes from the
+            # proxy's IP, which would put all operators in one rate-limit
+            # bucket. Use the first X-Forwarded-For hop instead, but only when
+            # the trusted-proxy flag is set (otherwise the header can be
+            # spoofed). The limiter is per process and can be dodged by
+            # rotating IPs; it slows guessing, it is not access control.
             if os.environ.get("CRYPTOBOT_DASHBOARD_TLS_TERMINATED", "0") == "1":
                 fwd = (self.headers.get("X-Forwarded-For") or "").split(",")[0].strip()
                 client_ip = fwd or (
@@ -872,10 +825,8 @@ def _make_handler(
             self.wfile.write(data)
 
         def _handle_auth_status(self) -> None:
-            # Security finding: when run standalone (post_router=None)
-            # the old `post_router is None or ...` short-circuit returned 200,
-            # which the JS client reads as 'authenticated' and then opens the
-            # SSE/ledger stream. Fail closed instead of signalling logged-in.
+            # Standalone (post_router=None): return 503. A 200 would make the
+            # client think it is logged in and open the SSE stream.
             if post_router is None:
                 self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {
                     "reason": "auth_not_configured",
@@ -887,11 +838,10 @@ def _make_handler(
             self._send_json(HTTPStatus.UNAUTHORIZED, {"reason": "unauthorized"})
 
         def _read_capped_body(self) -> Optional[bytes]:
-            """Read the POST body with `MAX_POST_BODY_BYTES` cap.
+            """Read the POST body, capped at ``MAX_POST_BODY_BYTES``.
 
-            Security finding #34: a single attacker request could allocate
-            arbitrary memory via the `Content-Length` header. Returns the
-            body bytes or `None` after emitting a 413 response.
+            Prevents a large ``Content-Length`` from allocating arbitrary
+            memory. Returns the body, or ``None`` after sending a 413.
             """
             try:
                 length = int(self.headers.get("Content-Length") or 0)
@@ -940,11 +890,10 @@ def _make_handler(
                 self.end_headers()
                 self.wfile.write(b"too many SSE clients")
                 return
-            # Tighten the socket so a stuck client cannot block the handler
-            # for more than the configured per-client write timeout. Without
-            # this, ``wfile.write`` can stall on TCP backpressure indefinitely
-            # and dashboard rendering stops behind one slow browser tab
-            # (review finding #50).
+            # Set a socket timeout so one stuck client cannot block the handler
+            # longer than the per-client write timeout; otherwise
+            # ``wfile.write`` could stall on TCP backpressure and stop the
+            # dashboard behind one slow tab.
             try:
                 self.connection.settimeout(config.SSE_CLIENT_WRITE_TIMEOUT_S)
             except (OSError, AttributeError):
@@ -956,7 +905,7 @@ def _make_handler(
                 self.send_header("Connection", "keep-alive")
                 self.send_header("X-Accel-Buffering", "no")
                 self.end_headers()
-                # Initial comment so the browser flips into "connected".
+                # Initial comment so the browser marks the stream connected.
                 try:
                     self.wfile.write(b": connected\n\n")
                     self.wfile.flush()
@@ -966,7 +915,7 @@ def _make_handler(
                     try:
                         event = q.get(timeout=15.0)
                     except queue.Empty:
-                        # Heartbeat comment to keep the connection alive.
+                        # Heartbeat comment to keep the connection open.
                         try:
                             self.wfile.write(b": heartbeat\n\n")
                             self.wfile.flush()
@@ -998,11 +947,11 @@ def start_server(
     dashboard_dir=None,
     post_router: Optional[PostRouter] = None,
 ) -> tuple[_ThreadingServer, threading.Thread]:
-    """Bind, start in a daemon thread; return (httpd, thread).
+    """Bind and start in a daemon thread; return (httpd, thread).
 
-    When `post_router` is supplied the handler responds to `/api/v2/*`
-    POST endpoints with cookie auth (D-LIVE-13). Without it, operator POSTs,
-    snapshot reads, and the SSE stream fail closed with 503 responses.
+    With ``post_router`` the handler serves the ``/api/v2/*`` endpoints with
+    cookie auth. Without it, operator POSTs, snapshot reads and the SSE stream
+    all return 503.
     """
     host = host if host is not None else config.DASHBOARD_BIND_HOST
     port = port if port is not None else config.DASHBOARD_HTTP_PORT
