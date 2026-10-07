@@ -1,8 +1,7 @@
 /* ===========================================================================
- * cryptobot — operator night desk (dark terminal theme)
+ * cryptobot dashboard (dark terminal theme)
  * ---------------------------------------------------------------------------
- * 2026-07-07 full redesign. The light "paper journal" was replaced with a
- * layered dark trading-terminal system: blue-black canvas, hairline-separated
+ * A layered dark trading-terminal look: blue-black canvas, hairline-separated
  * surfaces, one restrained accent (Polymarket blue, brightened for dark),
  * and direction colors (green/red) reserved STRICTLY for P&L / YES-NO /
  * WIN-LOSS — never for chrome or status.
@@ -217,12 +216,7 @@ body::before {
 .conn.reconnecting { color: var(--warn); border-color: var(--warn-line); } .conn.reconnecting .d { background: var(--warn); }
 .conn.rejected, .conn.mock { color: var(--neg); border-color: var(--neg-line); } .conn.rejected .d, .conn.mock .d { background: var(--neg); }
 
-/* venue badge (topbar) — PASSIVE. The segmented `.venue-seg` SWITCHER it
-   replaced was removed 2026-08-01 with the cross-venue view: each console is
-   single-venue by deployment (:8800 Polymarket / :8801 predict.fun), so a
-   switcher could only pin the console to a venue it cannot render. Accent hue
-   for Polymarket; the info hue for predict.fun so a non-Polymarket console is
-   unmistakable on a live-money desk. */
+/* venue badge (topbar): a passive label naming the venue. */
 .badge-venue { background: var(--accent-bg); color: var(--accent-ink); border-color: var(--accent-line); }
 .badge-venue::before { animation: none; }
 
@@ -402,7 +396,7 @@ body::before {
 .streak-chip.w { background: var(--c-pos); }
 .streak-chip.l { background: var(--c-neg); }
 
-/* shared meter bar — MeterBar (shell.jsx); Live/Wallet/group grids + .cmp table retired 2026-07-11 */
+/* shared meter bar — MeterBar (shell.jsx) */
 .meter { height: 6px; border-radius: var(--r-pill); overflow: hidden; background: rgba(255,255,255,0.06); }
 .meter > div { height: 100%; border-radius: var(--r-pill); transition: width 0.25s var(--ease); }
 
@@ -520,9 +514,8 @@ body::before {
 .hero-value { font-family: var(--ff-display); font-size: 52px; font-weight: 700; letter-spacing: -0.035em; line-height: 0.95; font-variant-numeric: tabular-nums; }
 /* graph-paper backdrop behind the flagship chart only */
 .hero-chart { background-image: radial-gradient(rgba(255,255,255,0.035) 1px, transparent 1px); background-size: 22px 22px; border-radius: var(--r-2); }
-/* Equity and drawdown are SEPARATE panes inside the hero card (operator
- * 2026-08-05) — own header each, hairline + gap between them so the two
- * curves never read as one stacked chart. */
+/* Equity and drawdown are separate panes inside the hero card, each with its
+ * own header and a hairline gap, so the two curves never read as one chart. */
 .hero-pane { min-width: 0; }
 .hero-pane + .hero-pane { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--border-faint); }
 .hero-pane-head { font-size: 9.5px; color: var(--fg-3); text-transform: uppercase; letter-spacing: 0.1em; font-weight: 650; margin-bottom: 7px; }
@@ -543,11 +536,6 @@ body::before {
 
 /* scope-pill group spacer (journal filters) */
 .scope-gap { width: 10px; border-left: 1px solid var(--border); margin: 2px 4px; }
-
-/* The latency BUDGET BAR styles (.lat-rows/.lat-row/.lat-track/.lat-bar/
- * .lat-seg/.lat-marker/.lat-legend) and their "Latency waterfall" section
- * header were deleted 2026-08-05 with the "where the tick goes" panel they
- * dressed — see pages-latency.jsx. */
 
 /* live motion — one-shot flashes keyed to element mount */
 @keyframes hero-pulse {
