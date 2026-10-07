@@ -1,9 +1,9 @@
-"""Live-like tick execution primitives for the v2 subminute strategy and PURE_STOP_04.
+"""Tick-level execution replay for sub-minute strategies.
 
-The scored artifact supplies walk-forward 11-feature probabilities once per
-second. Raw PMData supplies sub-second UP-token books. This module owns side
-selection, edge-preserving entry quoting, delayed partial FAK buys, dynamic
-held-side stop scoring, and delayed full-size FOK sells.
+The scored artifact gives a model probability every second; raw PMData gives
+sub-second YES-token books. This module handles side selection, edge-preserving
+entry quotes, delayed partial FAK buys, held-side re-scoring and delayed
+full-size FOK sells.
 """
 from __future__ import annotations
 
@@ -18,10 +18,8 @@ from polymarket.backtest.engine.sweep_lib import POLY_FEE_THETA
 from polymarket.backtest.lib.tick_store import DEFAULT_TICK_DB, TickStore, open_store
 
 POOL_PATH = BT_RUNS_DIR / "scored_11set_truth.parquet"
-# The last-30s books are ONE SQLite file since 2026-07-31. The old flat
-# ``poly_tick_last30/`` dir and its ``TICK_DIR`` constant are GONE on purpose:
-# a constant naming a deleted directory silently globs to an empty slug set and
-# reports "0 qualifying markets" instead of failing. Read through the store.
+# The last-30-second books are stored in one SQLite file; read them through the
+# tick store.
 TICK_DB = DEFAULT_TICK_DB
 FOLDS = ("B", "C", "D", "E")
 
@@ -107,27 +105,19 @@ def fee(price):
 
 
 def entry_fee_usd(price: float, shares: float) -> float:
-    """USD entry-leg taker fee LIVE would book for ``shares`` bought at ``price``.
+    """USD entry fee live trading would book for ``shares`` bought at
+    ``price``.
 
-    SETTLEMENT accounting only — ``fee()`` above stays the DECISION-path rate
-    (it feeds ``model_probability`` and the edge-preserving book walk, which
-    mirror the live pre-bet edge gate and must not move).
+    For settlement only; ``fee()`` above stays the decision-time rate (it feeds
+    ``model_probability`` and the book walk, which mirror the live edge gate).
 
-    Delegates to the live source of truth,
-    ``cryptobot.execution.grade_fees.entry_fee_usd``, so the replay books the
-    exact number the ledger books and the two cannot drift. Two things the old
-    inline ``cash_usd * fee(vwap)`` got wrong:
+    Delegates to ``cryptobot.execution.grade_fees.entry_fee_usd`` so the replay
+    books exactly what the ledger books. The fee is per share
+    (``theta*p*(1-p)`` on every share, i.e. ``cash*theta*(1-p)``), and includes
+    ``POLY_FEE_CALIBRATION`` (0.864), the fraction of the published curve the
+    venue was measured to charge.
 
-      * the fee is per SHARE, not per dollar of notional — live charges
-        ``theta*p*(1-p)`` on every share, i.e. ``cash*theta*(1-p)``, so the
-        inline form under-charged by a factor of ``p``;
-      * it omitted ``POLY_FEE_CALIBRATION`` (0.864), the wallet-tape measured
-        fraction of the published parabola the venue actually extracts.
-
-    Polymarket charges NO fee on the exit (stop SELL) leg — verified on the
-    2026-07-23 wallet-tape reconciliation and mirrored by
-    ``execution.stop_loss``, which books ``proceeds - cost - entry_fee``.
-    There is deliberately no ``exit_fee_usd`` here.
+    Polymarket charges no fee on the sell leg, so there is no exit fee here.
     """
     from cryptobot.execution.grade_fees import entry_fee_usd as _live_entry_fee
 

@@ -25,31 +25,13 @@ from polymarket.backtest import BT_RUNS_DIR  # noqa: E402
 POOL_DIR = str(BT_RUNS_DIR / "option3_pool")
 
 FOLD_ORDER = ("A", "B", "C", "D", "E")
-HOLDOUT_FOLD = "E"  # PROTOCOL.md: touch exactly once, in 08_holdout_E only
+HOLDOUT_FOLD = "E"  # final holdout: evaluate once, after everything is frozen
 EMBARGO_S = 3600
 
 COIN_MAP = {"btc": 0, "eth": 1, "sol": 2, "xrp": 3}
 
-# ``FEATURES_11`` is what LIVE actually scores with, on BOTH intervals. Verified
-# against the deployed artifact: data/models/checkpoint_v1/checkpoint_v1_manifest.json
-# carries feature_key == "11set" and an IDENTICAL 11-column feature_columns list
-# for '5m' and '15m'. Keep this list in that order — it is the manifest's order.
-FEATURES_11 = [
-    "model_p_side", "rf_edge", "ask", "other_ask", "book_spread",
-    "coin_id", "interval_min", "side_up", "entry_minute", "hour_utc", "dow_utc",
-]
-# DELETED 2026-08-03: ``FEATURES_5`` (exp044's 15m-sleeve convention) and
-# ``FEATURES_ASK_ONLY``, with their ``score_wfo`` feature keys "5set" / "ask".
-# exp044 was retired 2026-07-31; the subminute sleeves that replaced it score
-# through checkpoint_v1 on 11set at BOTH intervals, so "the 15m feature set"
-# described no deployed model and a caller selecting it would have silently
-# produced a live-parity error. A literal caller census that day found zero
-# references to either name anywhere in the repo.
-
-
-# top-of-book analysis columns; excludes the fill-ladder lists, which multiply
-# memory ~10x and are only needed for depth-walk sims (memory rule:
-# feedback_wfo_memory_budget)
+# Top-of-book analysis columns. The fill-ladder lists are left out: they use
+# ~10x the memory and only depth-walk simulations need them.
 LIGHT_COLUMNS = [
     "market_slug", "coin", "interval", "slug_ts", "entry_ts", "entry_dt",
     "checkpoint_sec", "offset_sec", "range_sec", "entry_minute", "fold", "won_up",
@@ -64,12 +46,13 @@ LIGHT_COLUMNS = [
 def load_pool(grids=("step5", "step1last"), convention="option3", holdout_visible=False,
               columns: list[str] | None = None, ladders: bool = False,
               offset_mod: tuple[int, int] | None = None) -> pd.DataFrame:
-    """Load and concat pool part-files. E rows are hidden unless explicitly asked.
+    """Load and concatenate pool part files. Fold E rows are hidden unless
+    asked for.
 
-    Defaults to LIGHT_COLUMNS (no ladder lists); pass ladders=True only for
-    depth-walk simulations. offset_mod=(m, r) keeps rows with offset_sec % m == r
-    — memory-bounded subgrid loading for the 15M-row step5 pool (filtered per
-    part-file before concat, per feedback_wfo_memory_budget).
+    Defaults to LIGHT_COLUMNS (no book ladders); pass ladders=True only for
+    depth-walk simulations. offset_mod=(m, r) keeps rows with offset_sec % m ==
+    r, filtered per part file before concatenation to bound memory on the large
+    step5 pool.
     """
     if columns is None and not ladders:
         columns = LIGHT_COLUMNS
@@ -92,17 +75,16 @@ def load_pool(grids=("step5", "step1last"), convention="option3", holdout_visibl
             df["grid"] = g
             frames.append(df)
     pool = pd.concat(frames, ignore_index=True)
-    # cross-grid exact duplicates: step5's 5s offsets inside the last 30s are the
-    # same decision seconds step1last covers at 1s — keep one row per
-    # (market, decision second). step1last (listed later in `grids`) wins the tie
-    # so the last-30s rows carry a single consistent grid label.
+    # step5's 5-second offsets inside the last 30 seconds are the same decision
+    # seconds step1last covers at 1s; keep one row per (market, decision
+    # second), preferring step1last (listed later in ``grids``) so those rows
+    # share one grid label.
     if "offset_sec" in pool.columns:
         pool = pool.drop_duplicates(subset=["market_slug", "offset_sec"], keep="last").copy()
     if "qa_book_crossed" in pool.columns:
         pool = pool[~pool["qa_book_crossed"]].copy()
-    # labels are re-merged from the canonical outcomes parquet at every load:
-    # the 2026-07-07 Chainlink-primary rebuild changed 14 D-fold labels vs the
-    # values baked in at pool-build time, and future rebuilds must flow through.
+    # Labels are re-merged from the canonical outcomes parquet on every load,
+    # so label corrections made after the pool was built always apply.
     from polymarket.backtest.lib import pmdata_clean as pc
 
     fresh = pc.load_outcomes(pc.OUTCOMES_PATH, ok_only=True)
@@ -137,7 +119,7 @@ def side_frame(pool: pd.DataFrame) -> pd.DataFrame:
     dt = pd.to_datetime(out["entry_ts"], unit="s", utc=True)
     out["hour_utc"] = dt.dt.hour.astype(float)
     out["dow_utc"] = dt.dt.dayofweek.astype(float)
-    # model sees the decision ask for its side (rename to exp044 conventions)
+    # The model sees its own side's decision ask.
     out = out.rename(columns={"ask": "ask_up_raw"})
     out["ask"] = out["side_ask"]
     out["other_ask"] = np.where(out["side_up"] == 1, out["other_ask"], out["ask_up_raw"])
@@ -149,10 +131,9 @@ def fee(ask: np.ndarray) -> np.ndarray:
 
 
 # ============================================================================
-# CANONICAL EVALUATOR (frozen 2026-07-08) — every money-relevant number flows
-# through these two functions. Filter order is FROZEN: band filters (interval/
-# coins/ask/offset) -> reachable -> dedup (first offset per market) -> gate.
-# Changing this order changes bet counts ~2x (measured); do not reorder.
+# Canonical bet spec. Filter order: band filters (interval, coins, ask, offset)
+# -> reachable -> dedup (first offset per market) -> gate. Changing the order
+# roughly halves or doubles bet counts; do not reorder.
 # ============================================================================
 
 BET_SPEC_DEFAULT = {
@@ -167,18 +148,3 @@ BET_SPEC_DEFAULT = {
 }
 
 
-# ============================================================================
-# DELETED 2026-08-03 — the CANONICAL SIZING block (``SIZING_SPEC``,
-# ``stake_weights``, ``DEPTH_CAPS_USD``, ``DEPTH_CAP_FIRST_BIND``), recorded
-# 2026-07-08. A literal caller census found no code reference anywhere in the
-# repo — only prose, including ``polymarket/src/cryptobot/config.py``'s own note that
-# its knobs "originally mirrored the research SIZING_SPEC". LIVE sizing is
-# owned by ``polymarket/live/config/v2_step1last_live.json`` (``capital_frac``
-# 0.01 per sleeve, ``concurrent_exposure_cap_fraction``,
-# ``max_drawdown_halt_frac``) and by ``polymarket/src/cryptobot/config.py`` — and the
-# two had already diverged, so this block described a sizing policy the bot does
-# not run (2.5%/1.25% here vs 1%/1% live, and its per-coin depth caps still
-# list SOL/XRP, dropped from the universe 2026-08-02). Keeping it invited
-# exactly the live-parity error the census exists to catch.
-# Recover with ``git show <this commit>^:polymarket/backtest/lib/pool_study.py``.
-# ============================================================================

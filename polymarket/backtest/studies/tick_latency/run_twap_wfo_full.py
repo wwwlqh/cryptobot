@@ -48,11 +48,13 @@ def _side_win_target(up_label: pd.Series, side_up: pd.Series) -> pd.Series:
 
 
 def _attach_causal_partial_ret_z(pool: pd.DataFrame) -> pd.DataFrame:
-    """Recompute the pool's z feature with RV observable at window open.
+    """Recompute the pool's z feature using volatility observable at window
+    open.
 
-    The retained option3 pool predates the causal-RV correction. Rebuilding the
-    full pool requires retired PMData snapshots, so derive the corrected RV
-    from the retained Binance 1-second caches and overwrite only this feature.
+    The saved option3 pool predates this correction, and rebuilding it needs
+    PMData snapshots that are no longer kept, so the corrected volatility is
+    derived from the saved Binance 1-second caches and only this feature is
+    overwritten.
     """
     frames: list[pd.DataFrame] = []
     for coin, sub in pool.groupby("coin", observed=True, sort=False):
@@ -88,11 +90,10 @@ def _load_side_frame() -> pd.DataFrame:
     pool = _attach_causal_partial_ret_z(pool)
     sf = ps.side_frame(pool)
 
-    # ``side_frame`` contains one Up and one Down row per candidate.  TWAP
+    # ``side_frame`` has one Up row and one Down row per candidate, while TWAP
     # labels are market-level Up labels, so convert them to the side-specific
-    # target the live scorer predicts.  Using ``up_twap_*`` directly on both
-    # rows grades a Down bet as a win when Up wins (and was the defect in the
-    # preliminary 2026-08-12 run).
+    # target the model predicts. Using ``up_twap_*`` on both rows would grade a
+    # Down bet as a win whenever Up wins.
     sf["win_twap_c"] = _side_win_target(sf["up_twap_c"], sf["side_up"])
     sf["win_twap_s"] = _side_win_target(sf["up_twap_s"], sf["side_up"])
 

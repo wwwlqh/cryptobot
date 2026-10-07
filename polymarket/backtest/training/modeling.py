@@ -318,9 +318,8 @@ def _sample_weights(train: pd.DataFrame, mode: str) -> np.ndarray | None:
             np.where(entry >= CHUNK_B_START, 2.0, 1.0),
         ).astype(np.float64)
     elif mode == "fold_recent_boost":
-        # Fold-relative recency: oldest third 1x, middle third 2x, newest
-        # third 4x. This avoids anchoring all-history WFO runs to the legacy
-        # fixed CHUNK_B/C_START dates used by exp044's historical baseline.
+        # Recency weights within the fold: oldest third 1x, middle third 2x,
+        # newest third 4x, rather than fixed calendar dates.
         n = len(train)
         if n == 0:
             return np.zeros(0, dtype=np.float64)
@@ -345,13 +344,10 @@ def _build_hgb_pipe(
     hgb_max_leaf_nodes: int = 31,
     hgb_l2_regularization: float = 0.02,
 ):
-    """Construct the unfitted SimpleImputer(median) -> HGB pipeline.
+    """Build the unfitted SimpleImputer(median) -> HGB pipeline.
 
-    Single source of truth for the residual-edge estimator so the backtest
-    replay (`_fit_predict`) and the persisted live artifact
-    (`training/export_models.py`) build a byte-identical model. Do not inline
-    this constructor anywhere else. (The exp044 `persist_hgb_artifact.py`
-    builder was retired 2026-07-31.)
+    The one constructor for this estimator, so backtest replays and exported
+    models are built identically. Do not inline it elsewhere.
     """
     model = HistGradientBoostingClassifier(
         max_iter=hgb_max_iter,

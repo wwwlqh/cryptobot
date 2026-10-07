@@ -1,21 +1,14 @@
-"""Book-depth lookup for VWAP-based slippage in backtests.
+"""Book-depth index for VWAP-based fill costs in backtests.
 
-Loads a compact flat in-memory L2 ask index — built from the pmdata.dev
-order-book snapshots by the since-deleted ``build_pmdata_book_index`` (dropped
-as dead code in f195822: its raw inputs are permanently gone) — and walks it to
-compute VWAP-based fill haircuts. Memory footprint: ~800 MB for ~2M
-snapshots × ~25 levels avg, vs >8 GB for the naive dict-of-arrays layout
-(which OOMs on pickle).
+Loads a compact memory-mapped L2 ask index built from pmdata.dev order-book
+snapshots: ~800 MB for ~2M snapshots x ~25 levels, against >8 GB for a
+dict-of-arrays (which runs out of memory when pickled).
 
-**The default index cache is GONE (deleted 2026-07-31).**
-``BT_CACHE_DIR/book_depth_index_pmdata/`` went with the great consolidation,
-and its builder had already gone in f195822 — there is no rebuild path. So
-``load_book_depth_index()`` with no ``out_dir`` now always raises
-``FileNotFoundError``; only an explicit ``out_dir`` naming a surviving prebuilt
-index can succeed. The module stays because the walk itself is load-bearing:
-``training/portfolio._load_book_idx_for`` still calls it (catching that
-FileNotFoundError and degrading to ``_fallback_haircut``), and the linear-impact
-fallback below is imported directly at ``portfolio.py:573``.
+There is no default index and no builder in this repo, so
+``load_book_depth_index()`` needs an ``out_dir`` holding a prebuilt index and
+raises ``FileNotFoundError`` otherwise.
+``training/portfolio._load_book_idx_for`` catches that and falls back to
+``_fallback_haircut`` (the linear-impact model below).
 
 Layout:
     book_depth_index_pmdata/
@@ -26,18 +19,16 @@ Layout:
         cum_shares.f32        (parallel, cumulative size)
         index.pkl             (dict[(slug, side, ts)] -> (offset, n_levels, is_cf))
 
-At runtime, the four .f32 files are np.memmap'd (OS pages them in on demand),
-the index dict loads into RAM (~200 MB for ~2M entries).
+The four .f32 files are memory-mapped; the index dict is loaded into RAM (~200
+MB for ~2M entries).
 
-Usage (``out_dir`` is now mandatory in practice — see above):
+Usage:
     from polymarket.backtest.training.book_depth import load_book_depth_index
     idx = load_book_depth_index(Path(prebuilt_index_dir))
     if idx.has(slug, side, ts):
-        ...  # walk idx.prices / idx.cum_cost / idx.cum_shares yourself
+        ...  # walk idx.prices / idx.cum_cost / idx.cum_shares
 
-The index's own ``vwap_haircut`` walker was removed 2026-08-01 at zero callers:
-``training.portfolio._real_vwap`` superseded it (it returns the executable VWAP
-rather than a haircut relative to the quote) and is the only walker left.
+The executable-VWAP walk itself is ``training.portfolio._real_vwap``.
 """
 from __future__ import annotations
 
@@ -116,14 +107,13 @@ def _fallback_haircut(
 
 @lru_cache(maxsize=1)
 def load_book_depth_index(out_dir: Path = INDEX_DIR) -> BookDepthIndex:
-    """Cached loader so multiple Optuna trials in the same process share one
-    memory-mapped index.
+    """Cached loader so Optuna trials in one process share one memory-mapped
+    index.
 
-    The no-arg form ALWAYS raises: ``INDEX_DIR`` was deleted 2026-07-31. Fail
-    LOUD rather than return an empty index — a silently absent book turns "the
-    substrate is gone" into "every fill was free", which is the exact confusion
-    this retirement is supposed to end. Callers allowed to degrade must catch
-    ``FileNotFoundError`` themselves (``portfolio._load_book_idx_for`` does).
+    Raises when the index is missing rather than returning an empty one: an
+    absent book would otherwise look like every fill was free. Callers that may
+    degrade catch ``FileNotFoundError`` themselves
+    (``portfolio._load_book_idx_for`` does).
     """
     if not (out_dir / "manifest.json").exists():
         raise FileNotFoundError(

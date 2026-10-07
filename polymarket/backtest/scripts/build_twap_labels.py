@@ -1,42 +1,37 @@
 #!/usr/bin/env python
 """Build historical proxy labels for the Chainlink TWAP settlement rule.
 
-The saved tape contains the ordinary Chainlink 1-second stream, not Chainlink's
-signed TWAP product. These labels approximate each lookback value with the
-arithmetic mean of available one-second observations. Chainlink does not
-publish the custom feed's weighting, sampling-boundary, rounding, or
-missing-input rules, so this is not an exact reconstruction. Exact post-change
-values are available in Gamma ``eventMetadata``.
+The saved tape is the ordinary Chainlink 1-second stream, not Chainlink's
+signed TWAP product. These labels approximate each lookback value with the mean
+of the available one-second observations. Chainlink does not publish the feed's
+weighting, sampling boundaries, rounding or missing-input rules, so this is an
+approximation; exact values after the switch are in Gamma ``eventMetadata``.
 
-Polymarket moves crypto up/down settlement from a single price snapshot to a
-Time-Weighted Average Price on **2026-08-07 00:00 UTC**: 5m markets initially
-used 30s while 15m used 60s. From **2026-08-14 00:00 UTC**, both intervals use
-60s. Historical rows retain their actual settlement-era lookback.
+Polymarket switched crypto up/down settlement from a single price to a
+time-weighted average on **2026-08-07 00:00 UTC**: 5m markets used 30s and 15m
+used 60s at first, and from **2026-08-14 00:00 UTC** both use 60s. Historical
+rows keep the lookback of their settlement period.
 
-⚠️ WINDOW SEMANTICS: the market slug is ``{coin}-updown-{interval}m-{START_ts}``
-(see ``cryptobot_polymarket/gamma.py`` — the slug is built from
-``window_start_ts``). The ``parse_slug`` docstring in ``backtest/fetch/_common.py``
-calls the field ``resolve_ts``, which is WRONG and would shift every window by a
-full interval if believed. Window = [slug_ts, slug_ts + interval).
+Window semantics: the slug is ``{coin}-updown-{interval}m-{START_ts}`` (see
+``cryptobot_polymarket/gamma.py``), so a window is [slug_ts, slug_ts +
+interval).
 
-The official integration documentation defines 30 and 60 seconds as TWAP
-*lookback* windows. Accordingly, the symmetric opening proxy uses the window
-ending at the market boundary, not a forward-looking window after it. Three
-labels remain for audit continuity:
+The 30s and 60s windows are lookbacks, so the symmetric opening proxy uses the
+window ending at the market boundary, not one after it. Three labels:
 
-  legacy : point open  vs point close    (today's rule — the control; should
-                                          reproduce Gamma at ~99%+, and any
-                                          shortfall bounds our tape/plumbing error)
-  twap_c : point open  vs TWAP close     (close-only TWAP)
-  twap_s : TWAP open   vs TWAP close     (symmetric TWAP)
+  legacy : point open vs point close   (the old rule; should match Gamma
+                                        ~99%+, and any gap measures our tape
+                                        or plumbing error)
+  twap_c : point open vs TWAP close    (close-only TWAP)
+  twap_s : TWAP open  vs TWAP close    (symmetric TWAP)
 
-Resolution rule in all three: Up iff close >= open (tie -> Up), matching the
-official "resolve Up if the data stream shows end-price >= start-price".
+All three resolve Up iff close >= open (a tie is Up), matching Polymarket's
+"resolve Up if end price >= start price".
 
-Boundary convention: close proxy ``(end - N, end]`` and opening proxy
-``(start - N, start]``. A point price is the last tick at or before the
-boundary; if that tick is more than ``--max-stale`` seconds old the market is
-marked unusable rather than silently mislabelled.
+Boundaries: close proxy ``(end - N, end]``, opening proxy ``(start - N,
+start]``. A point price is the last tick at or before the boundary; if it is
+more than ``--max-stale`` seconds old the market is marked unusable rather than
+mislabelled.
 """
 from __future__ import annotations
 

@@ -1,14 +1,6 @@
-"""Shared PMData scoring/fill/settlement helpers for the sub-minute pipeline.
-
-Originally the exp044 target-window evaluator for the frozen
-``data/models/hgb_v1.joblib`` + ``rf_v1.joblib`` pair. That CLI was retired with
-exp044 on 2026-07-31 and both artifacts are now off the disk; what remains is
-the helper library ``training.checkpoint`` / ``build_pool`` / ``offset_wfo``
-import (manifest sleeves, fee/ask-bucket math, pmdata.dev book payloads).
-
-(``offset_validation`` does NOT import this module — an earlier revision of
-this docstring and the footer comment both claimed it did; offset_validation
-imports only ``modeling`` and ``offset_wfo``.)
+"""Shared PMData helpers for the sub-minute research pipeline: sleeve and
+ask-bucket types, fee math, and pmdata.dev book payloads. Imported by
+``training.checkpoint``, ``build_pool`` and ``offset_wfo``.
 """
 from __future__ import annotations
 
@@ -34,20 +26,19 @@ PMDATA_SNAPSHOT_DIR = BT_DATA_DIR / "pmdata" / "poly_snapshot"
 
 
 def require_snapshot_dir() -> Path:
-    """Fail loudly when the 1 Hz pmdata book tree is missing. Call at ENTRY only.
+    """Fail loudly when the 1 Hz pmdata book tree is missing. Call at entry
+    only.
 
-    ``poly_snapshot/`` was deleted on 2026-07-31 in the data consolidation, and
-    every reader below it degrades **silently**: ``_load_raw_snapshot`` and
-    ``offset_wfo._load_top_book_series`` return ``None`` per market, so a rebuild
-    walks the whole universe, drops every row on "no snapshot", and writes an
-    EMPTY pool that reads exactly like "the strategy found no bets". That is the
-    one failure mode a rebuild must never have, so the three chain entries that
-    funnel into those readers — ``training.build_pool.build_grid_pool``,
+    Every reader below degrades silently: ``_load_raw_snapshot`` and
+    ``offset_wfo._load_top_book_series`` return ``None`` per market, so a
+    rebuild would drop every row and write an empty pool that looks like "no
+    bets found". The three entry points that lead to those readers
+    (``training.build_pool.build_grid_pool``,
     ``training.checkpoint._build_pool_for_grid`` and
-    ``training.offset_wfo._attach_raw_ladders`` — call this ONCE up front.
+    ``training.offset_wfo._attach_raw_ladders``) call this once up front.
 
-    Never call it per row or per market: the check is a filesystem stat, and the
-    readers it protects run inside 128k-market loops. Guard at the entry, once.
+    Do not call it per row or per market; the readers run inside loops over
+    ~128k markets.
     """
     if not PMDATA_SNAPSHOT_DIR.is_dir():
         raise FileNotFoundError(
@@ -84,15 +75,9 @@ class ManifestSleeve:
 
 
 # --------------------------------------------------------------------------- #
-# Sleeve/ask-bucket value types. RELOCATED VERBATIM 2026-08-01 (phase 6) out of
-# ``training.residual_replay`` (SleeveConfig) and ``training.residual_matrix``
-# (AskBucket, _split_csv, _parse_buckets) when both of those research CLIs were
-# deleted — their run() entry points died at ``modeling._load_full_table`` on
-# the deleted artifacts/decision_table.parquet. Signatures are unchanged.
-# ``_sleeve_configs`` below is SleeveConfig's only production constructor, and
-# ``offset_validation._simulate_wallet`` reads exactly three of its fields
-# (stake_frac, max_bet_usd, book_consumption_max); the rest are carried so the
-# dataclass stays signature-compatible with what it replaced.
+# Sleeve and ask-bucket value types. ``_sleeve_configs`` below is the only
+# constructor of SleeveConfig, and ``offset_validation._simulate_wallet`` reads
+# three of its fields (stake_frac, max_bet_usd, book_consumption_max).
 # --------------------------------------------------------------------------- #
 @dataclass(frozen=True)
 class AskBucket:
@@ -276,50 +261,5 @@ def _raw_book_payload(row) -> tuple[dict, float] | None:
     return {"asks": asks}, depth_usd
 
 
-# RETIRED 2026-07-31 (exp044): the main() CLI that used to sit here scored a
-# target window with the frozen hgb_v1.joblib + rf_v1.joblib pair. Both joblibs
-# and both loaders are gone (phases 1-3), so the entry point went with them.
-# RETIRED 2026-08-01 (phase 4): `_evaluate_wallet_raw` — the raw-book wallet
-# simulator that CLI drove — and its only helper `_raw_execution_fill` went too;
-# with main() gone neither had a caller, and `_raw_execution_fill` was the sole
-# user of the `walk_book_edge_preserving` import.
-# RETIRED 2026-08-01 (phase 5): the leftovers that CLI had been the only reason
-# for — `import argparse`, `import json`, `_json_default` (its json.dumps
-# `default=` hook), the `BT_CACHE_DIR`/`BT_RUNS_DIR` imports, `BOOK_DIR` (the
-# book_depth_index_pmdata cache, deleted 2026-07-31), `SNAP_FEATURES` (nothing
-# has read the narrow snapshot_features.parquet since the pool moved to the
-# _full frame) and the `load_book_depth_index` / `_evaluate_wallet` imports.
-# Each was confirmed zero-consumer by a repo-wide grep before removal; the
-# functions themselves still live in book_depth.py, which training.portfolio
-# still imports.
-# RETIRED 2026-08-01 (phase 6), all grep-confirmed zero-consumer:
-#   * the exp044 scoring chain `_rf_probs` / `_score_side` / `_build_candidates`
-#     — their `hgb`/`rf` parameters were the retired hgb_v1/rf_v1 joblib loaders
-#     (deleted af3c124). `_build_candidates` held this file's ONLY `ev.` use, so
-#     the `modeling as ev` import went with it, cutting the
-#     pmdata_target -> modeling -> portfolio -> optuna import edge.
-#   * `_attach_labels` + the `forward_oos_regrade.Settler` import (a one-way
-#     research->arbiter edge; forward_oos_regrade never imports training/*).
-#   * `OPR_SELECTED_FILTERS` + `_apply_selected_opr_filters`. `_attach_opr_columns`
-#     STAYS — checkpoint.py calls it.
-#   * `RES_CACHE` / `_ts`, and the whole binance-kline subsystem (`KLINE_CACHE`,
-#     `SYMBOLS`, `BINANCE_URL`, `_ms`, `_init_kline_cache`, `_fetch_binance`,
-#     `_ensure_klines`, `_load_bars`, `_attach_partial_ret_z`) with the
-#     `sqlite3` / `time` / `requests` / `Iterable` / `REPO_ROOT` imports it alone
-#     needed. Every external consumer of that block lived inside the zero-caller
-#     `offset_wfo._attach_offset_features`, deleted in the SAME commit — do both
-#     or neither. NOTE the DATA is not missing: both
-#     data/server_snapshot/oos_resolutions_cache.sqlite and
-#     binance_signal_log_1m_cache.sqlite still exist on disk; only the constants
-#     naming them are gone. Nothing was deleted from disk.
-# ARRIVED 2026-08-01 (phase 6): `SleeveConfig` (from residual_replay) and
-# `AskBucket` / `_split_csv` / `_parse_buckets` (from residual_matrix), verbatim,
-# when both of those modules were deleted whole.
-# Everything above is the SHARED helper surface the surviving sub-minute
-# pipeline imports (training.checkpoint, training.build_pool, and — for the
-# per-second feature/book substrate — training.offset_wfo) — do not delete this
-# module. `_raw_book_payload` (offset_wfo) and `_load_raw_snapshot` (build_pool,
-# offset_wfo) are live, and `require_snapshot_dir` is the fail-fast guard in
-# front of both. build_pool.py reaches `_load_raw_snapshot.__wrapped__`, so the
-# @lru_cache above it is load-bearing: removing it breaks build_pool at RUNTIME
-# with AttributeError, not at import.
+# ``build_pool.py`` uses ``_load_raw_snapshot.__wrapped__``, so the @lru_cache
+# on it must stay (removing it fails at runtime, not import).

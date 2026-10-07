@@ -1,29 +1,14 @@
-"""SQLite-backed store for the last-30s per-tick book substrate.
+"""SQLite store for the last-30-second per-tick books.
 
-Replaces the 61k-file ``pmdata/poly_tick_last30/<slug>.parquet`` flat directory
-with ONE file, ``pmdata/poly_tick_last30.db``. Each slug's frame is kept as
-parquet *bytes* in a BLOB, so the list-valued columns (``ask_prices``,
-``ask_sizes``, ``bid_prices``, ``bid_sizes``) round-trip exactly and a reader
-still pays one columnar decode per market — no row-shredding, no schema drift.
+One file, ``pmdata/poly_tick_last30.db``, holds each market's frame as parquet
+bytes in a BLOB, so the list columns (``ask_prices``, ``ask_sizes``,
+``bid_prices``, ``bid_sizes``) round-trip exactly and a reader decodes one
+market at a time. A single file avoids the cost of listing tens of thousands of
+small files on a synced volume; ``list_slugs()`` is one index scan.
 
-Why one DB: 61k small files on a OneDrive-synced NTFS volume cost more in
-directory metadata than in payload; enumeration (``glob``) was the slow part of
-every WFO load. ``list_slugs()`` is a single index scan.
-
-Writers: ``TickStore`` serializes every write through one connection guarded by
-a lock, so the downloader's ``ThreadPoolExecutor`` can call ``write_ticks``
-from any worker. Readers are also serialized on that lock, which is fine —
-replay workloads are single-threaded and the blob decode happens outside it.
-
-RETIRED 2026-08-01: the one-off migration CLI (``main`` / ``_verify`` /
-``migrate_parquet_dir`` / ``TickStore.write_blob`` / ``DEFAULT_PARQUET_DIR``,
-folded in here from a 114-line script the day before). It walked
-``pmdata/poly_tick_last30/<slug>.parquet`` into this DB — and that flat tree was
-DELETED 2026-07-31 once ``--verify`` signed the DB off, with no rebuild path, so
-every entry point into it could only ever fail on a missing directory. This
-module is now the store and nothing else. Recover the migrator with
-``git show <this commit>^:polymarket/backtest/lib/tick_store.py`` if a future
-consolidation ever needs the same walk.
+``TickStore`` sends every write through one lock-guarded connection, so the
+downloader's thread pool can call ``write_ticks`` from any worker. Reads take
+the same lock; decoding happens outside it.
 """
 from __future__ import annotations
 

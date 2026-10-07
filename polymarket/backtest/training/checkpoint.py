@@ -1,8 +1,8 @@
-"""Leak-clean WFO for HGB+ORB checkpoint grids.
+"""Leak-free walk-forward validation for HGB checkpoint grids.
 
-This is a research-only harness. It tests whether the ORB-gated HGB sleeves still
-work when the decision checkpoints move from whole-minute marks to sub-minute
-grids. It does not write live artifacts or change runtime configuration.
+Research only. Tests whether the HGB sleeves still work when decisions move
+from whole-minute marks to sub-minute grids. It writes no live artifacts and
+changes no runtime configuration.
 """
 from __future__ import annotations
 
@@ -64,10 +64,9 @@ GRID_SPECS: dict[str, dict[str, tuple[int, ...]]] = {
         "5m": tuple(range(5, 300, 5)),
         "15m": tuple(range(5, 900, 5)),
     },
-    # 1s cadence over the LAST 30s only (operator 2026-07-02: test whether
-    # per-second capture of the flickering gate beats the step5 $44k combo).
-    # Offsets 270-299 (5m) / 870-899 (15m); range_sec pinned to 5 below so the
-    # ORB features match step5's construction (apples-to-apples).
+    # 1-second cadence over the last 30 seconds only (offsets 270-299 for 5m,
+    # 870-899 for 15m). range_sec is pinned to 5 below so the opening-range
+    # features are built the same way as step5's.
     "step1last": {
         "5m": tuple(range(270, 300, 1)),
         "15m": tuple(range(870, 900, 1)),
@@ -75,14 +74,13 @@ GRID_SPECS: dict[str, dict[str, tuple[int, ...]]] = {
 }
 GRID_ORDER = tuple(GRID_SPECS)
 
-# Per-grid ORB range override. Default is min(grid offsets), which for a
-# last-seconds-only grid would silently become a 270s opening range — a
-# different strategy. Pin step1last to step5's 5s range instead.
+# Per-grid opening-range override. The default is the grid's smallest offset,
+# which for a last-30-seconds grid would mean a 270s opening range, a different
+# strategy. Pin step1last to step5's 5s range.
 RANGE_SEC_OVERRIDE: dict[str, int] = {"step1last": 5}
-# Provenance-only paths for the EXP044_REFERENCE block below. Both files are GONE
-# from disk (exp044 retirement, 2026-07-31) — nothing reads them; they survive
-# solely to render the ``source_config`` / ``source_digest`` manifest strings that
-# name where the frozen reference numbers came from.
+# Names used only in the manifest's ``source_config`` / ``source_digest``
+# strings to record where the reference numbers came from; the files are not
+# read.
 EXP044_LIVE_CONFIG = BT_RUNS_DIR / "exp044_live.json"
 EXP044_STRATEGY_DIGEST = BT_RUNS_DIR / "opr_exp044_strategy_digest.md"
 
@@ -122,19 +120,12 @@ EXP044_REFERENCE = {
     ),
 }
 
-# The exp044 sleeve RECIPE, frozen verbatim from ``data/models/hgb_v1_manifest.json``
-# on 2026-07-31 (exp044 phase 3).
-#
-# This harness never scored with the hgb_v1 joblib — it refits its own per-window
-# pipelines — it only read the manifest for the recipe: which feature columns each
-# interval's HGB trains on, the HGB hyperparameters, the sample-weight mode, and the
-# gate/sizing knobs (``threshold`` / ``stake_frac`` / ``ask_bucket`` /
-# ``book_consumption_max``) that ``etgt._sleeve_configs`` turns into wallet sleeves.
-# Loading a 1.2 MB joblib to reach a JSON blob was the only thing keeping hgb_v1 alive,
-# and the artifact has no rebuild path, so the recipe is inlined instead. These are
-# FROZEN research constants — the same treatment EXP044_REFERENCE above already gets —
-# and must not drift: changing a number here silently re-specifies every grid this
-# harness has ever compared against.
+# The minute-boundary baseline sleeve recipe: each interval's HGB feature
+# columns, hyperparameters, sample-weight mode, and the gate/sizing settings
+# (``threshold`` / ``stake_frac`` / ``ask_bucket`` / ``book_consumption_max``)
+# that ``etgt._sleeve_configs`` turns into wallet sleeves. The harness fits its
+# own per-window models; only this recipe is reused. These are fixed research
+# constants: changing a number re-specifies every grid compared against them.
 EXP044_SLEEVES: dict[str, dict[str, Any]] = {
     "5m": {
         "name": "exp044_5m_pmdata_strict_thr075_s010",
@@ -176,8 +167,8 @@ EXP044_SLEEVES: dict[str, dict[str, Any]] = {
         "ask_bucket": "mid:0.4:0.6",
     },
 }
-# Shaped like the retired manifest so ``manifest["sleeves"][interval]`` still resolves
-# in _fit_hgb_pipelines / _side_rows_for_hgb without touching their signatures.
+# Shaped like a model manifest so ``manifest["sleeves"][interval]`` works in
+# _fit_hgb_pipelines / _side_rows_for_hgb.
 EXP044_MANIFEST: dict[str, Any] = {
     "artifact_version": "hgb_v1",
     "exp044_run_id": "exp044_pmdata_hgb_strict15mboost_20260605",
@@ -824,17 +815,13 @@ def _build_pool_for_grid(
     sleeves: dict[str, etgt.ManifestSleeve],
     args: argparse.Namespace,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
-    # ENTRY GUARD (2026-08-01). Both funnels below read the poly_snapshot tree
-    # deleted 2026-07-31 — _prepare_grid_rows -> _attach_checkpoint_books ->
-    # base._load_top_book_series for the shifted grids, and _score_grid_pool ->
-    # _score_rows_with_model -> base._attach_raw_ladders for every grid,
-    # baseline60-refit included. Both return empty when the tree is gone, so
-    # run() would write a zero-row pool_<grid>.parquet and a build_diag that
-    # reads as "the strategy found no bets". One call here covers both; it sits
-    # in _build_pool_for_grid rather than run() so the default
-    # `--grids baseline60 --baseline-mode reference` path, which reads the
-    # frozen exp044 reference and never touches a book, still runs without the
-    # substrate.
+    # Both paths below read the poly_snapshot tree (_prepare_grid_rows via the
+    # top book series for shifted grids, and _score_grid_pool via the raw
+    # ladders for every grid). Without the tree they return nothing and run()
+    # would write an empty pool that reads as "no bets found", so check once
+    # here. It sits in _build_pool_for_grid rather than run() so the default
+    # ``--grids baseline60 --baseline-mode reference`` path, which never reads
+    # a book, still works without the data.
     etgt.require_snapshot_dir()
     t0 = time.time()
     rows, prep_diag = _prepare_grid_rows(markets, grid_name)

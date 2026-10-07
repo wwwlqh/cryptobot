@@ -1,43 +1,35 @@
-"""Fetch OFFICIAL Polymarket resolutions (Gamma API) and build pmdata_outcomes.parquet.
+"""Fetch Polymarket's official resolutions (Gamma API) and build
+pmdata_outcomes.parquet.
 
-Polymarket settles crypto up/down markets on Chainlink; the venue's recorded
-resolution follows that and exists for FULL history via Gamma ``/markets?slug=``.
-This is the SINGLE Gamma resolution fetcher (2026-07-12 consolidation): it pulls
+Polymarket settles crypto up/down markets from Chainlink, and Gamma's
+``/markets?slug=`` has the recorded result for the full history. This pulls
 ``gamma_won_up`` for every live-coin market and folds the results into
-``pmdata_outcomes.parquet`` — the canonical settlement table whose ``won_up``
-column is read by the WFO arbiter (polymarket.backtest.training.offset_wfo),
-`lib/pmdata_clean.load_outcomes`, `training/build_pool._load_ok_outcomes` and
-`training/checkpoint._load_outcomes`.
+``pmdata_outcomes.parquet``, the settlement table whose ``won_up`` column is
+read by the walk-forward evaluation (training.offset_wfo),
+``lib/pmdata_clean.load_outcomes``, ``training/build_pool._load_ok_outcomes``
+and ``training/checkpoint._load_outcomes``.
 
-Universe = live-coin (btc/eth/sol/xrp) markets in pmdata/snapshot_features_full.parquet
-(the book-snapshot universe), UNION any slug already in pmdata_outcomes.parquet
-(so WFO markets keep coverage; this accumulated parquet also already carries
-every slug the retired live-LUT source used to contribute).
-2026-07-31 (exp044 phase 3): the retired live-LUT parquet is gone from disk;
-the discovery side now reads snapshot_features_full instead.
+The default market list is every live-coin (btc/eth/sol/xrp) market in
+pmdata/snapshot_features_full.parquet plus every slug already in
+pmdata_outcomes.parquet.
 
-Two phases (both run by default; --assemble-only / --no-assemble to split):
-  fetch    -> gamma_won_up per slug, checkpointed to gamma_resolutions/part_*.parquet
-              (resumable: skips slugs already fetched; RPS throttle + backoff)
+Two phases, both run by default (--assemble-only / --no-assemble to split):
+  fetch    -> gamma_won_up per slug, saved to gamma_resolutions/part_*.parquet
+              (resumable: skips fetched slugs; rate-limited with backoff)
   assemble -> fold all parts into pmdata_outcomes.parquet
               [market_slug, coin, interval, slug_ts, gamma_won_up, won_up,
                status ('ok'|'ambiguous'), label_source='gamma']
 
-⚠️ DISCOVERY CEILING (why --since/--until exists, added 2026-08-02): both
-discovery sources are FROZEN datasets — snapshot_features_full.parquet and the
-existing pmdata_outcomes.parquet both end 2026-07-21. So the default universe
-can NEVER reach a market newer than the last file refresh, and a plain re-run
-silently returns "nothing new" instead of extending coverage. ``--since/--until``
-bypasses that by GENERATING the slugs arithmetically: crypto up/down slugs are
-fully deterministic (``{coin}-updown-{interval}m-{window_start_ts}`` on exact
-300s / 900s boundaries), so every market in a date range can be enumerated
-without any prior index. Slugs that never existed simply resolve to NaN and are
-recorded 'ambiguous' — harmless.
+Both default sources are fixed datasets ending 2026-07-21, so a plain re-run
+never finds newer markets. ``--since/--until`` generates slugs instead: they
+are deterministic (``{coin}-updown-{interval}m-{window_start_ts}`` on exact
+300s / 900s boundaries), so every market in a date range can be enumerated.
+Slugs that never existed resolve to NaN and are recorded 'ambiguous'.
 
 Usage:
     python -m polymarket.backtest.fetch.fetch_gamma_resolutions            # fetch new + rebuild parquet
     python -m polymarket.backtest.fetch.fetch_gamma_resolutions --assemble-only   # rebuild parquet from parts
-    # extend coverage past the frozen-index ceiling:
+    # go past the end of the default sources:
     python -m polymarket.backtest.fetch.fetch_gamma_resolutions --since 2026-07-21 --until 2026-08-02
 """
 from __future__ import annotations
@@ -141,11 +133,9 @@ def _generated_slugs(since: str, until: str) -> list[str]:
 
 
 def _universe_slugs() -> list[str]:
-    """Slugs to resolve: live-coin markets in snapshot_features_full (the pmdata
-    book-snapshot universe) UNION any slug already in pmdata_outcomes (so the
-    WFO arbiter's markets keep coverage; pmdata_outcomes already carries every
-    slug the retired live-LUT source used to contribute, so no history is lost).
-    2026-07-31 (exp044 phase 3): the retired live-LUT parquet is gone from disk."""
+    """Slugs to resolve: live-coin markets in snapshot_features_full plus every
+    slug already in pmdata_outcomes.
+    """
     slugs: set[str] = set()
     if SNAPSHOT_FEATURES.exists():
         sf = pd.read_parquet(SNAPSHOT_FEATURES, columns=["market_slug", "coin"])
@@ -158,13 +148,10 @@ def _universe_slugs() -> list[str]:
 def assemble_outcomes(out_path: Path = OUTCOMES) -> None:
     """Fold every gamma_resolutions/ part into pmdata_outcomes.parquet.
 
-    won_up = gamma_won_up (the Gamma Chainlink settlement); status='ok' where
-    definitive (0/1), else 'ambiguous'. Keyed by market_slug — last write wins,
-    so a re-resolved market supersedes an earlier 'open' fetch; coin/interval/
-    slug_ts parsed from the slug. This IS the outcome-table build: the WFO
-    arbiter (polymarket.backtest.training.offset_wfo) reads the resulting
-    ``won_up`` column (the live LUT reader was retired 2026-07-31, exp044
-    phase 3)."""
+    won_up = gamma_won_up; status='ok' when it is 0 or 1, else 'ambiguous'.
+    Keyed by market_slug with the last write winning, so a later fetch replaces
+    an earlier 'open' one. coin, interval and slug_ts come from the slug.
+    """
     parts = sorted(OUT_DIR.glob("part_*.parquet"))
     if not parts:
         sys.exit(f"no gamma resolution parts under {OUT_DIR}; run the fetch first")
@@ -289,8 +276,8 @@ def main(argv=None) -> int:
             payload = None
             for attempt in range(5):
                 try:
-                    # closed=true is REQUIRED: Gamma's default index drops
-                    # settled crypto up/down markets (probe 2026-07-08).
+                    # closed=true is required: Gamma's default index leaves out
+                    # settled up/down markets.
                     r = client.get(GAMMA, params={"slug": slug, "closed": "true"})
                     if r.status_code == 429:
                         time.sleep(2.0 * (attempt + 1))

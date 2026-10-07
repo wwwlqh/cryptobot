@@ -1,41 +1,17 @@
-"""Second-offset entry-timing substrate: pmdata rows -> per-second features/books.
+"""Per-second entry-timing substrate: pmdata rows -> per-second features and
+books.
 
-RETIRED as a CLI on 2026-07-31 (exp044 phase 3). It was a parity-first harness:
-offset=0 reproduced the frozen minute-boundary ORB/HGB baseline byte-for-byte and
-offset>0 shifted only the entry/fill timestamp inside the same entry minute. Every
-one of its modes (``parity`` / ``build`` / ``wfo`` / ``all``) scored through the
-frozen ``hgb_v1`` + ``rf_v1`` joblib pair, and both artifacts are gone with no
-rebuild path — so ``_score_offset_pool``, ``build_pool``, ``_wfo`` and ``main``
-were deleted rather than left as an unrunnable entry point.
+A library (no ``__main__``). What other modules import:
 
-What SURVIVES is the substrate underneath, which has nothing to do with the
-retired models. Re-verified by literal grep 2026-08-01 — this list is the actual
-import surface, per consumer:
-
-* ``training.checkpoint`` — ``SNAP_FULL``, ``OUTCOMES``, ``_load_1s``,
-  ``_spot_at_seconds``, ``_chunk``, ``_load_top_book_series`` +
-  ``_extract_top_book_from_series``, ``_attach_raw_ladders``
-* ``training.build_pool`` — ``OUTCOMES``, ``_side_books_from_snapshot``
-* ``training.offset_validation`` — ``FEE``, ``MIN_BET_USD``, ``TRAIN_FOLDS``,
-  ``OOS_FOLD``, ``_load_1s``, ``_passes_filter``, ``_flat_metrics``, ``_fill``.
-  (It does NOT import ``CHUNKS`` — an earlier revision of this docstring said
-  so; offset_validation only names CHUNKS in a prose comment.)
-* ``_dedup_one_per_market`` + ``DECISION_KEY`` — no production caller; kept
-  deliberately as the only executable statement of the one-bet-per-decision
-  invariant, pinned by ``tests/test_offset_wfo.py``.
-
-RETIRED 2026-08-01 (phase 6): the offset>0 half of the dead CLI —
-``_attach_offset_features``, ``_attach_offset_books``,
-``_extract_book_at_timestamp``, ``_extract_book_from_snapshot_df``,
-``_parse_int_csv``, ``_json_safe`` and ``BOOK_WORKERS``. All were zero-caller.
-``_attach_offset_books`` was also the last reader of the deleted
-``poly_snapshot`` tree carrying no ``require_snapshot_dir()`` guard, so its
-deletion removes that hazard outright; anyone resurrecting it from git history
-inherits the unguarded read and must guard it. Deleting
-``_attach_offset_features`` is what took the ``pmdata_target`` binance-kline
-cache to zero consumers, and the two went in the same commit.
-
-Import it as a library; there is no ``__main__``.
+* ``training.checkpoint``: ``SNAP_FULL``, ``OUTCOMES``, ``_load_1s``,
+``_spot_at_seconds``, ``_chunk``, ``_load_top_book_series``,
+``_extract_top_book_from_series``, ``_attach_raw_ladders``; *
+``training.build_pool``: ``OUTCOMES``, ``_side_books_from_snapshot``; *
+``training.offset_validation``: ``FEE``, ``MIN_BET_USD``, ``TRAIN_FOLDS``,
+``OOS_FOLD``, ``_load_1s``, ``_passes_filter``, ``_flat_metrics``, ``_fill``; *
+``_dedup_one_per_market`` + ``DECISION_KEY``: no production caller, kept as the
+executable statement of the one-bet-per-decision rule and tested by
+``tests/test_offset_wfo.py``.
 """
 from __future__ import annotations
 
@@ -77,16 +53,9 @@ def _chunk(dt: pd.Timestamp) -> str:
     return "?"
 
 
-# Cached at the DEFINITION site (moved here 2026-08-01, phase 6). This re-reads
-# an 11.5M-row parquet per coin; with market sharding x per-second grids that is
-# thousands of re-reads, so each coin's spot must load exactly once. It used to
-# be an `offset_validation` import-time monkeypatch, which meant the cache
-# existed only if somebody imported THAT module first — a load-bearing
-# import-order dependency between two modules that otherwise share nothing.
-# checkpoint.py satisfied it by accident of import order and build_pool.py only
-# transitively, via `checkpoint as cg`. Decorating here makes it unconditional.
-# tests/test_checkpoint.py's `monkeypatch.setattr(cg.base, "_load_1s", ...)`
-# still works: it replaces the module attribute wholesale.
+# Cached here so each coin's 11.5M-row spot parquet is read once per process,
+# whichever module imports this first. Tests can still replace ``_load_1s``
+# with monkeypatch.setattr.
 @lru_cache(maxsize=8)
 def _load_1s(coin: str) -> pd.DataFrame:
     path = BINANCE_1S_DIR / f"{coin.lower()}_1s.parquet"
@@ -185,12 +154,9 @@ def _extract_top_book_from_series(series, entry_ts: int) -> dict | None:
 
 
 def _attach_raw_ladders(candidates: pd.DataFrame) -> pd.DataFrame:
-    # ENTRY GUARD (2026-08-01). Every row here goes through
-    # etgt._raw_book_payload -> etgt._load_raw_snapshot -> PMDATA_SNAPSHOT_DIR,
-    # which returns None per market when the deleted poly_snapshot tree is
-    # absent — so without this the function returns an EMPTY frame and the
-    # caller records "no candidates" instead of "no substrate". Once, up front,
-    # never inside the itertuples loop.
+    # Every row below reads the poly_snapshot tree, which returns None per
+    # market when it is missing; the result would be an empty frame that looks
+    # like "no candidates". Check once up front, not inside the loop.
     etgt.require_snapshot_dir()
     if candidates.empty:
         return candidates.copy()

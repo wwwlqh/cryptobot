@@ -1,24 +1,30 @@
-"""Compound-bankroll joint 5m+15m optimizer with chunk ABCD walk-forward CV.
+"""Joint 5m+15m portfolio optimizer with compounding bankroll and chunked
+walk-forward validation.
 
-v2 — searches every per-sleeve Optuna param plus 9 portfolio knobs:
-  alloc_total, alloc_5m_share, exposure_cap_frac, idempotency_mode (5-way),
-  cap_growth_mode (fixed|peak_growth), min_bet_usd, book_consumption_max,
-  fallback_liq_{btc,eth,sol,xrp}.
+Searches every per-sleeve Optuna parameter plus portfolio settings:
+alloc_total, alloc_5m_share, exposure_cap_frac, idempotency_mode (5 modes),
+cap_growth_mode (fixed|peak_growth), min_bet_usd, book_consumption_max and
+fallback_liq_{btc,eth,sol,xrp}.
 
-Key realism patches vs v1:
-  1. **Compound sizing.** face = running_equity * alloc * capital_frac.
-  2. **Joint search.** One trial proposes BOTH a 5m config AND a 15m config.
-  3. **Per-minute idempotency.** Tunable mode for collisions across sleeves.
-  4. **Real L2 VWAP.** Per-coin via the slug; per-coin fallback liquidity.
-  5. **Book-consumption cap.** face hard-capped at frac of available L2 depth.
-  6. **Cap growth.** Exposure cap can scale with peak equity (peak_growth mode).
-  7. **Honest DD.** Reports both global max_dd AND worst 30-bet window DD.
-  8. **Hard gates.** Prune on max_dd > 0.30, worst_30bet > 0.30, n_bets < 30,
-     total_pnl <= 0, or any fold final_equity > $5M (sim-artifact guard).
-  9. **Walk-forward chunks ABCD.** Train=[A..test_start), test=fold window;
-     LUT rebuilt per-fold from training rows only.
+Modelling choices:
 
-Output: backtest/optimize_runs/compound_5m15m_dd030/{run_id}/optimize_proposed.json
+  1. Compound sizing: face = running_equity * alloc * capital_frac.
+  2. Joint search: each trial proposes a 5m and a 15m config together.
+  3. Per-minute idempotency, with a tunable rule for cross-sleeve collisions.
+  4. Real L2 VWAP per coin, with per-coin fallback liquidity.
+  5. Book-consumption cap: face capped at a fraction of available depth.
+  6. Cap growth: the exposure cap can scale with peak equity.
+  7. Drawdown: reports global max_dd and the worst 30-bet window.
+  8. Pruning: max_dd > 0.30, worst_30bet > 0.30, n_bets < 30,
+     total_pnl <= 0, or any fold ending above $5M (a simulation artifact).
+  9. Walk-forward chunks ABCD: train = [A, test_start), test = the fold; the
+     hit-rate table is rebuilt per fold from training rows only.
+
+Needs ``decision_table.parquet`` in the artifacts directory, which is not
+shipped with this repo.
+
+Output:
+backtest/optimize_runs/compound_5m15m_dd030/{run_id}/optimize_proposed.json
 
 CLI:
     python -m polymarket.backtest.training.portfolio --n-trials 2000 --run-id main_v2
@@ -87,11 +93,8 @@ def _real_vwap(book_idx, slug: str, side: str, ts: int,
     return bet / total_shares, total_book_cost
 
 from polymarket.backtest import ARTIFACTS_DIR, BT_RUNS_DIR
-# GONE from disk since 2026-07-31 (exp044 phase 3), with no rebuild path: the
-# decision_table left the live boot path with the pair sleeves in phase 2 and its
-# whole producer chain (build/, features/build.py, prices.db, the binance-kline
-# fetchers) was deleted in phase 3. The constant stays so ``_load_full_table``
-# can name the file it wants in its failure; it is never written.
+# The input table this optimizer reads. Not produced by this repo; the constant
+# names it in the error raised by ``_load_full_table``.
 DECISION_TABLE = ARTIFACTS_DIR / "decision_table.parquet"
 RUNS_DIR = BT_RUNS_DIR / "compound_5m15m_dd030"
 
@@ -256,24 +259,23 @@ def _log_book_idx_dir_once(d: str | None) -> None:
 
 
 def _attach_l2_asks(df: pd.DataFrame) -> pd.DataFrame:
-    """Attach the REAL L2 best-ask per side from the book index.
+    """Attach the real L2 best ask per side from the book index.
 
-    up_ask_l2 = best ask to BUY the Up token   (book key (slug, "Up", entry_ts))
-    no_ask_l2 = best ask to BUY the Down token  (book key (slug, "Down", entry_ts))
-    up_depth_l2 / no_depth_l2 = total $ cost of the whole ask book (for the
-        bet-placement cap — how much the book can physically absorb).
+        up_ask_l2 = best ask to buy the Up token   (key (slug, "Up", entry_ts))
+        no_ask_l2 = best ask to buy the Down token (key (slug, "Down", entry_ts))
+        up_depth_l2 / no_depth_l2 = total $ cost of the whole ask side (how much
+            the book can absorb).
 
-    These are the EXECUTABLE prices. The legacy decision_table yes_price /
-    no_price are stale/mid quotes that diverge from the book by ~40c, so the
-    strategy must gate + size on the L2 asks instead.
+    These are executable prices. The decision table's yes_price / no_price are
+    stale or mid quotes that can differ from the book by ~40c, so gating and
+    sizing use the L2 asks.
 
-    CARRYFORWARD SNAPSHOTS ARE SKIPPED. ~11% of book entries are "carryforward"
-    — stale copies of an earlier snapshot (usually the market-open ~0.50 book)
-    re-stamped at later timestamps. Using them is a leakage trap: the optimizer
-    learns to "buy" at the stale 0.50 price while the model already knows the
-    near-decided outcome, producing a fake 99% win rate. Only fresh (is_cf=0)
-    snapshots represent the real executable book at entry_ts. Rows whose book
-    is carryforward or missing get NaN and are dropped at pick time.
+    Carry-forward snapshots are skipped. About 11% of book entries are stale
+    copies of an earlier snapshot (often the ~0.50 opening book) re-stamped at
+    later times. Using them leaks: the optimizer learns to "buy" at 0.50 while
+    the model already knows the near-certain outcome, giving a fake 99% win
+    rate. Only fresh (is_cf=0) snapshots are used; rows with a carried-forward
+    or missing book get NaN and are dropped.
 
     Computed once per process (the full table is lru_cached).
     """
@@ -321,13 +323,11 @@ _LUT_ROLLING_WINDOW_DAYS = 30  # was build_lut.py's LUT_ROLLING_WINDOW_DAYS
 
 def _rebuild_lut(train_df: pd.DataFrame, label_col: str,
                 train_end: pd.Timestamp | None = None) -> pd.DataFrame:
-    """Build a per-cell hit-rate LUT from the last 30 days of train_df.
+    """Build a per-cell hit-rate table from the last 30 days of train_df.
 
-    Restricts to the 30-day window ending at train_end (exclusive) to match
-    the rolling window the retired build_lut.py and live LUT lookup used. Using
-    the full training window (which can span 80+ days) produces systematically
-    higher lut_hit_rate values than the live runtime will see, biasing the
-    optimizer toward over-confident signal_source=lut/blend configs.
+    Uses the 30-day window ending at train_end (exclusive). The full training
+    window (often 80+ days) gives higher hit rates than a 30-day rolling table
+    would, which biases the optimizer toward over-confident lut/blend configs.
     """
     if train_end is not None:
         lookback_start = train_end - pd.Timedelta(days=_LUT_ROLLING_WINDOW_DAYS)

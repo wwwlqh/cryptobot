@@ -1,27 +1,26 @@
 #!/usr/bin/env python
-"""Pull pmdata's Chainlink Data Streams tape (per-second) for the live coins.
+"""Pull pmdata's per-second Chainlink Data Streams tape for the live coins.
 
-Endpoint:  GET https://api.pmdata.dev/chainlink/{SYM}/streams/{SYM}_streams_{YYYY-MM-DD}.parquet
-Auth:      header  api_key: <PMDATA_API_KEY from cryptobot/.env>
+Endpoint:  GET
+https://api.pmdata.dev/chainlink/{SYM}/streams/{SYM}_streams_{YYYY-MM-DD}.parquet
+Auth:      header  api_key: <PMDATA_API_KEY from .env>
 
-⚠️ SYMBOLS ARE ``BTCUSD``/``ETHUSD``/``SOLUSD``/``XRPUSD`` — NOT ``BTC``/``ETH``.
-The bare-ticker spelling used by the (deleted) 2026-07 puller 404s on every
-date, which reads exactly like "dataset discontinued". It is not. Diagnostic:
-a registered-but-empty route answers JSON ``{"error":"Not Found"}``; an unknown
-route answers plain ``404 Not Found``.
+Symbols are ``BTCUSD``/``ETHUSD``/``SOLUSD``/``XRPUSD``, not ``BTC``/``ETH``;
+the bare tickers 404 on every date, which looks like a discontinued dataset but
+is not. An existing route with no file answers JSON ``{"error":"Not Found"}``;
+an unknown route answers plain ``404 Not Found``.
 
-Coverage probed 2026-08-02: BTCUSD from 2026-04-22, the rest from 2026-06-07.
-Retention is NOT the 30-day rolling window the old notes claimed. Today's file
+Coverage: BTCUSD from 2026-04-22, the others from 2026-06-07. Each day's file
 is published a day late, so ``--end`` defaults to yesterday.
 
-Tape quality (measured 2026-08-01, BTCUSD+ETHUSD): 84,462 ticks/day = 0.98/s,
-median gap exactly 1.000s, p99 2s, max 4s, zero gaps >30s, 97.8% of the day's
-distinct seconds covered. Columns: observationsTimestamp,
-receiveMicrosecondTimestamp, price, bid, ask, validFromTimestamp, expiresAt,
-version. Prices are 18-decimal fixed-point strings (divide by 1e18).
+Tape quality (BTCUSD and ETHUSD): ~84,000 ticks a day (0.98/s), median gap
+1.000s, p99 2s, max 4s, no gaps over 30s, 97.8% of seconds covered. Columns:
+observationsTimestamp, receiveMicrosecondTimestamp, price, bid, ask,
+validFromTimestamp, expiresAt, version. Prices are 18-decimal fixed-point
+strings (divide by 1e18).
 
-Resumable: an existing non-empty file for a (symbol, date) is skipped, so a
-re-run only fetches the gap. Use --force to refetch.
+Resumable: an existing non-empty file for a (symbol, date) is skipped; use
+--force to refetch.
 """
 from __future__ import annotations
 
@@ -43,7 +42,7 @@ UA = "Mozilla/5.0 (cryptobot chainlink puller)"
 # Live universe. BNBUSD/DOGEUSD also exist upstream but are not traded.
 SYMBOLS = ("BTCUSD", "ETHUSD", "SOLUSD", "XRPUSD")
 
-# Probed 2026-08-02 by binary search; a symbol never serves earlier than this.
+# First date each symbol is served.
 EARLIEST = {
     "BTCUSD": dt.date(2026, 4, 22),
     "ETHUSD": dt.date(2026, 6, 7),

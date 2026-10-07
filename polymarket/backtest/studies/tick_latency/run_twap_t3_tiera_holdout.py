@@ -27,8 +27,8 @@ from polymarket.backtest.studies.tick_latency.run_twap_wfo_full import (
 )
 
 OUT = Path(__file__).with_name("TWAP_T3_TIERA_FOLD_F_20260812.json")
-# Latest READY Ireland reconciliation before this replay (2026-08-12 02:36 UTC).
-# At 1% this exercises the live $1 minimum-stake floor.
+# Equity from the last READY live reconciliation before this replay (2026-08-12
+# 02:36 UTC). At 1% this exercises the $1 minimum stake.
 START_EQUITY = 80.820665
 BASE_FRAC = 0.01
 LATENCY_S = 0.4

@@ -1,43 +1,16 @@
-"""Fixed-set gate/sizing sweep + the checkpoint wallet simulator (stage D).
+"""Fixed-offset gate/sizing sweep and the wallet simulator used by
+``training.checkpoint``.
 
-Sibling of ``offset_wfo.py``. RETIRED as a CLI on 2026-07-31 (exp044 phase 3),
-for two independent reasons: stage A (``_build_pool``) refit the HGB per
-expanding fold but still scored ``model_p_side`` / ``rf_edge`` through the
-FROZEN ``rf_v1`` joblib and read its sleeve recipe out of the ``hgb_v1``
-manifest — both artifacts are gone with no rebuild path — and its L2 training
-matrix came from the ``book_depth_index_pmdata`` cache, deleted in the same
-consolidation. No ``pool_refit.parquet`` survives either, so stages B-E had no
-input left even with the models. ``_RefitHGB``, ``_read_base_rows_4coin``,
-``_build_train_side_df``, ``_refit_chunk_models``, ``_score_offset_pool_refit``,
-``_build_pool``, ``_parity_check`` and ``main`` were deleted rather than left as
-an unrunnable entry point.
+A library (no ``__main__``), tested by ``tests/test_offset_validation.py``.
 
-RETIRED 2026-08-01 (phase 6): stages B, C and E went too. They had no caller
-left once main() died — ``_rank_seconds`` / ``_rank_pivot`` / ``_robust_sets``
-(per-second ranking + the robust-set filter) and the whole honest-diagnostics
-block (``_tier_head_to_head``, ``_sec0_baseline``, ``_placebo``,
-``_paired_delta``, ``_decision_keys``, ``_wilson``, ``_flat_metrics_ci``,
-``_flat_pnl_array``) were reachable only from the deleted CLI, as were
-``_dedup_one_per_resolution`` (a 3-line wrapper over
-``_dedup_resolution_with_stats``), ``_train_windows`` (a byte-identical
-duplicate of ``checkpoint._train_windows``, which is the copy checkpoint
-actually calls) and the constants ``OUT_DIR`` / ``TIERS_DEFAULT`` /
-``MIN_SECOND_CHUNK_N_DEFAULT`` / ``FEE``.
+``_fixed_set_wfo`` sweeps the opening-range gate and sizing with the entry
+offsets fixed, and picks the configuration with the highest training PnL such
+that every training fold is positive and the training drawdown stays under the
+cap. Fold D is never read by the gate or the sort key.
 
-What SURVIVES is the model-free selection + accounting surface that
-``training.checkpoint`` imports — ``_fixed_set_wfo`` and its closure, plus the
-fold calendar / capital constants — covered by
-``tests/test_offset_validation.py``:
-
-  D. ``_fixed_set_wfo`` — sweep ORB-gate + sizing with the offsets pinned; pick
-     max train PnL s.t. all train folds positive AND train-path maxDD <= cap.
-     D is never read by the gate or the sort key.
-
-The fold semantics it encodes are unchanged: fold A is scored IN-SAMPLE by the
-train-A model (it is the seed train fold and is never a held-out test fold in an
-expanding scheme); B/C/D are progressively OOS. D is the sole arbiter.
-
-Import it as a library; there is no ``__main__``.
+Fold semantics: fold A is scored in-sample by the model trained on A (it is the
+seed training fold, never a held-out test fold in an expanding scheme); B, C
+and D are progressively out-of-sample. D is the sole arbiter.
 """
 from __future__ import annotations
 
@@ -60,7 +33,7 @@ COINS = ("btc", "eth", "sol", "xrp")
 INTERVALS = ("5m", "15m")
 LABEL_COL = "won_up_polymarket"
 
-# Live ORB gate generalized to 4 coins (grid_b0_z0_e0.08): pred_edge>=0.08, strengths>=0.
+# Opening-range gate defaults for 4 coins: pred_edge >= 0.08, strengths >= 0.
 LIVE_PRED_EDGE_MIN = 0.08
 
 TRAIN_FOLDS = base.TRAIN_FOLDS  # ("A","B","C")
@@ -100,21 +73,17 @@ MIN_BET_USD_DEFAULT = base.MIN_BET_USD
 
 
 # --------------------------------------------------------------------------- #
-# Stage A residue: the expanding-window fold calendar
-#
-# The refit itself (``_refit_chunk_models`` and friends) was deleted with the
-# rf_v1/hgb_v1 retirement; this survives because ``training.checkpoint`` fits
-# its OWN per-window models against exactly this calendar. The matching
-# ``_train_windows()`` helper lives in ``checkpoint`` (its own byte-identical
-# copy, which is the one it calls); the duplicate here went 2026-08-01.
+# Expanding-window fold calendar. ``training.checkpoint`` fits its own models
+# against it (its ``_train_windows()`` is the matching helper).
 # --------------------------------------------------------------------------- #
-# chunk -> train-window key that scores it. D is scored only by the A+B+C model,
-# whose train window ends strictly before D starts (minus embargo) => D never trains.
+# chunk -> train-window key that scores it. D is scored only by the A+B+C
+# model, whose training window ends before D starts (minus the embargo), so D
+# is never trained on.
 CHUNK_MODEL_KEY = {"A": "A", "B": "A", "C": "AB", "D": "ABC"}
 
 
 # --------------------------------------------------------------------------- #
-# The ORB gate config
+# Opening-range gate config
 # --------------------------------------------------------------------------- #
 def _gate_cfg(offsets, pred_edge_min, breakout_bps=0.0, min_entry_z=0.0) -> dict:
     return {
@@ -400,9 +369,11 @@ def _fixed_set_wfo(
     capital: float = CAPITAL_DEFAULT,
     min_bet_usd: float = MIN_BET_USD_DEFAULT,
 ) -> tuple[list, dict | None]:
-    """Sweep ORB-gate + sizing with offsets pinned to ``fixed_offsets`` (no subset
-    explosion). Select: max train compounded PnL s.t. all train folds positive AND
-    train-path maxDD <= cap. D never read by the gate or the sort key."""
+    """Sweep the opening-range gate and sizing with offsets fixed to
+    ``fixed_offsets``. Pick the highest compounded training PnL such that
+    every training fold is positive and training drawdown <= cap. D is never
+    read by the gate or the sort key.
+    """
     fixed = tuple(int(x) for x in fixed_offsets)
     rows = []
     for coin_set in COIN_SETS:
