@@ -1,23 +1,21 @@
-"""Build the SSE payload from the live ledger + portfolio.
+"""Build the dashboard's SSE payload from the ledger and portfolio.
 
-Output shape per R-NEW-12 (top-level keys stable; additive new fields ok):
+Top-level keys (stable; new fields may be added):
+
   tick_ts, venue, ledger_limit, kpis, portfolio, markets, ledger, ledger_rollup,
   ledger_rollup_by_venue, ledger_equity, cash_equity, ledger_daily,
   ledger_daily_by_venue, ledger_analytics, ledger_analytics_by_venue, contracts,
   strategy_flags, live_wallet, capital_flows, operator, latency, v2
-  (+ predictfun_wallet on a predict.fun deploy)
 
-`build_payload(conn, portfolio, last_seen_ledger_id=...)` returns
-(payload_dict, max_ledger_id_in_payload). Callers track `max_ledger_id` so
-subsequent SSE events can send only the ledger DELTA since the last
-broadcast (Key Technical Decision).
+``build_payload(conn, portfolio, last_seen_ledger_id=...)`` returns
+``(payload_dict, max_ledger_id_in_payload)``. Callers keep ``max_ledger_id`` so
+later SSE events only send new ledger rows.
 
-COUNTING CONTRACT (operator 2026-08-05): the ledger stores one row per FILL,
-but the venue holds a base bet and its top-ups as ONE CLOB position. Every
-count in ``ledger_rollup`` / ``ledger_daily`` / ``ledger_analytics`` therefore
-counts TRADE GROUPS — see ``_TRADE_GROUP_KEY_SQL``. Dollar sums are unchanged
-by grouping. The ``ledger`` array still streams every fill (the dashboard folds
-them client-side for display, and expands a trade back into its fills).
+Counting: the ledger stores one row per fill, but the venue holds all fills of
+one market position as a single CLOB position. Every count in ``ledger_rollup``
+/ ``ledger_daily`` / ``ledger_analytics`` therefore counts trade groups (see
+``_TRADE_GROUP_KEY_SQL``); dollar sums are the same either way. The ``ledger``
+array still streams every fill, and the dashboard folds them for display.
 """
 
 from __future__ import annotations
@@ -153,12 +151,8 @@ def _json_safe(value: Any) -> Any:
 
 
 def _markets_block() -> list[dict]:
-    """The live scan universe, one entry per coin.
-
-    The per-sleeve decision subtree (sleeve_decisions) fed the retired
-    "Live markets & gates" tab (retired 2026-07-11) — the only surviving
-    consumer is the dashboard's coin filter (data.jsx liveCoins reads
-    markets[].coin), so only the coin list is emitted.
+    """The live scan universe, one entry per coin. The dashboard's coin filter
+    reads ``markets[].coin``.
     """
     return [{"coin": coin} for coin in config.COINS]
 
@@ -185,9 +179,8 @@ def _fee_calibration() -> Optional[float]:
 
 def _v2_sizing_constants() -> dict[str, Any]:
     return {
-        # Fallback defaults come straight from sizing_v2's canonical DEFAULT_*
-        # constants (single source of truth) so this panel can never drift from
-        # the sizing primitive — e.g. the 2026-07-31 throttle removal (floor 1.0).
+        # Defaults come from sizing_v2's DEFAULT_* constants so this panel
+        # always matches the sizing code.
         "base_frac_15m": float(getattr(config, "V2_BASE_FRAC_15M", DEFAULT_BASE_FRAC_15M)),
         "base_frac_5m": float(getattr(config, "V2_BASE_FRAC_5M", DEFAULT_BASE_FRAC_5M)),
         "brake_scale": float(getattr(config, "V2_BRAKE_SCALE", DEFAULT_BRAKE_SCALE)),
@@ -384,23 +377,16 @@ def _wallet_payload(
         "kind": snap.kind,
         "ledger_sleeves": list(snap.ledger_sleeves),
         "initial_bankroll": _round_money(snap.initial_bankroll),
-        # U8 of the all_4 deploy plan: dashboard renders each of the 4
-        # strategy tiles with this $100 display value. Sizing math stays
-        # on `realized_capital` (compound); display stays at the
-        # backtest-calibrated $100 base per memory
-        # `feedback_wallet_bankroll_display`. Consumed ONLY by the
-        # frontend tile renderer — no gate / sizing primitive reads it.
+        # Display value for each strategy tile. Sizing uses
+        # ``realized_capital``; nothing but the dashboard reads this.
         "bankroll_display_usd": _round_money(snap.initial_bankroll),
         "realized_capital": _round_money(snap.realized_capital),
         "peak_capital": _round_money(snap.peak_realized_capital),
         "pnl_total": _round_money(snap.pnl_total),
         "pnl_24h": _round_money(snap.pnl_24h),
-        # 24h W·L: a booked stop-loss exit IS a loss, so it is FOLDED into
-        # losses_24h (operator 2026-08-05 — the separate `stops_24h` column and
-        # every "N SL" the dashboard rendered off it are gone). win_rate_24h is
-        # unchanged: its denominator already counted stops as losses.
-        # These are per-FILL counts from the wallet snapshot (capital.py), not
-        # the trade-group counts the ledger rollups report.
+        # 24h win rate: stop-loss exits count as losses (folded into
+        # losses_24h). These are per-fill counts from the wallet snapshot
+        # (capital.py), not the trade-group counts of the ledger rollups.
         "win_rate_24h": round(snap.win_rate_24h, 4) if snap.win_rate_24h is not None else None,
         "wins_24h": snap.wins_24h,
         "losses_24h": snap.settled_24h - snap.wins_24h + snap.stops_24h,
@@ -422,7 +408,7 @@ def _wallet_payload(
         "exposure_ratio": round(exposure_ratio, 4),
         "target_bet_size": _round_money(target),
         "target_unit": "bet",
-        # U12: per-strategy LIVE deploy surface.
+        # Live/dry mode of the wallet.
         "mode": snap.mode,
         "mode_version": int(mode_version) if mode_version is not None else None,
         "wallet_group": snap.wallet_group,
@@ -511,12 +497,10 @@ def _recent_clean_wallet_balance_row(
         return None
 
 
-# Display-capital staleness cap (2026-07-09 sticky last-good cash basis): how
-# old a last-good CLOB balance sample may be and still be shown as the
-# operator's current capital (labelled with its as-of time). Reconciliation
-# samples normally land well inside WALLET_SNAPSHOT_FRESHNESS_TTL_S (900s);
-# 4x gives the sampler room to blip without the Overview silently flipping to
-# the paper strategy equity.
+# How old the last good CLOB balance sample may be and still be shown as
+# current capital (with its as-of time). Samples normally arrive within
+# WALLET_SNAPSHOT_FRESHNESS_TTL_S (900s); 4x leaves room for a missed sample
+# before the Overview falls back to the paper equity.
 _ACCOUNT_CAPITAL_STALE_CAP_S: int = 4 * WALLET_SNAPSHOT_FRESHNESS_TTL_S
 
 
@@ -615,14 +599,12 @@ def _live_account_reconciliation(
                     account_capital_confirmed = True
 
     if account_capital is None:
-        # Sticky last-good cash basis (operator 2026-07-09): the latest
-        # reconciliation row is unusable (null CLOB balance / bad source
-        # status) — fall back to the most recent 'ok' balance sample within
-        # the staleness cap, WITHOUT requiring a flat book (an 'ok' sample
-        # taken mid-position is still the true cash balance at that instant).
-        # confirmed stays False, so `comparable` — and every strict consumer
-        # of it — keeps its meaning; the UI shows the as-of time instead of
-        # silently flipping the Overview to the paper strategy equity.
+        # The latest reconciliation row is unusable (null CLOB balance or bad
+        # status): fall back to the most recent 'ok' sample within the
+        # staleness cap, even one taken with positions open (it is still the
+        # true cash balance at that moment). confirmed stays False, so
+        # ``comparable`` keeps its meaning; the UI shows the sample's as-of
+        # time instead.
         stale = _recent_ok_wallet_balance_row(conn)
         if stale is not None:
             stale_balance = _float_or_none(stale["clob_balance_usd"])
@@ -673,15 +655,13 @@ def _live_account_reconciliation(
     if account_capital is not None:
         basis_row = None
         if first_live_ts:
-            # C4 (real money, 2026-07-21): the basis anchor must be a CLEAN
-            # sample — source_status 'ok' AND flat book (0 open orders, 0 open
-            # positions). A mid-position sample understates cash by the spent
-            # share cost, so anchoring on it overstates account_pnl_total by
-            # exactly that cost (the 07-14 mid-position basis bug). Only the
-            # clean path may set clean_basis (⇒ `comparable`); when no clean
-            # pre-live sample exists we still anchor on the newest pre-live
-            # balance for continuity, but flag it un-clean so `comparable`
-            # stays False and strict consumers ignore it.
+            # The basis anchor must be a clean sample: source_status 'ok' and a
+            # flat book (no open orders or positions). A sample taken with
+            # positions open understates cash by the cost of the shares held,
+            # which would overstate account_pnl_total by that amount. Only a
+            # clean sample sets clean_basis (and so ``comparable``). Without
+            # one, the newest earlier balance is still used for continuity but
+            # flagged unclean, so strict consumers ignore it.
             basis_row = _recent_clean_wallet_balance_row(
                 conn, before_or_at=first_live_ts
             )
@@ -755,20 +735,22 @@ def _live_account_capital(
     account: dict[str, Any],
     live_balance_get: Optional[Callable[[], Optional[float]]],
 ) -> dict[str, Any]:
-    """Per-tick live CLOB cash equity + net for the dashboard headline.
+    """Per-tick live CLOB cash equity and net for the dashboard headline.
 
-    The reconciliation sample (``account``) is the audited basis PROVENANCE, no
-    longer the headline. The headline cash equity is the SAME per-tick balance
-    live sizing reads, via a fallback chain:
-      1. ``live_balance_get()`` — the in-memory BalanceCache value (exact, the
-         number sizing uses; ~60s refresh) → source ``balance_cache``;
-      2. ``live_readiness_reports.clob_balance_usd`` latest, when fresh (age
-         ≤ 300s) — written from the SAME fetch every ~60s → ``readiness_report``;
-      3. ``account['capital']`` — the reconciliation sample, DEGRADED anchor
-         (the client shows its as-of) → ``reconciliation_sample``;
-      4. ``None`` (DRY / no cash basis).
-    ``account_pnl_total_live`` nets against the SAME audited basis anchor
-    (``account['initial']``) so cash net and the % delta share one basis.
+    The headline uses the same balance live sizing reads, through a fallback
+    chain:
+
+      1. ``live_balance_get()``: the in-memory BalanceCache value (refreshed
+         ~60s) -> source ``balance_cache``;
+      2. the latest ``live_readiness_reports.clob_balance_usd`` if at most 300s
+         old (written from the same fetch) -> ``readiness_report``;
+      3. ``account['capital']``: the reconciliation sample, shown with its as-of
+         time -> ``reconciliation_sample``;
+      4. ``None`` (DRY or no cash basis).
+
+    The reconciliation sample (``account``) is the audited basis.
+    ``account_pnl_total_live`` nets against the same basis
+    (``account['initial']``) so the cash net and the % change agree.
     """
     capital_live: Optional[float] = None
     capital_live_ts: Optional[str] = None
@@ -902,11 +884,11 @@ def _open_positions_mark_block(
     book_mark_get: Optional[Callable[..., Any]],
     account_capital_live: Optional[float],
 ) -> dict[str, Any]:
-    """Mark ALL active-strategy PENDING positions to the current book and sum.
+    """Mark every active-strategy PENDING position to the current book and sum.
 
-    ``account_equity_incl_open`` = live cash (which EXCLUDES the spent share
-    cost) + Σ open mark value — the honest total. Server-side loop over the
-    ``_ledger_where`` filter so a retired strategy's opens never leak in.
+    ``account_equity_incl_open`` = live cash (which excludes the cost of shares
+    held) + the open positions' mark value. Uses ``_ledger_where`` so positions
+    from other strategies are left out.
     """
     value_total = 0.0
     marked_n = 0
@@ -949,17 +931,14 @@ def _open_positions_mark_block(
     }
 
 
-# Latency item #6: get_group_state + extractable_pnl_by_wallet were recomputed
-# on EVERY _kpis_block call — 2x per publisher pass whenever the late-joiner
-# bootstrap also rebuilds. Both are pure ledger / live_order_attempts /
-# transfer_requests aggregates, so a short TTL cache bounds the duplicate work
-# now that the SSE publisher thread (main.py) is the sole caller. Invalidation
-# is the SAME ledger-content probe the capital scan cache keys on
-# (capital.ledger_version) so any ledger mutation refreshes immediately;
-# live_order_attempts / transfer_requests drift is bounded by the 1s TTL.
-# mode/operator state are deliberately NOT cached — an operator STOP or
-# wallet-mode flip must land on the very next payload (~1 tick). Cleared per
-# test via clear_aux_cache (conftest autouse).
+# get_group_state and extractable_pnl_by_wallet are pure aggregates over the
+# ledger, live_order_attempts and transfer_requests, and _kpis_block may be
+# called more than once per publish. A short TTL cache avoids the repeat work.
+# It is keyed on the ledger-content probe (capital.ledger_version), so any
+# ledger change refreshes it at once; changes to the other two tables show up
+# within the 1s TTL. Mode and operator state are not cached, so a stop or a
+# wallet-mode change lands on the next payload. Tests clear it via
+# clear_aux_cache.
 _KPI_GROUP_TTL_S = 1.0
 _KPI_GROUP_CACHE: dict[str, Any] = {
     # Strong identity ref, compared with `is` — an id()-keyed entry could
@@ -1008,10 +987,7 @@ def _group_state_cached(
         group_state = get_group_state(conn, portfolio)
     except sqlite3.OperationalError:
         group_state = {}
-    # Performance finding #8 (PERF-04): one aggregate query per table
-    # instead of 2 queries per wallet inside the per-sleeve loop. At 1
-    # Hz x 4 wallets x double build_payload, the per-wallet path fired
-    # 16 queries/sec; the bulk path fires 2.
+    # One aggregate query per table instead of two per wallet.
     try:
         extractable_map = extractable_pnl_by_wallet(conn)
     except sqlite3.OperationalError:
@@ -1084,13 +1060,11 @@ def _kpis_block(
             "wallet_group": wallet_payload["wallet_group"],
         }
 
-    # Dollar EQUITY rollups must count a shared-equity group ONCE: Phase 5
-    # gives every member of a shared_equity group the SAME combined
-    # realized/peak/pending/initial, so summing per-member would double-count
-    # the single shared wallet (e.g. a $100 shared wallet would read $200).
-    # Count one representative member per shared group; non-shared wallets sum
-    # per-wallet as before. (Per-sleeve COUNTS — pnl_24h/n_pending/n_topups —
-    # stay summed below; those are genuine per-sleeve attributions.)
+    # Count a shared-equity group once in the dollar equity rollups: every
+    # member carries the same combined realized/peak/pending/initial values, so
+    # summing members would double-count the one shared wallet. Non-shared
+    # wallets are summed per wallet. Per-sleeve counts (pnl_24h, n_pending,
+    # n_topups) are still summed below; those are real per-sleeve figures.
     _shared_lookup = getattr(portfolio, "shared_equity_group_for", None)
     total_initial = 0.0
     total_realized = 0.0
@@ -1119,20 +1093,19 @@ def _kpis_block(
         total_peak += w.peak_realized_capital
         total_pending += w.pending_exposure
         total_net_flow += w.net_flow_usd
-        # PURE-P&L drawdown dollars, recovered from the wallet's own D14 ratio
-        # (= (pnl_peak − pnl_realized) / initial_bankroll). Summing the
-        # flow-INCLUSIVE peak/realized totals instead would let a deposit move
-        # `drawdown_pct` — the D14 backtest-parity stat that must stay blind to
-        # funding. Identical to the old subtraction when no flows exist.
+        # PnL-only drawdown dollars, from the wallet's drawdown_ratio (=
+        # (pnl_peak - pnl_realized) / initial_bankroll). Summing the
+        # flow-inclusive totals instead would let a deposit move
+        # ``drawdown_pct``, which must ignore funding. Same result as plain
+        # subtraction when there are no flows.
         total_pnl_drawdown += w.drawdown_ratio * w.initial_bankroll
         total_cap_usd += w.realized_capital * portfolio.exposure_cap_fraction_for(wallet_id)
     total_pnl_24h = sum(w.pnl_24h for w in wallet_snaps.values())
     total_wins_24h = sum(w.wins_24h for w in wallet_snaps.values())
     total_settled_24h = sum(w.settled_24h for w in wallet_snaps.values())
     total_stops_24h = sum(w.stops_24h for w in wallet_snaps.values())
-    # Booked stop-loss exits count as losses (they are realized losses). The
-    # wallet snapshot keeps them in their own accumulator; the payload folds
-    # them into losses_24h below and emits no separate SL count.
+    # Stop-loss exits are realized losses. The wallet snapshot counts them
+    # separately; here they are folded into losses_24h.
     _wr_denom_24h = total_settled_24h + total_stops_24h
     win_rate_24h = (
         total_wins_24h / _wr_denom_24h if _wr_denom_24h > 0 else None
@@ -1147,9 +1120,9 @@ def _kpis_block(
     )
     halted_wallets = [w for w in wallets if w["trading_halted"]]
     account = _live_account_reconciliation(conn, portfolio)
-    # Per-tick live cash equity/net (the number sizing reads) + the unrealized
-    # open-position mark. The reconciliation `account` above becomes the audited
-    # basis provenance; these are the headline.
+    # Per-tick live cash equity and net (the balance sizing reads) plus the
+    # open-position mark. The reconciliation ``account`` above is the audited
+    # basis; these are the headline.
     account_live = _live_account_capital(conn, account, live_balance_get)
     open_marks = _open_positions_mark_block(
         conn, portfolio, book_mark_get, account_live["account_capital_live"]
@@ -1174,12 +1147,9 @@ def _kpis_block(
         "account_initial_capital_source": account["basis_source"],
         "account_initial_capital_ts": account["basis_ts"],
         "account_capital_comparable": account["comparable"],
-        # Per-tick live CLOB cash equity + net — the SAME balance live sizing
-        # reads (BalanceCache), not the ~10-min reconciliation sample. These are
-        # the dashboard headline; the reconciliation account_* fields above are
-        # the audited basis provenance. Fallback chain + as-of live in
-        # _live_account_capital (balance_cache → readiness_report mirror →
-        # reconciliation_sample [degraded] → null).
+        # Per-tick live CLOB cash equity and net: the same balance live sizing
+        # reads (BalanceCache), not the slower reconciliation sample. Fallback
+        # chain and as-of time are in _live_account_capital.
         **account_live,
         # Unrealized open-position mark-to-book (+ the honest total equity that
         # adds it to the cash that excludes the spent share cost).
@@ -1205,20 +1175,16 @@ def _kpis_block(
         "halt_reason": "dd_halt" if halted_wallets else None,
         "halted_wallets": [w["id"] for w in halted_wallets],
         "pnl_24h": _round_money(total_pnl_24h),
-        # 24h W·L: booked stop-loss exits are FOLDED into losses_24h (operator
-        # 2026-08-05 — the standalone `stops_24h` column is gone). win_rate_24h
-        # is unchanged; its denominator already treated stops as losses. Per-FILL
-        # counts (wallet snapshot), not the ledger rollups' trade-group counts.
+        # 24h win rate with stop-loss exits counted as losses. Per-fill counts
+        # from the wallet snapshot, not trade groups.
         "win_rate_24h": round(win_rate_24h, 4) if win_rate_24h is not None else None,
         "wins_24h": total_wins_24h,
         "losses_24h": total_settled_24h - total_wins_24h + total_stops_24h,
-        # TWO pending counts, deliberately (operator 2026-08-09). `n_pending`
-        # is the per-FILL row count the capital/exposure bookkeeping already
-        # carries; `n_pending_trades` folds those rows into CLOB positions so
-        # the rail tile, the 24h "open excluded" sub and the sidebar badge can
-        # say "bets" and mean the same thing as the Journal's grouped "open
-        # positions" tile. None (legacy schema) ⇒ the client falls back to the
-        # per-fill number and relabels itself.
+        # Two pending counts: ``n_pending`` is the per-fill row count used by
+        # the exposure bookkeeping; ``n_pending_trades`` folds those rows into
+        # CLOB positions, so the Overview, sidebar and Journal all mean the
+        # same thing by "open bets". None on an old schema; the client then
+        # falls back to the per-fill number.
         "n_pending": sum(w.n_pending for w in wallet_snaps.values()),
         "n_pending_trades": _open_trade_group_count(conn, portfolio),
         "n_topups_24h": sum(w.n_topups_24h for w in wallet_snaps.values()),
@@ -1230,11 +1196,8 @@ def _kpis_block(
         # uses one source of truth (review #22). Was previously hardcoded
         # 0.80 in StatStrip.jsx and could silently diverge from config.
         "exposure_warn_ratio": config.EXPOSURE_WARN_RATIO,
-        # U8 of the all_4 deploy plan: marker the frontend branches on
-        # to render either the 4-tile strategy grid (isolated_4) or the
-        # legacy 2-wallet_groups rollup. Derived from portfolio shape so
-        # operator reverts (soft-revert env vars) flip rendering
-        # automatically.
+        # Tells the dashboard whether to render one tile per isolated wallet or
+        # the wallet-group rollup; derived from the portfolio.
         "topology": "isolated_4" if not portfolio.wallet_groups else "wallet_groups",
         "wallets": wallets,
         "by_sleeve": by_sleeve,
@@ -1244,14 +1207,13 @@ def _kpis_block(
 def _active_sleeve_filter(
     portfolio: Optional[V6Portfolio],
 ) -> tuple[str, tuple[str, ...]]:
-    """Build a ``sleeve IN (...)`` fragment restricting the ledger to the
-    sleeves the *currently loaded* portfolio trades.
+    """Build a ``sleeve IN (...)`` fragment limiting the ledger to the sleeves
+    the loaded portfolio trades.
 
-    A retired strategy's ledger rows (e.g. the old ``v6_5m`` LUT sleeve) are
-    not in ``market_sleeves`` and so never surface on the dashboard. Because
-    the active set is read from the live config, a future strategy swap follows
-    automatically with no code change here. Returns ("", ()) when no
-    portfolio/sleeves are known, in which case no sleeve filter is applied.
+    Rows from strategies that are no longer configured never show on the
+    dashboard. The active set comes from the live config, so a strategy change
+    needs no code change here. Returns ("", ()) when no sleeves are known (no
+    filter).
     """
     labels = (
         tuple(s.label for s in portfolio.market_sleeves) if portfolio else ()
@@ -1271,10 +1233,9 @@ def _ledger_where(
     active-strategy sleeves only, ``bet_ts >= WALLET_START_AT`` when a cutover
     is configured, and (for deltas) ``id > last_seen_id``.
     """
-    # Normalize through _wallet_start_sql (same reader capital.py and
-    # _record_anchor_ts use): a hand-set ISO cutover ('2026-07-14T12:00:00Z')
-    # compared raw against SQL-text bet_ts would lexicographically exclude the
-    # whole cutover day ('T' > ' ') and desync this window from the v2 console.
+    # Normalize through _wallet_start_sql (as capital.py and _record_anchor_ts
+    # do). An ISO cutover like '2026-07-14T12:00:00Z' compared raw against
+    # SQL-text bet_ts would drop the whole cutover day ('T' > ' ').
     wallet_start_at = _wallet_start_sql()
     sleeve_sql, sleeve_params = _active_sleeve_filter(portfolio)
     conditions: list[str] = []
@@ -1292,51 +1253,44 @@ def _ledger_where(
     return where, params
 
 
-# Shared W-L predicate fragments — the SINGLE SQL source of the win-rate
-# contract's row classes (see _WIN_RATE_CONTRACT below), composed into both the
-# lifetime and the daily rollup queries so the two can never drift.
+# Shared win/loss predicates: the one SQL definition of the win-rate classes
+# (see _WIN_RATE_CONTRACT), used by both the lifetime and the daily rollups so
+# they cannot drift.
 #
-# 2026-08-05 (operator): the SL class is GONE from every displayed count. A
-# booked stop-loss exit is a realized loss, so it folds into ``losses`` instead
-# of riding its own ``stops`` column — the dashboard no longer renders "0SL"
-# anywhere and win_rate is plainly wins/(wins+losses). The stop PREDICATE
-# survives because it still classifies historical rows (a stop row's DB outcome
-# is 'CANCELLED', so without it those rows would read as voided cancels and
-# vanish from the denominator); it spells the pnl_net guard EXPLICITLY even
-# where the surrounding WHERE already pins ``pnl_net IS NOT NULL`` (redundant
-# there, load-bearing in the lifetime rollup which scans unsettled rows too).
+# A stop-loss exit is a realized loss, so it counts in ``losses``. The stop
+# predicate is still needed for historical rows: their outcome is 'CANCELLED',
+# so without it they would be read as voided cancels and drop out of the
+# denominator. It includes the pnl_net check explicitly; that is redundant
+# where the WHERE clause already requires it, but needed in the lifetime
+# rollup, which also scans unsettled rows.
 _STOP_BOOKED_PRED_SQL = "exit_kind='stop_loss' AND pnl_net IS NOT NULL"
 # A LOSS row for counting purposes: a decided LOSS, or a booked stop exit.
 _LOSS_PRED_SQL = f"(outcome='LOSS' OR ({_STOP_BOOKED_PRED_SQL}))"
 _VOIDED_CANCEL_PRED_SQL = "outcome='CANCELLED' AND exit_kind IS NULL"
 
 # ---------------------------------------------------------------------------
-# TRADE-GROUP (CLOB position) CONTRACT — operator 2026-08-05
+# Trade-group (CLOB position) contract
 # ---------------------------------------------------------------------------
-# The ledger writes ONE ROW PER FILL: a base entry plus every top-up it took in
-# the same market window is several rows. On the venue that is ONE CLOB
-# position — one token balance that settles once — so every count the dashboard
-# labels "trades" / "bets" / a win-rate denominator counts GROUPS, not rows.
-# ($ sums are unaffected: Σ over groups of Σ over rows == Σ over rows.)
+# The ledger writes one row per fill: an entry plus any top-ups in the same
+# market window are several rows. On the venue that is one CLOB position (one
+# token balance that settles once), so every count the dashboard labels
+# "trades", "bets" or uses as a win-rate denominator counts groups, not rows.
+# (Dollar sums are unaffected.)
 #
-# The grouping key is the market position's identity, not a heuristic:
+# The grouping key is the position's identity:
 #
-#     venue · coin · interval_min · window_start_ts · side · wallet
+#    venue · coin · interval_min · window_start_ts · side · wallet
 #
-# (coin, interval_min, window_start_ts) names the exact market window,
-# ``side`` names WHICH outcome token was bought (a YES and a NO position in the
-# same window are two different CLOB balances and must never merge), and the
-# wallet keeps two funded accounts' positions apart. That tuple IS the CLOB
-# position — which is why ``idx_ledger_window`` on
-# (coin, interval_min, window_start_ts, is_topup, outcome) already exists and
-# why the engine's own "is there a slot open here?" queries key on it.
-# ``is_topup`` is deliberately NOT part of the key: a top-up's whole point is
-# that it lands in its base bet's group. It is used only to LABEL the fills
-# inside a group (base / top-up 1 / top-up 2 …), never to split them.
+# (coin, interval_min, window_start_ts) is the market window, ``side`` is which
+# outcome token was bought (YES and NO in one window are two balances), and the
+# wallet keeps separate accounts apart. ``idx_ledger_window`` on (coin,
+# interval_min, window_start_ts, is_topup, outcome) indexes the same tuple.
+# ``is_topup`` is not part of the key; a top-up belongs to its base bet's group
+# and the flag only labels fills within a group.
 #
-# wallet falls back to ``sleeve`` for legacy rows written before wallet_id
-# existed; sleeve is per-interval, so the fallback can only ever SPLIT a group
-# further, never merge two unrelated positions.
+# Rows written before wallet_id existed fall back to ``sleeve``, which is per
+# interval, so the fallback can only split a group further, never merge two
+# positions.
 _TRADE_GROUP_KEY_SQL = (
     "coin, interval_min, window_start_ts, side, "
     "COALESCE(NULLIF(wallet_id, ''), sleeve)"
@@ -1360,29 +1314,23 @@ _GROUP_LOSS_SQL = "CASE WHEN g_open=0 AND g_win=0 AND g_loss=1 THEN 1 ELSE 0 END
 _GROUP_VOID_SQL = (
     "CASE WHEN g_open=0 AND g_win=0 AND g_loss=0 AND g_real=0 THEN 1 ELSE 0 END"
 )
-# Settled AND actually OPENED: the ONE population every "trades"/"bets" count
-# on the console must mean (operator 2026-08-09). `g_real=1` == at least one
-# fill that is not a voided never-filled cancel. Shipped as its own scalar so
-# no client re-derives it as `total - open` — that subtraction silently kept
-# the voided groups inside the Journal's "settled trades" tile.
+# Settled and actually opened: the one population every "trades"/"bets" count
+# means. ``g_real=1`` means at least one fill that is not a voided,
+# never-filled cancel. Shipped as its own value so clients do not compute
+# ``total - open``, which would include voided groups.
 _GROUP_SETTLED_OPENED_SQL = "CASE WHEN g_open=0 AND g_real=1 THEN 1 ELSE 0 END"
 
 
 def _open_trade_group_count(
     conn: sqlite3.Connection, portfolio: Optional[V6Portfolio]
 ) -> Optional[int]:
-    """Number of OPEN CLOB positions — pending ledger rows folded into TRADE
-    GROUPS (``_TRADE_GROUP_KEY_SQL``), so a base bet plus its two pending T3
-    top-ups is ONE open trade.
+    """Number of open CLOB positions: pending rows folded into trade groups
+    (``_TRADE_GROUP_KEY_SQL``).
 
-    Shipped as ``kpis.n_pending_trades`` beside the per-FILL ``kpis.n_pending``
-    (capital.py's wallet-snapshot row counter). Before 2026-08-09 the Overview
-    rail's "open bets" tile and the sidebar badge rendered the per-FILL number
-    while the Journal's "open positions" tile rendered the grouped one — the
-    same console showed two different answers for the same question. The
-    per-fill scalar stays in the payload (it is the exposure bookkeeping's own
-    count and a legacy-payload fallback), it is just no longer what the word
-    "bets" points at. Returns None on a legacy schema so the client falls back.
+    Shipped as ``kpis.n_pending_trades`` next to the per-fill
+    ``kpis.n_pending`` (capital.py's row counter) so the Overview, sidebar and
+    Journal give the same answer. Returns None on an old schema so the client
+    falls back.
     """
     where, params = _ledger_where(portfolio)
     cond = "outcome='PENDING'"
@@ -1403,41 +1351,28 @@ def _open_trade_group_count(
 def _ledger_rollups(
     conn: sqlite3.Connection, portfolio: Optional[V6Portfolio]
 ) -> tuple[Optional[dict], dict[str, dict]]:
-    """Lifetime ledger aggregates over the ACTIVE strategy, computed
-    server-side over the FULL ledger (not the streamed bootstrap window).
-    Returns ``(combined, by_venue)``: the all-venue rollup the dashboard
-    headline reads, plus the H5 per-venue split (same shape/definitions,
-    keyed 'polymarket' / 'predictfun'; empty/NULL venue folds to 'polymarket',
-    matching ``_row_venue``).
+    """Lifetime ledger aggregates for the active strategy, over the full ledger
+    (not the streamed window). Returns ``(combined, by_venue)``: the
+    headline rollup plus a per-venue split with the same shape (empty/NULL
+    venue counts as 'polymarket', as in ``_row_venue``).
 
-    ONE venue-keyed GROUP BY scan serves both — the combined rollup is derived
-    by summing the venue groups in Python (win_rate/roi recomputed from the
-    summed counts/sums, never by averaging ratios), where the pre-2026-07-22
-    form ran a second identical full-ledger scan per 5s history refresh inside
-    the live process. It uses the SAME active-sleeve + WALLET_START_AT filter
-    as ``_ledger_block`` (via ``_ledger_where``) so the rollups and the
-    streamed rows can never disagree.
+    One GROUP BY venue scan serves both; the combined rollup sums the venue
+    groups in Python (win_rate and roi are recomputed from the summed counts,
+    never averaged). Uses the same active-sleeve + WALLET_START_AT filter as
+    ``_ledger_block`` (via ``_ledger_where``), so rollups and streamed rows
+    always agree.
 
-    COUNTING CONTRACT (operator 2026-08-05 — CLOB semantics): every count here
-    counts TRADE GROUPS, not ledger rows — a base bet and its top-ups in the
-    same market window are ONE position on the venue and so ONE trade here (see
-    ``_TRADE_GROUP_KEY_SQL``). The $ columns (``pnl_net``, ``stake``) are
-    unchanged by grouping — they are the same Σ over the same rows.
+    Counts are trade groups (``_TRADE_GROUP_KEY_SQL``); ``pnl_net`` and
+    ``stake`` are the same sums as over rows.
 
-    ``total`` stays the AUDIT count of every group in the era (open + settled +
-    voided). The number the console may render as "trades" is
-    ``settled_opened`` (operator 2026-08-09) — settled groups with at least one
-    real fill; ``total - open`` is NOT that, it still carries the voided
-    never-filled cancels, which is exactly how they leaked into the Journal's
-    "settled trades" tile.
+    ``total`` is the audit count of every group (open + settled + voided). What
+    the dashboard shows as "trades" is ``settled_opened``: settled groups with
+    at least one real fill. ``total - open`` still includes voided cancels.
 
-    WIN-RATE CONTRACT: ``win_rate = wins / (wins + losses)`` over groups, where
-    a booked stop-loss exit counts as a LOSS (``_LOSS_PRED_SQL``, the same
-    2026-07-21 operator order — only its separate ``stops`` column is gone,
-    2026-08-05) and ``voided`` groups (never filled / refunded,
-    ``_VOIDED_CANCEL_PRED_SQL``) are EXCLUDED from the denominator. ``decided``
-    == wins + losses. Returns ``(None, {})`` if the ledger table can't be read
-    (legacy schema / missing table).
+    Win rate = ``wins / (wins + losses)`` over groups, with stop-loss exits
+    counted as losses (``_LOSS_PRED_SQL``) and voided groups (never filled or
+    refunded, ``_VOIDED_CANCEL_PRED_SQL``) excluded. ``decided`` = wins +
+    losses. Returns ``(None, {})`` if the ledger cannot be read (old schema).
     """
     where, params = _ledger_where(portfolio)
     try:
@@ -1478,12 +1413,11 @@ def _ledger_rollups(
             "total": total,
             "decided": wr_denom,
             "wins": wins,
-            # Booked stop-loss exits are folded in here — they ARE losses.
+            # Stop-loss exits are included here; they are losses.
             "losses": losses,
             "voided": voided,
-            # THE trade count (operator 2026-08-09): settled groups that
-            # actually opened. total == settled_opened + open + voided; the
-            # Journal's "settled trades" tile reads THIS, never total − open.
+            # The trade count: settled groups that actually opened (total ==
+            # settled_opened + open + voided).
             "settled_opened": settled_opened,
             "open": open_n,
             "win_rate": (wins / wr_denom) if wr_denom else None,
@@ -1555,41 +1489,36 @@ _EMPTY_PNL_DECOMPOSITION: dict[str, Optional[float]] = {
 def _ledger_pnl_decomposition(
     conn: sqlite3.Connection, portfolio: Optional[V6Portfolio]
 ) -> dict[str, Optional[float]]:
-    """Ledger-paper gross → fee → net decomposition over all settled rows.
+    """Ledger gross -> fee -> net decomposition over all settled rows.
 
-    Polymarket's fee is embedded in the fill prices and skimmed from the
-    WINNING payout, so it is realized only on WIN rows. Per winning row:
-      ``gross_row = shares * (1 − fp)``           (payout − cost, pre-fee)
-      ``fee_row   = gross_row − pnl_net``         (the skim that reduced payout)
-    where the (shares, fp) pair is the REALIZED live fill when present
-    (``live_filled_size``/``live_filled_price``) and the intended
-    (``bet_size/fill_price``, ``fill_price``) pair otherwise. The two are
-    never mixed — the pre-2026-07-21 form divided the INTENDED ``bet_size`` by
-    the REALIZED ``live_filled_price``, fabricating gross/fee on every LIVE
-    partial fill (M1/M2). Losses / cancels forfeit the stake with no winning
-    payout to skim, so their ``fee_row = 0`` and ``gross_row = pnl_net``.
+    The fee is taken out of the fill price and realized on the winning payout.
+    Per winning row:
+
+      ``gross_row = shares * (1 - fp)``    (payout - cost, before fee)
+      ``fee_row   = gross_row - pnl_net``  (the fee that reduced the payout)
+
+    where (shares, fp) is the realized live fill (``live_filled_size`` /
+    ``live_filled_price``) when present and the intended (``bet_size /
+    fill_price``, ``fill_price``) otherwise; the two are never mixed. Losses
+    and cancels have no payout, so ``fee_row = 0`` and ``gross_row = pnl_net``.
     Summed:
-      ``pnl_net_usd``   = Σ pnl_net over settled (== the ledger_rollup net)
-      ``pnl_fee_usd``   = Σ fee_row over wins  (positive magnitude of fee paid)
+
+      ``pnl_net_usd``   = sum of pnl_net over settled rows (== ledger_rollup net)
+      ``pnl_fee_usd``   = sum of fee_row over wins (fee paid, positive)
       ``pnl_gross_usd`` = pnl_net_usd + pnl_fee_usd
-    Plus ``pnl_rebate_usd`` = Σ ``capital_flows.amount_usd`` over ``kind =
-    'rebate'`` (taker-fee rebates + venue rewards paid back to the ACCOUNT).
-    It is deliberately OUTSIDE the gross − fee = net identity: a rebate is an
-    account-level cash event that no ledger row can be attributed to (the venue
-    pays it on the funded pot, not per bet), so folding it into the paper net
-    would break ``Σ(day.pnl) == pnl_net_usd`` and double-count against
-    ``kpis.net_deposits``, where the rebate is ALREADY inside equity via the
-    capital-flow replay. Same era gate as the bet window — ``load_capital_flows``
-    drops pre-``WALLET_START_AT`` rows (those are inside INITIAL_BANKROLL) —
-    so the two columns cover the same period; there is no sleeve dimension to
-    filter on.
-    Uses the SAME ``_ledger_where`` filter (active sleeves + WALLET_START_AT) as
-    the rollup so the net here can never disagree with the headline net. For a
-    LIVE win the per-row fee reduces to
-    ``live_filled_size*(1 − live_filled_price) − pnl_net``; for a DRY/legacy
-    win to ``bet_size*(1/fill_price − 1) − pnl_net``.
-    Display-only — never a sizing/settlement primitive. Returns Nones when the
-    ledger can't be read (legacy schema)."""
+
+    Plus ``pnl_rebate_usd`` = sum of ``capital_flows.amount_usd`` with ``kind =
+    'rebate'`` (fee rebates and rewards paid to the account). It sits outside
+    the gross - fee = net identity: a rebate is an account-level cash event not
+    tied to any bet, and it is already in equity through the capital-flow
+    replay (so adding it here would double count against
+    ``kpis.net_deposits``). ``load_capital_flows`` applies the same
+    ``WALLET_START_AT`` cutover, so both cover the same period.
+
+    Uses the same ``_ledger_where`` filter as the rollup, so this net always
+    matches the headline. Display only. Returns Nones when the ledger cannot be
+    read (old schema).
+    """
     where, params = _ledger_where(portfolio)
     settled_cond = "pnl_net IS NOT NULL"
     sql_where = (
@@ -1633,26 +1562,20 @@ def _ledger_pnl_decomposition(
     }
 
 
-# DAY-BUCKET CONTRACT (H1, 2026-07-21) — server + client MUST use this
-# identical rule (the client's settleTs in data.jsx mirrors it):
+# Day-bucket rule, shared by server and client (data.jsx settleTs mirrors it):
 #
-#   day = MYT(+8h) date of COALESCE(exit_ts when exit_kind='stop_loss',
+#  day = MYT (+8h) date of COALESCE(exit_ts when exit_kind='stop_loss',
 #                                   NULLIF(resolution_ts,''), bet_ts)
 #
-# MYT (Asia/Kuala_Lumpur) is a fixed UTC+8 with no DST, so the client's
-# fmt.dateMyt(ts) — Intl.DateTimeFormat in 'Asia/Kuala_Lumpur' over a UTC
-# timestamp — is exactly date(ts_as_utc + 8h). The ledger stores bet_ts /
-# resolution_ts as UTC-naive 'YYYY-MM-DD HH:MM:SS' strings, and SQLite's date()
-# treats a bare timestring as that same wall clock, so `date(ts, '+8 hours')`
-# reproduces fmt.dateMyt to the day (exit_ts's ISO 'T'/'Z' spelling is also
-# accepted by date() directly). A booked-once PURE_STOP_04 stop-loss row
-# realizes its pnl at the IMMUTABLE exit_ts while its resolution_ts stays NULL
-# until a display-only sweep backfill may stamp the (late) sweep clock — keying
-# stop rows on exit_ts makes the day bucket invariant to that backfill, exactly
-# like the shared equity-replay key (_equity_change_order_sql). The trailing
-# COALESCE(NULLIF(resolution_ts,''), bet_ts) mirrors the client's
-# `r.resolution_ts || r.bet_ts` (JS `||` treats '' as falsy; a settled row
-# always has a valid bet_ts, so the key is never NULL).
+# MYT (Asia/Kuala_Lumpur) is fixed UTC+8 with no DST, so the client's
+# fmt.dateMyt(ts) equals date(ts_as_utc + 8h). bet_ts / resolution_ts are
+# stored as UTC 'YYYY-MM-DD HH:MM:SS' strings, which SQLite's date() reads as
+# the same wall clock, so ``date(ts, '+8 hours')`` gives the same day (date()
+# also accepts exit_ts's ISO spelling). Stop-loss rows key on exit_ts, the time
+# the loss was realized, as in the equity replay (_equity_change_order_sql).
+# The final COALESCE(NULLIF(resolution_ts,''), bet_ts) matches the client's
+# ``r.resolution_ts || r.bet_ts`` ('' is falsy in JS; settled rows always have
+# bet_ts).
 _MYT_DAY_SQL = (
     "date(COALESCE("
     "CASE WHEN exit_kind = 'stop_loss' THEN NULLIF(exit_ts, '') END, "
@@ -1686,45 +1609,28 @@ _TRADE_GROUP_CONTRACT = (
 def _ledger_daily_rollups(
     conn: sqlite3.Connection, portfolio: Optional[V6Portfolio]
 ) -> tuple[list[dict[str, Any]], dict[str, list[dict[str, Any]]]]:
-    """Server-side ALL-TIME per-day P&L rollup keyed on the MYT settlement day.
-    Returns ``(combined, by_venue)``: the all-venue day array the
-    calendar/journal read, plus the H5 per-venue split (same shape/rules,
-    keyed 'polymarket' / 'predictfun'; empty/NULL venue folds to
-    'polymarket'). ONE venue-keyed GROUP BY scan serves both — the combined
-    array is merged per day from the venue groups in Python (the
-    pre-2026-07-22 form ran a second identical full-ledger scan per 5s history
-    refresh inside the live process).
+    """All-time per-day P&L keyed on the MYT settlement day. Returns
+    ``(combined, by_venue)``: the day array the calendar and journal read,
+    plus a per-venue split with the same shape. One GROUP BY venue scan
+    serves both.
 
-    Groups every settled ledger row (``pnl_net IS NOT NULL``) under the SAME
-    ``_ledger_where`` filter (active sleeves + WALLET_START_AT) as
-    ``_ledger_pnl_decomposition``, so ``Σ(day.pnl) == kpis.pnl_net_usd`` BY
-    CONSTRUCTION — the two read the identical row set and both SUM(pnl_net). The
-    calendar/journal derive their headline, cells, and day-KPIs from this array
-    instead of the bounded client ledger, so the Calendar net can never disagree
-    with the Overview P&L breakdown net again (they are now the same population).
+    Groups every settled row (``pnl_net IS NOT NULL``) under the same
+    ``_ledger_where`` filter as ``_ledger_pnl_decomposition``, so
+    ``sum(day.pnl) == kpis.pnl_net_usd`` by construction. The calendar and
+    journal use this array rather than the bounded client ledger, so their
+    totals always match the Overview.
 
-    Each entry is ``{date, pnl, n, wins, losses}`` — the shape the client's
-    ``aggDaily`` emits — ascending by MYT date (day rule = ``_MYT_DAY_SQL``;
-    stop rows key on their immutable exit_ts). ``pnl`` is the RAW Σ pnl_net for
-    the day (NOT ``_round_money``'d): summing the raw per-day totals
-    reconstructs ``kpis.pnl_net_usd`` to the cent, where per-day pre-rounding
-    could drift the headline off the breakdown by a cent; the client rounds only
-    for display.
+    Each entry is ``{date, pnl, n, wins, losses}`` (the shape the client's
+    ``aggDaily`` produces), ascending by date (rule in ``_MYT_DAY_SQL``).
+    ``pnl`` is the unrounded day sum, so the days add up to the headline to the
+    cent; the client rounds for display.
 
-    COUNTS ARE TRADE GROUPS (operator 2026-08-05, ``_TRADE_GROUP_KEY_SQL``): a
-    base bet and its top-ups settle as ONE CLOB position, so they contribute ONE
-    to ``n``/``wins``/``losses``. A group is filed under the EARLIEST MYT day
-    any of its fills settles on (in practice they all share one — the fills hold
-    one token that resolves once), which keeps each group on exactly one day so
-    ``Σ(day.n) == the lifetime group count``. ``pnl`` still sums whole groups,
-    so ``Σ(day.pnl) == kpis.pnl_net_usd`` survives grouping untouched: every
-    settled row lands in exactly one group and every group in exactly one day.
-    ``wins``/``losses`` classify the GROUP (booked stop exits count as losses,
-    ``_LOSS_PRED_SQL``), and ``n`` EXCLUDES groups that are nothing but voided
-    CANCELLED rows (``_VOIDED_CANCEL_PRED_SQL`` — e.g. a pnl_net=0 refund) so a
-    void never inflates the day's trade count; its 0 pnl stays in the sum,
-    preserving the identity above. Returns ``([], {})`` when the ledger can't be
-    read (legacy schema).
+    Counts are trade groups (``_TRADE_GROUP_KEY_SQL``). A group is filed under
+    the earliest day any of its fills settles (in practice they share one), so
+    every group lands on exactly one day and ``sum(day.n)`` equals the lifetime
+    group count. ``wins``/``losses`` classify the group (stop-loss exits are
+    losses), and ``n`` excludes groups made only of voided cancels; their $0
+    stays in ``pnl``. Returns ``([], {})`` when the ledger cannot be read.
     """
     where, params = _ledger_where(portfolio)
     settled_cond = "pnl_net IS NOT NULL"
@@ -1793,37 +1699,26 @@ _ANALYTICS_ALL = "All"
 def _ledger_analytics_rollups(
     conn: sqlite3.Connection, portfolio: Optional[V6Portfolio]
 ) -> tuple[Optional[dict], dict[str, dict]]:
-    """Full-ledger analytics the Overview/Journal pages used to derive
-    client-side over the bounded SSE stream window (headline summary · per-coin
-    · per-slice · P&L histogram · streak tape). Returns ``(combined, by_venue)``
-    like the other rollups, each keyed by range: ``{'All': {...}, '30d': {...},
-    '7d': {...}}``.
+    """Full-ledger analytics for the Overview and Journal (summary, per-coin,
+    per-slice, P&L histogram, streak tape). Returns ``(combined, by_venue)``
+    like the other rollups, each keyed by range: ``{'All': {...}, '30d':
+    {...}, '7d': {...}}``.
 
-    The historical panels must describe the WHOLE deployed history, not "the
-    newest ``LEDGER_BOOTSTRAP_LIMIT`` rows this session happened to receive" —
-    at ~3.5k era rows the bounded window dropped ~85% of the sample and the
-    panels silently disagreed with the lifetime headline beside them.
+    These panels must cover the whole history, not just the rows streamed to
+    this session.
 
-    ONE row scan under the SAME ``_ledger_where`` filter as ``_ledger_block``
-    feeds every range and both venue splits, aggregated in Python: the histogram
-    needs the |pnl| span before it can bin and the streak tape needs settlement
-    ORDER, so neither is a GROUP BY — and a scan per (range × venue × panel)
-    per history refresh inside the live process is exactly what
-    ``_ledger_rollups``' consolidation note warns against. Definitions mirror
-    the client's ``aggSummary`` / ``aggCoins`` / ``aggSlices`` /
-    ``aggHistogram`` / ``aggStreaks`` (wins/(wins+losses) with booked stop exits
-    folded into the losses and their realized loss in the PF gross loss, settled
-    stake as the ROI denominator) so the fallback path and this block can never
-    report different numbers.
+    One row scan under the same ``_ledger_where`` filter as ``_ledger_block``
+    feeds every range and venue, aggregated in Python (the histogram needs the
+    P&L span before binning and the streak tape needs settlement order). The
+    definitions match the client's ``aggSummary`` / ``aggCoins`` /
+    ``aggSlices`` / ``aggHistogram`` / ``aggStreaks`` (win rate = wins / (wins
+    + losses) with stop-loss exits as losses, settled stake as the ROI
+    denominator), so the client fallback and this block report the same
+    numbers.
 
-    COUNTS ARE TRADE GROUPS (operator 2026-08-05): the scanned rows are folded
-    into CLOB positions by ``_trade_groups`` FIRST, and every panel below —
-    summary ``total``/``settled``/``wins``/``losses``, the per-coin ``bets``/
-    ``resolved``, the per-slice ``n``, the histogram's per-trade bins, the
-    streak tape — counts one per group. The range slice applies to GROUPS (on
-    the group's settle time), so a group can never be half in and half out of a
-    window. Returns ``(None, {})`` if the ledger can't be read (legacy schema /
-    missing table).
+    Rows are folded into trade groups (``_trade_groups``) first, so every panel
+    counts one per group, and range filtering applies to groups by settle time.
+    Returns ``(None, {})`` if the ledger cannot be read.
     """
     where, params = _ledger_where(portfolio)
     try:
@@ -1870,25 +1765,20 @@ def _ledger_analytics_rollups(
 
 
 def _trade_groups(rows: list) -> list[dict]:
-    """Fold per-fill ledger rows into TRADE GROUPS (CLOB positions).
+    """Fold per-fill ledger rows into trade groups (CLOB positions).
 
-    One group per ``_TRADE_GROUP_KEY_SQL`` tuple — venue · coin · interval ·
-    window_start · side · wallet — so a base bet and every top-up it took in
-    that market window become ONE trade, exactly as the venue holds them (one
-    token balance, one settlement). Row ORDER within a group is the ledger's
-    natural fill order (``bet_ts``, then the scan order), so ``fills[0]`` is the
-    base entry: the ANCHOR whose entry_minute / realized_edge describe the
-    trade, matching how the journal labels the expansion (base, top-up 1, …).
+    One group per ``_TRADE_GROUP_KEY_SQL`` tuple (venue, coin, interval, window
+    start, side, wallet). Fills keep ledger order (``bet_ts``, then scan
+    order), so ``fills[0]`` is the base entry whose entry_minute and
+    realized_edge describe the trade.
 
-    Emitted per group:
-      ``pnl`` / ``stake``   Σ over the fills — identical to the pre-grouping
-                            row sums, which is why no $ figure moves.
-      ``settle_ts``         MIN over the fills (they share one resolution).
-      ``open``/``win``/``loss``/``voided``/``settled``  the group's single
-                            outcome class (see ``_GROUP_FLAGS_SQL`` — the SQL
-                            rollups classify identically).
-      ``n_fills``           how many ledger rows folded in (the journal's
-                            "N in 1" badge).
+    Per group:
+
+      ``pnl`` / ``stake``  sums over the fills (same totals as over rows).
+      ``settle_ts``        earliest over the fills (they share one resolution).
+      ``open``/``win``/``loss``/``voided``/``settled``  the group's outcome class
+                           (classified like ``_GROUP_FLAGS_SQL``).
+      ``n_fills``          number of ledger rows in the group.
     """
     order: list[tuple] = []
     groups: dict[tuple, dict] = {}
@@ -1988,21 +1878,19 @@ def _row_interval_label(row) -> str:
 
 
 def _analytics_entry(groups: list[dict]) -> dict:
-    """Summary / per-coin / per-slice / histogram / streak aggregates for one
-    TRADE-GROUP set (one venue × one range).
+    """Summary, per-coin, per-slice, histogram and streak aggregates for one
+    set of trade groups (one venue, one range).
 
-    Every count is one-per-group (CLOB semantics, operator 2026-08-05); the $
-    columns are the same Σ over the same fills they always were.
+    Every count is one per group; dollar columns are the same sums over the
+    fills.
 
-    TRADE POPULATION (operator 2026-08-09): every count the console labels
-    "trades"/"bets" — ``summary.settled``, per-coin ``bets``/``resolved``,
-    per-slice ``n``, the histogram bins and the expectancy denominator — counts
-    settled groups that actually OPENED. A voided never-filled cancel
-    (``outcome='CANCELLED'`` with no exit_kind, all fills voided) is NOT a
-    trade; it lives only in ``summary.voided``, the disjoint third bucket
-    alongside ``settled`` and ``open``. This is the same population
-    ``_ledger_equity_series`` plots one point per, so the hero tile and the
-    curve's x-axis cannot disagree.
+    Every count labelled "trades"/"bets" (``summary.settled``, per-coin
+    ``bets``/``resolved``, per-slice ``n``, histogram bins, the expectancy
+    denominator) counts settled groups that actually opened. A voided,
+    never-filled cancel is not a trade; it is counted only in
+    ``summary.voided``, separate from ``settled`` and ``open``. This is the
+    same population ``_ledger_equity_series`` plots, so the trade count and the
+    equity curve's x-axis agree.
     """
     coins: dict[str, dict] = {}
     slices: dict[str, dict] = {}
@@ -2026,15 +1914,11 @@ def _analytics_entry(groups: list[dict]) -> dict:
         if settled:
             pnl_sum += pnl
             if is_voided:
-                # TRADE-COUNT CONTRACT (operator 2026-08-09): a voided
-                # never-filled cancel NEVER OPENED a position, so it is not a
-                # trade and must stay out of every count the console labels
-                # "trades"/"bets" — `settled_n` is what the Overview hero tile
-                # renders and it has to equal _ledger_equity_series' point
-                # count. It keeps its OWN disjoint `voided` stat, and its $0
-                # stays inside pnl_sum so Σ still reconciles to the headline
-                # net. (Pre-2026-08-09 this incremented settled_n too, so the
-                # hero read `opened + voided` while the curve plotted `opened`.)
+                # A voided, never-filled cancel never opened a position, so it
+                # is not a trade and stays out of every "trades"/"bets" count;
+                # ``settled_n`` must equal the equity series' point count. It
+                # has its own ``voided`` count, and its $0 stays in pnl_sum so
+                # totals still reconcile.
                 voided_n += 1
             else:
                 settled_n += 1
@@ -2059,10 +1943,9 @@ def _analytics_entry(groups: list[dict]) -> dict:
                 "losses": 0, "pnl": 0.0, "gw": 0.0, "gl": 0.0,
                 "stake": 0.0, "stakeSettled": 0.0,
             })
-            # `bets` / `resolved` are the "trades" column of the Overview
-            # per-coin table — same contract as the hero tile, so a voided
-            # never-filled cancel counts in NEITHER (operator 2026-08-09).
-            # Σ(coin.resolved) == summary.settled by construction.
+            # ``bets`` / ``resolved`` are the per-coin "trades" column, so
+            # voided cancels count in neither. sum(coin.resolved) ==
+            # summary.settled.
             if not is_voided:
                 c["bets"] += 1
             c["stake"] += stake
@@ -2077,10 +1960,9 @@ def _analytics_entry(groups: list[dict]) -> dict:
                     c["losses"] += 1
                     c["gl"] += abs(min(0.0, pnl))
 
-        # Per-slice `n` and the per-trade P&L histogram/expectancy population.
-        # Voided never-filled cancels are excluded here too (operator
-        # 2026-08-09) so Σ(slice.n) == summary.settled and a $0 refund can no
-        # longer land in the histogram's centre bin as a break-even trade.
+        # Per-slice ``n`` and the histogram/expectancy population. Voided
+        # cancels are excluded so sum(slice.n) == summary.settled and a $0
+        # refund never lands in the histogram as a break-even trade.
         if settled and not is_voided:
             interval = g["interval"]
             entry = g["entry"]
@@ -2121,10 +2003,8 @@ def _analytics_entry(groups: list[dict]) -> dict:
                     if stake_settled_sum > 0 else None),
             **_profit_factor(gross_win, gross_loss),
             "avgEdge": round(edge_sum / edge_n, 6) if edge_n else None,
-            # Mean realized P&L per BOOKED trade — settled OPENED groups that
-            # actually carry a pnl_net (voided never-filled cancels are out of
-            # the denominator since 2026-08-09; their $0 used to drag the mean
-            # toward zero), matching the client aggRatios population.
+            # Mean realized P&L per settled, opened group that has a pnl_net
+            # (voided cancels excluded), matching the client's aggRatios.
             "expectancy": (_round_money(math.fsum(settled_pnls)
                                         / len(settled_pnls))
                            if settled_pnls else None),
@@ -2137,9 +2017,9 @@ def _analytics_entry(groups: list[dict]) -> dict:
 
 
 def _win_rate(wins: int, losses: int) -> Optional[float]:
-    """Win rate over TRADE GROUPS — the ONE definition, shared with
-    ``_ledger_rollups``. Booked stop-loss exits are already inside ``losses``
-    (``_LOSS_PRED_SQL`` / ``_trade_groups``); voided cancels are in neither."""
+    """Win rate over trade groups, shared with ``_ledger_rollups``. Stop-loss
+    exits are already counted in ``losses``; voided cancels are in neither.
+    """
     denom = wins + losses
     return round(wins / denom, 6) if denom else None
 
@@ -2257,32 +2137,25 @@ def _ledger_equity_series(
     max_points: Optional[int] = None,
     record_anchor: Optional[str] = None,
 ) -> Optional[dict]:
-    """Server-side equity curve over the active strategy's ledger.
+    """Equity curve for the active strategy.
 
-    When ``record_anchor`` (SQL-text UTC) is given the curve is scoped to the
-    RECORD ERA — only equity-change rows at/after the operator reset — so the
-    dashboard PnL chart, its peak and its max-drawdown all start from the reset
-    era instead of dragging in pre-reset history (operator 2026-07-24). The right
-    edge still lands on ``anchor`` (current capital), so the curve reads as the
-    era trajectory ending at today's balance. ``None`` = full lifetime curve.
+    With ``record_anchor`` (SQL-text UTC), the curve covers only equity changes
+    at or after the reset, so the chart, its peak and its max drawdown start
+    from that point. The right edge still lands on ``anchor`` (current
+    capital). ``None`` gives the full lifetime curve.
 
-    Mirrors ``_ledger_rollups`` (same ``_ledger_where`` filter) but returns a
-    per-TRADE cumulative SERIES rather than scalars — this is what lets the
-    dashboard equity chart show the deployed-strategy history instead of the
-    ~50-row session window the client could otherwise see. NOTE: with
-    ``record_anchor`` set the curve adds an equity-change-ts >= anchor predicate
-    the rollup does not, so the two intentionally diverge before the reset.
+    Uses the same ``_ledger_where`` filter as ``_ledger_rollups`` but returns a
+    cumulative series, so the chart shows the strategy's whole history rather
+    than the rows streamed to the client. With ``record_anchor`` set the curve
+    adds a time filter the rollup does not, so the two differ before the reset.
 
-    ONE POINT PER TRADE GROUP (operator 2026-08-09): the x-axis is the trade
-    number, so the curve's point count matches the hero "trades" tile. Settled
-    fills fold under ``_TRADE_GROUP_KEY_SQL`` (a base bet + its top-ups = one
-    CLOB position = one point), and voided never-filled cancel groups are
-    excluded — only trades that actually OPENED plot. Groups replay in
-    settlement order from a base anchored so the right edge lands exactly on
-    ``anchor`` (= kpis.realized_capital, matching the client's
-    ``anchoredEquity``); falls back to the portfolio bankroll when no anchor is
-    given. Downsampled to ``max_points`` (first + last preserved) to bound the
-    SSE payload. Returns None when the ledger can't be read (legacy schema).
+    One point per trade group: the x-axis is the trade number, matching the
+    "trades" count. Settled fills fold under ``_TRADE_GROUP_KEY_SQL`` and
+    voided cancel groups are left out. Groups replay in settlement order from a
+    base chosen so the right edge equals ``anchor`` (= kpis.realized_capital,
+    like the client's ``anchoredEquity``); without an anchor the portfolio
+    bankroll is used. Downsampled to ``max_points`` (first and last kept).
+    Returns None when the ledger cannot be read.
     """
     max_points = (
         max_points if max_points is not None else config.LEDGER_EQUITY_MAX_POINTS
@@ -2296,17 +2169,11 @@ def _ledger_equity_series(
         (where + " AND " + settled_cond) if where else (" WHERE " + settled_cond)
     )
     try:
-        # Order (and label) each point by the moment equity ACTUALLY changed,
-        # using capital.py's shared _equity_change_order_sql so this chart's
-        # peak/maxDD agree with the capital tile + the LIVE hard DD halt
-        # (config.MAX_DRAWDOWN_HALT_FRAC). A
-        # booked-once PURE_STOP_04 stop-loss row (exit_kind='stop_loss') realizes
-        # its pnl at the immutable exit_ts while its resolution_ts is NULL until a
-        # display-only telemetry backfill may stamp the sweep clock — keying stop
-        # rows on exit_ts (else resolution_ts, else bet_ts for legacy) makes this
-        # replay invariant to that backfill, exactly like get_capital_snapshot.
-        # The 'bet_ts' fallback (vs '' in the capital snapshot) is the one
-        # intended difference between the two callers.
+        # Order and label each point by when equity actually changed, using
+        # capital.py's _equity_change_order_sql, so this chart's peak and max
+        # drawdown match the capital tile and the drawdown halt. Stop-loss rows
+        # key on exit_ts, other rows on resolution_ts. The 'bet_ts' fallback
+        # (the capital snapshot uses '') is the one intended difference.
         ts_sql = _equity_change_order_sql("bet_ts")
         rows = conn.execute(
             # The trade-group key columns ride along so the Python fold below
@@ -2318,11 +2185,10 @@ def _ledger_equity_series(
             "ORDER BY ts ASC, id ASC",
             params,
         ).fetchall()
-        # Record-era scope (operator 2026-07-24): drop equity-change rows before
-        # the reset so the curve/peak/maxDD start from the era, not lifetime.
-        # Filtered in Python on the `ts` SQLite already computed (rows are
-        # ts-ordered) — cheaper and simpler than re-injecting the non-sargable
-        # COALESCE/CASE ts expression into the WHERE clause (SQL-text UTC compare).
+        # Drop equity changes before the reset so the curve, peak and max
+        # drawdown start there. Filtered in Python on the ``ts`` SQLite already
+        # computed (rows are in ts order), which is simpler than putting the
+        # COALESCE/CASE expression in the WHERE clause.
         if record_anchor is not None:
             rows = [
                 r for r in rows
@@ -2485,18 +2351,13 @@ def _ledger_block(
     limit_delta: int | None = None,
     book_mark_get: Optional[Callable[..., Any]] = None,
 ) -> tuple[list[dict], int]:
-    """Return (rows, max_id_seen). When last_seen_id=0 we send the bootstrap
-    snapshot (most recent N rows); otherwise we send rows with id >
-    last_seen_id plus recent settled rows so connected clients can replace
-    previously streamed PENDING entries after resolution.
+    """Return (rows, max_id_seen). With last_seen_id=0, send the most recent N
+    rows; otherwise send rows with id > last_seen_id plus recently settled
+    rows, so clients can replace PENDING rows they already have.
 
-    Rows are restricted to the active strategy's sleeves (``portfolio``) so a
-    retired strategy's ledger (e.g. the old ``v6_5m`` LUT sleeve) never appears
-    on the dashboard, and to ``bet_ts >= WALLET_START_AT`` when a cutover is
-    configured — both via the shared ``_ledger_where``. Both limits come from
-    config so the asymmetry is visible — review #46 flagged the inline
-    ``LIMIT 500`` magic number that didn't match the named ``limit_initial``
-    kwarg on the bootstrap path.
+    Rows are limited to the active strategy's sleeves and to ``bet_ts >=
+    WALLET_START_AT`` when a cutover is set, both via ``_ledger_where``. Both
+    limits come from config.
     """
     bootstrap = limit_initial if limit_initial is not None else config.LEDGER_BOOTSTRAP_LIMIT
     delta = limit_delta if limit_delta is not None else config.LEDGER_DELTA_LIMIT
@@ -2554,17 +2415,14 @@ def _ledger_block(
             "sleeve": r["sleeve"],
             "entry_minute": r["entry_minute"],
             "mode": mode,
-            # Venue dimension (deliverable 5): 'polymarket' / 'predictfun'.
-            # Absent-in-DB (legacy row) resolves to 'polymarket'.
+            # Venue of the row; rows without one count as 'polymarket'.
             "venue": _row_venue(r),
             "side": r["side"],
-            # TRADE-GROUP key component (operator 2026-08-05): the market
-            # window's epoch start. The client folds a base bet and its top-ups
-            # into ONE journal row on
-            # (venue · coin · interval_min · window_start_ts · side · wallet),
-            # the same tuple the server rollups group on — so the journal's row
-            # count and the server's trade counts describe the same population.
-            # A legacy row without it stays its own group (never mis-merged).
+            # Part of the trade-group key: the market window's start. The
+            # client folds a position's fills into one journal row on (venue ·
+            # coin · interval_min · window_start_ts · side · wallet), the same
+            # tuple the server rollups group on. A row without it stays its own
+            # group.
             "window_start_ts": r["window_start_ts"],
             "direction": _direction(r["side"]),
             "outcome": r["outcome"],
@@ -2579,26 +2437,19 @@ def _ledger_block(
             "effective_bet_size": _round_money(effective_bet_size),
             "is_topup": bool(r["is_topup"]),
             "pnl_net": _round_money(r["pnl_net"]),
-            # Additive analytics fields (dashboard redesign): the operator
-            # journal/calendar/calibration pages derive per-day P&L, equity
-            # curve, and model_p-vs-realized-win-rate client-side from the
-            # streamed ledger, so the model's predicted probability, realized
-            # edge, market-implied price, settlement time, and resolved
-            # direction must ride along on each row. All nullable for legacy
-            # rows; the additive contract (R-NEW-12) permits new fields.
+            # Fields the journal, calendar and analytics pages compute with
+            # client-side: model probability, realized edge, market price,
+            # settlement time and resolved direction. All nullable for older
+            # rows.
             "model_p": _round_prob(r["model_p"]),
             "p_market": _round_prob(r["p_market"]),
             "realized_edge": _round_prob(r["realized_edge"]),
             "resolution_ts": r["resolution_ts"],
-            # PURE_STOP_04: immutable exit clock used by the server/client
-            # MYT day-bucket contract. It must survive the streamed row even
-            # though the stop's resolution is settled later by the sweep.
+            # Fixed exit time of a stop-loss row, used by the day-bucket rule.
             "exit_ts": r["exit_ts"],
             "won_up": r["won_up"],
             "interval_min": r["interval_min"],
-            # B1 sub-minute checkpoint stamp (NULL on baseline rows) — the
-            # Journal's "+Ns" badge reads this (review finding: the SELECT
-            # carried it but the emitted dict dropped it).
+            # Seconds into the window at entry (the Journal's "+Ns" badge).
             "offset_sec": r["offset_sec"],
             # Historical stop-loss rows: exit_kind='stop_loss' marks an early
             # close whose pnl_net is the realized loss.
@@ -2763,11 +2614,11 @@ def _readiness_checks(payload: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _capital_flows_block(conn: sqlite3.Connection) -> list[dict]:
-    """Operator-recorded account cash events, oldest-first.
+    """Recorded account cash events, oldest first.
 
-    The panel keeps pre-cutover rows visible for audit history; the replay
-    applies only rows at/after ``WALLET_START_AT``. ``kpis.net_deposits`` is
-    the current-era total already folded into the equity tile.
+    Rows before ``WALLET_START_AT`` are listed for history; the equity replay
+    only uses rows from the cutover on. ``kpis.net_deposits`` is the current
+    total, already included in the equity tile.
     """
     return [
         {
@@ -2849,10 +2700,9 @@ def _operator_block(conn: sqlite3.Connection) -> dict:
 # ---------------------------------------------------------------------------
 
 _AUX_BLOCK_TTL_S = 5.0
-# Keyed (block_name, id(conn)) — review finding: a name-only key handed one
-# DB's blocks to any other caller inside the TTL (latent hazard; production
-# has a single caller today, tests do not). id(conn) is stable while the
-# conn lives, and the 5s TTL makes id-reuse collisions irrelevant.
+# Keyed (block_name, id(conn)) so one database's cached blocks are never handed
+# to another connection. id(conn) is stable while the connection lives, and the
+# 5s TTL makes id reuse irrelevant.
 _aux_cache: dict[tuple[str, int], tuple[float, Any]] = {}
 
 
@@ -2892,16 +2742,10 @@ _LATENCY_STAGES = ("spot", "ctx", "gamma", "book", "sign", "post", "order", "tot
 # placed that tick (pipeline.py accumulates tick.ms_order_* += per-order ms).
 _LATENCY_ORDER_STAGES = ("sign", "post", "order")
 
-# Venue floor (item 27): the EXPECTED decision→fill envelope for a venue — a
-# per-order POST in that range is the venue floor, not instability. Emitted so
-# the client labels the Latency panel from data, not a hardcoded prose copy.
-# VENUE-DISPATCHED (2026-07-23): Polymarket enforces a ~250ms uncancellable
-# taker delay (+~50-80ms RTT/signing => ~300-320ms floor, see memory
-# reference_polymarket_latency_floor). predict.fun is a DIFFERENT venue on
-# BNB-chain infra with NO documented uncancellable-taker delay; the measured
-# order POST round-trip is ~700-900ms (2026-07-23 live validation), so showing
-# Polymarket's 250/300ms floor there made honest predict.fun latency read as
-# "way over floor / red" against a floor that wasn't even its own.
+# Expected decision-to-fill floor per venue: an order POST in this range is the
+# venue's floor, not slowness. Polymarket enforces a ~250ms uncancellable taker
+# delay, plus ~50-80ms of network and signing, for a ~300-320ms floor. Sent in
+# the payload so the latency page labels from data.
 _LATENCY_VENUE_FLOOR_BY_VENUE = {
     "polymarket": {
         "taker_delay_ms": 250,
@@ -2914,24 +2758,20 @@ _LATENCY_VENUE_FLOOR_BY_VENUE = {
 def _latency_venue_floor(
     measured_post: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
-    """The expected decision→fill floor for the DEPLOYED venue (config.VENUE).
+    """The expected decision-to-fill floor for the deployed venue
+    (config.VENUE).
 
-    ``taker_delay_ms`` is the venue's DOCUMENTED constant (250 on Polymarket) —
-    a published floor, not an observation. Operator 2026-08-05 asked the fair
-    question "maybe it is 260ms — can you record the real time?", so the block
-    also carries ``taker_delay_measured_ms``: the p50/p95/max/n of the ACCEPTED
-    per-order POST round trip in this window, i.e. the same
-    ``orders.per_order.post`` cohort the accept-vs-reject panel already shows.
+    ``taker_delay_ms`` is the venue's documented delay (250ms on Polymarket),
+    not a measurement. ``taker_delay_measured_ms`` adds the p50/p95/max/n of
+    the accepted per-order POST round trip in this window (the same
+    ``orders.per_order.post`` data as the accept/reject panel).
 
-    That is the honest measurement available from the box: an accepted
-    marketable order's POST cannot return before the venue's uncancellable
-    delay has elapsed, so the measured figure is `network + signing tail +
-    enforced delay` and is therefore an UPPER bound on the delay (measured >=
-    documented floor), never the delay in isolation — the client says so in the
-    row tooltip rather than relabelling one as the other.
+    An accepted marketable order cannot return before the delay has passed, so
+    the measured value is network + signing + delay: an upper bound on the
+    delay, not the delay itself. The client says so in the tooltip.
 
-    None when the window contains no accepted orders (a reject-only window
-    measures nothing); the client then falls back to the documented floor.
+    None when the window has no accepted orders; the client then shows the
+    documented value.
     """
     venue = getattr(config, "VENUE", "polymarket")
     out = dict(
@@ -2951,21 +2791,19 @@ def _latency_venue_floor(
 
 
 def _latency_block(conn: sqlite3.Connection) -> Optional[dict[str, Any]]:
-    """C1: aggregate the A0 stage='latency' pipeline_health rows (compact
-    JSON messages) into per-stage p50/p95/max + a recent-ticks list.
+    """Aggregate the stage='latency' pipeline_health rows (compact JSON) into
+    per-stage p50/p95/max plus a list of recent ticks.
 
-    LATENCY CONTRACT (item 27, 2026-07-21): the trace's sign/post/order values
-    are PER-TICK SUMS across every order placed that tick (a 2-order boundary
-    tick reads ~2x per-order POST), and a reject retry is its own order in the
-    sum. ``stages`` keeps the legacy tick-level aggregation (sums included) for
-    continuity; ``orders.per_order`` is the HONEST per-order view — each tick
-    contributes its per-order mean (stage_sum / n_orders), weighted by
-    n_orders, which is exact for the dominant 1-order ticks. Individual
-    per-order splits inside a multi-order tick are not persisted (only the
-    tick sum is), so the mean is the best available estimator; reject/retry
-    counts live separately in v2.reject_stats (n_rejected / n_accepted).
-    ``venue_floor`` carries the expected ~300-320ms decision→fill envelope so
-    the client can label per-order POST readings near it as EXPECTED."""
+    The trace's sign/post/order values are per-tick sums over every order
+    placed that tick (a tick with two orders reads ~2x one POST), and a reject
+    retry is its own order. ``stages`` keeps that tick-level aggregation;
+    ``orders.per_order`` is the per-order view: each tick contributes its mean
+    (stage_sum / n_orders), weighted by n_orders, which is exact for the common
+    one-order tick. Per-order splits within a multi-order tick are not stored,
+    so the mean is the best estimate available. Reject/retry counts are in
+    v2.reject_stats. ``venue_floor`` carries the expected ~300-320ms
+    decision-to-fill floor so the client can label readings near it as normal.
+    """
     def build() -> Optional[dict[str, Any]]:
         try:
             rows = conn.execute(
@@ -3000,13 +2838,11 @@ def _latency_block(conn: sqlite3.Connection) -> Optional[dict[str, Any]]:
         ]
         stages: dict[str, dict[str, float]] = {}
         for st in _LATENCY_STAGES:
-            # Review finding: sign/post/order are 0.0 on every orderless
-            # tick (the overwhelming majority), so percentiles over ALL
-            # samples read ~0ms regardless of real order latency —
-            # aggregate those stages over order-bearing ticks only.
-            # NB these are still TICK-LEVEL values (per-tick SUMS across
-            # n_orders for the order stages) — the honest per-order view
-            # is the `orders.per_order` block below.
+            # sign/post/order are 0.0 on every tick without an order (most
+            # ticks), so percentiles over all ticks would read ~0ms; aggregate
+            # those stages over order-bearing ticks only. These are still
+            # tick-level sums; the per-order view is the ``orders.per_order``
+            # block below.
             src = order_samples if st in _LATENCY_ORDER_STAGES else samples
             vals = sorted(float(s.get(st, 0.0) or 0.0) for s in src)
             stages[st] = {
@@ -3015,19 +2851,14 @@ def _latency_block(conn: sqlite3.Connection) -> Optional[dict[str, Any]]:
                 "max": round(vals[-1], 1) if vals else 0.0,
                 "n": len(vals),
             }
-        # Honest PER-ORDER order-stage stats (item 27): normalize each
-        # order-bearing tick's stage sum by its n_orders, weight by n_orders.
+        # Per-order stats: divide each order-bearing tick's stage sum by its
+        # n_orders and weight by n_orders.
         #
-        # ⚠️ ACCEPT/REJECT (2026-07-25 latency audit). Before the walker fix,
-        # BOTH exception handlers in place_gtc_limit_order returned OrderResult
-        # without sign_ms/post_ms, so every venue-refused FAK — ~55% of live
-        # orders, the whole `no_liquidity` cohort — recorded post=0. This loop
-        # then averaged those zeros in unweighted and the page reported order
-        # post p50 ~= 0.0ms. Now the trace carries `post` (ACCEPT-only sum) and
-        # `post_rej` (reject sum) with `n_rej`, and the two are aggregated
-        # SEPARATELY: an accept costs ~415ms (it waits out the venue's 250ms
-        # taker delay + matching), a reject ~286ms (a 400 skips matching), and
-        # blending them describes neither.
+        # Accepted and rejected orders are aggregated separately. The trace
+        # carries ``post`` (accepted orders) and ``post_rej`` (rejects) with
+        # ``n_rej``. An accepted order takes ~415ms (it waits out the 250ms
+        # taker delay plus matching), a reject ~286ms (a 400 skips matching),
+        # and averaging the two describes neither.
         n_orders_total = 0
         n_multi_order_ticks = 0
         n_rej_total = 0
@@ -3081,8 +2912,7 @@ def _latency_block(conn: sqlite3.Connection) -> Optional[dict[str, Any]]:
                 **{st: s.get(st, 0.0) for st in _LATENCY_STAGES},
                 "n_book": s.get("n_book", 0),
                 "n_orders": s.get("n_orders", 0),
-                # 2026-07-25 columns (absent on rows written by an older
-                # scanner — the page renders those cells as "—").
+                # Absent on rows written by older versions; the page shows "—".
                 "pre_post": s.get("pre_post"),
                 "tail": s.get("tail"),
                 "post_rej": s.get("post_rej"),
@@ -3094,12 +2924,12 @@ def _latency_block(conn: sqlite3.Connection) -> Optional[dict[str, Any]]:
             }
             for s in samples[:60]
         ]
-        # ── DECISION LATENCY (2026-07-25) ────────────────────────────────
-        # tick start -> first order POST leaving the box. THE client-owned
-        # number: everything after it is the venue's uncancellable taker delay
-        # + matching, and everything in `tail` delays no fill at all. Emitted
-        # separately so the page can stop presenting a whole-tick total (which
-        # includes ~99ms of post-POST work) as if it were decision→fill.
+        # ── DECISION LATENCY ─────────────────────────────────────────────────
+        # Tick start to the first order POST leaving the box: the part the bot
+        # controls. Everything after it is the venue's taker delay plus
+        # matching, and the ``tail`` (post-POST work) delays no fill. Reported
+        # separately so the page does not present the whole tick as
+        # decision-to-fill time.
         def _pstats(vals: list[float]) -> dict[str, float]:
             vals.sort()
             return {
@@ -3120,12 +2950,10 @@ def _latency_block(conn: sqlite3.Connection) -> Optional[dict[str, Any]]:
             ),
         }
 
-        # ── BOOK FRESHNESS ───────────────────────────────────────────────
-        # STALENESS is a different axis from wall-clock and the page must not
-        # blend them: a 1ms-fast tick that priced a 7s-old ladder is the worse
-        # outcome. The venue market channel pushes ~822 msg/s (p50 1ms
-        # inter-frame, measured 2026-07-25), so a large ws_age is always a
-        # consumer defect, never the feed.
+        # ── BOOK FRESHNESS ───────────────────────────────────────────────────
+        # Staleness is a different axis from latency: a fast tick that priced a
+        # seconds-old book is the worse outcome. The venue pushes ~800 msg/s,
+        # so a large ws_age points at the consumer, not the feed.
         ws_ages = [
             float(s.get("ws_age", 0.0) or 0.0) for s in samples
             if int(s.get("bk_ws", 0) or 0) > 0
@@ -3148,13 +2976,12 @@ def _latency_block(conn: sqlite3.Connection) -> Optional[dict[str, Any]]:
             # freshness is UNMEASURED — the page says so rather than implying
             # the ws_age figure covers every book.
             "prefetch_age_instrumented": False,
-            # STALL WATCHDOG (operator order 2026-08-06). The ws_age figures
-            # above deliberately no longer gate anything (age = quietness on
-            # these books), so the honest reading of a large age depends on
-            # whether the out-of-band REST cross-check is running and agreeing.
-            # In-process counters, not a DB read: the watchdog lives on the
-            # scheduler pool of THIS process. `armed=False` => never
-            # constructed (WS off / shadow mode / venue mirror without the API).
+            # Stall watchdog counters. ws_age no longer gates anything (on
+            # these books a large age usually means a quiet market), so a large
+            # age is only meaningful alongside whether the REST cross-check is
+            # running and agreeing. In-process counters from this process's
+            # scheduler. ``armed=False`` means the watchdog was never built (WS
+            # off, shadow mode, or a mirror without the methods).
             "watchdog": _watchdog_counters(),
         }
 
@@ -3180,9 +3007,8 @@ def _latency_block(conn: sqlite3.Connection) -> Optional[dict[str, Any]]:
     return _aux_cached(conn, "latency", build)
 
 
-# v2 "step1last" went live 2026-07-08 13:45:00 UTC — reject/fill accounting is
-# anchored here so the fill tax reflects the promoted strategy, not the DRY
-# seeding phase before it.
+# Earliest bet time counted in reject/fill accounting when no reset anchor
+# applies.
 _V2_GO_LIVE_TS = "2026-07-08 13:45:00"
 
 
@@ -3212,17 +3038,15 @@ def _reject_side_dir(side: Any) -> Optional[str]:
 
 
 def _sleeve_interval_tag(sleeve: Any) -> Optional[str]:
-    """Interval bucket ("5m"/"15m") encoded in a sub-minute sleeve label
-    (subminute_5m, subminute_15m, ...).
+    """Interval ("5m"/"15m") from a sub-minute sleeve label (subminute_5m,
+    ...).
 
-    Used to key a RESOLUTION across sleeves and attempts: several attempts (a
-    FAK retry, a T3 top-up, or any second sleeve on the same interval) hit the
-    SAME (coin, interval, window, side) resolution, first-fill-wins. Keying the
-    counterfactual "fill tax" on the interval bucket rather than the sleeve
-    label folds them into ONE window so a missed resolution is counted ONCE —
-    not once per attempt. The interval (not just the raw window_start_ts) stays
-    in the key so a 5m and a 15m window that share a boundary epoch (e.g. both
-    land on :00) remain distinct resolutions."""
+    Used to key a resolution across sleeves and attempts: retries (or a second
+    sleeve on the same interval) hit the same (coin, interval, window, side)
+    resolution, and keying on the interval rather than the sleeve label counts
+    a missed resolution once, not once per attempt. The interval stays in the
+    key so a 5m and a 15m window starting at the same second stay separate.
+    """
     m = re.search(r"(\d+)m", str(sleeve or ""))
     return f"{m.group(1)}m" if m else None
 
@@ -3257,27 +3081,22 @@ def _reject_missed_pnl(
 
 
 # ---------------------------------------------------------------------------
-# Miss CAUSE = the on-chain verdict, and nothing else (operator 2026-07-30).
+# The cause of a miss is the on-chain verdict and nothing else.
 #
-# The predecessor of this block inferred a cause from the ~1s post-reject book
-# re-read (`reject_requotes.requote_ask` vs our FAK limit) and shipped it as
-# taker_race / maker_pulled / ghost_fill / venue_reject / unclassified, with a
-# reachable-vs-unreachable money split hanging off it. The on-chain forensic
-# (2026-07-30, 45 rejects) REFUTED that reading outright: a book re-read cannot
-# distinguish an ask that TRADED AWAY from one that was PULLED, and the trade
-# tape says the truth is ~84% FASTER_TAKER / ~13% REPRICED_ONLY / ~2%
-# MAKER_CANCEL — the mirror image of the ~68%-maker-cancel the probe implied.
-# So the whole probe taxonomy is gone; `miss_forensics` verdicts are the single
-# source of truth for WHY a trade was missed.
+# Re-reading the book a second after a reject cannot tell an ask that traded
+# away from one that was pulled, and the trade tape showed most misses were
+# faster takers, not maker cancels. So ``miss_forensics`` verdicts are the only
+# source of why a trade was missed.
 #
-# What survives from the old block is only what was never an inference:
-#   * `requote_ask` / `requote_drift` — a PRICE metric (how far the book moved
-#     after the reject). Still collected, still displayed, no longer a cause.
-#   * MISS KIND (below) — facts about OUR OWN order, read off our own rows:
-#     ghost_fill / venue_error / book_miss. These are not rival causes; they
-#     say whether the book was contested at all, and therefore explain which
-#     misses the chain job can even adjudicate (it classifies exactly the
-#     `no_liquidity` rejects with no accept on the resolution = `book_miss`).
+# Kept alongside, as facts rather than causes:
+#
+#  * ``requote_ask`` / ``requote_drift``: how far the book moved after the
+#    reject, shown as a price metric.
+#  * MISS KIND (below): facts about our own order from our own rows
+#    (ghost_fill / venue_error / book_miss). They say whether the book was
+#    contested at all, i.e. which misses the chain job can classify (it
+#    handles the ``no_liquidity`` rejects with no accepted fill on the
+#    resolution, which are ``book_miss``).
 # ---------------------------------------------------------------------------
 
 #: A missed resolution's KIND — what OUR side did, never what the book did.
@@ -3307,17 +3126,14 @@ def _miss_res_key(
     return (coin, _sleeve_interval_tag(sleeve), int(window_start_ts), direction)
 
 
-# ── on-chain miss forensics (miss_forensics table) ───────────────────────
-# The verdicts are produced OFF this path by the miss_forensics scheduler job
-# (scheduler/miss_forensics.py); this block only reads them. They come from the
-# trade tape, so FASTER_TAKER vs MAKER_CANCEL is evidence, not inference — which
-# is why they REPLACED the post-reject-book taxonomy rather than sitting beside
-# it (see the block above).
-#: Strongest evidence FIRST — one tuple, from which both the resolution-level
-#: precedence (a single at-our-level print PROVES the level was live, so it
-#: outranks the weaker "nothing printed" readings from the other attempts) and
-#: the strip's display order derive. The names come from the producer so a
-#: renamed verdict is an ImportError, not a silently-empty panel.
+# ── on-chain miss forensics (miss_forensics table) ─────────────────────── The
+# verdicts are written by the miss_forensics scheduler job
+# (scheduler/miss_forensics.py); this only reads them. They come from the trade
+# tape, so FASTER_TAKER vs MAKER_CANCEL is evidence, not inference. Strongest
+# evidence first. This one tuple sets both the per-resolution precedence (one
+# print at our level proves the level was live, which outranks "nothing
+# printed" from other attempts) and the display order. Names are imported from
+# the producer, so a renamed verdict fails at import.
 _CHAIN_VERDICTS = (
     VERDICT_FASTER_TAKER,
     VERDICT_REPRICED_ONLY,
@@ -3395,16 +3211,15 @@ def _chain_forensics_rows(conn: sqlite3.Connection, anchor: str) -> list:
 def _chain_forensics_cached(
     conn: sqlite3.Connection, anchor: str
 ) -> tuple[list, dict[tuple, dict[str, Any]], dict[tuple, dict[str, Any]]]:
-    """``(rows, by_attempt, by_resolution)``, rebuilt only when the table moved.
+    """``(rows, by_attempt, by_resolution)``, rebuilt only when the table
+    changed.
 
-    The producer fires every ``MISS_FORENSICS_SECONDS`` (300s) while the
-    snapshot is rebuilt every few seconds, so nearly every build re-ran the same
-    join plus two index builds (~113ms measured) for a byte-identical answer.
-    Keyed on the ``ledger_version()`` pattern: a cheap
-    ``(COUNT, MAX(fill_id), MAX(checked_at))`` probe. ``_upsert`` always
-    restamps ``checked_at``, so a RECLASSIFICATION moves the probe too; only two
-    upserts of the SAME fill_id inside one second are invisible, and those cost
-    one stale refresh at most.
+    The producer runs every ``MISS_FORENSICS_SECONDS`` (300s) while the
+    snapshot is rebuilt every few seconds, so most rebuilds would repeat the
+    same join and indexing (~113ms). The cache key is a cheap ``(COUNT,
+    MAX(fill_id), MAX(checked_at))`` probe. ``_upsert`` always updates
+    ``checked_at``, so a reclassification moves the probe; only two upserts of
+    the same fill_id within one second are missed, costing one stale refresh.
     """
     try:
         probe: Optional[tuple] = conn.execute(
@@ -3477,19 +3292,17 @@ def _chain_forensics_stats(
     now_ts: float,
     resolved_by_res: dict[tuple, Any],
 ) -> Optional[dict[str, Any]]:
-    """The aggregate strip: 7-day verdict counts, median beat-dt, speed prize.
+    """The summary strip: 7-day verdict counts, median beat time, and the speed
+    prize.
 
-    ``resolved_by_res`` maps ``_miss_res_key`` -> settled UP/DOWN outcome; the
-    caller already groups the reject rows per resolution to build it, which is
-    why this no longer rides in as a per-row correlated subquery.
+    ``resolved_by_res`` maps ``_miss_res_key`` -> settled UP/DOWN; the caller
+    already groups rejects per resolution to build it.
 
-    THE SPEED PRIZE is the whole point of the panel. It prices the upside of
-    ever investing in latency: over the FASTER_TAKER cohort — the misses we
-    provably lost on speed, and therefore the only ones a faster bot could have
-    won — would-win WR vs the break-even WR implied by the price we bid (mean
-    limit). If the two are equal, winning those races buys nothing and speed is
-    not the lever, however many races we lose. (2026-07-30 manual forensic:
-    78.9% vs 76.1% — about zero.)
+    The speed prize prices the upside of investing in latency. Over the
+    FASTER_TAKER misses (the ones lost on speed, so the only ones a faster bot
+    could have won), compare the would-be win rate with the break-even rate
+    implied by our average limit price. If they are about equal, winning those
+    races gains nothing and speed is not worth chasing.
     """
     if not rows:
         return None
@@ -3574,16 +3387,16 @@ def _reject_context_maps(
 ) -> tuple[set, set, dict]:
     """(filled_keys, ghost_keys, error_kinds_by_key) for the record window.
 
-    filled_keys — resolutions where a REAL fill exists (subminute accepted
-    with filled_usd > 0, or a ledger row whose reconciler landed
-    live_filled_size > 0 — the deferred fill-GET rescue path): their rejects
-    are retries of a bet that COMPLETED, so they are never missed trades.
-    ghost_keys — resolutions whose only accept filled $0 (phantom quote).
-    error_kinds_by_key — the set of FAILED live_order_attempts error_kinds
-    per resolution (drives the venue_error miss kind). Every query is bounded
-    (anchor via the created_at index, or newest-N by id then post-filter —
-    the same early-stop shapes the sibling queries use); a missing table
-    degrades to empty maps."""
+    filled_keys: resolutions with a real fill (an accepted sub-minute fill with
+      filled_usd > 0, or a ledger row whose live_filled_size > 0). Their rejects
+      were retries of a bet that completed, so they are never misses.
+    ghost_keys: resolutions whose only accepted order filled $0.
+    error_kinds_by_key: FAILED live_order_attempts error_kinds per resolution
+      (for the venue_error miss kind).
+
+    Every query is bounded (by the created_at index, or newest-N by id and then
+    filtered); a missing table gives empty maps.
+    """
     filled: set = set()
     ghost: set = set()
     try:
@@ -3669,28 +3482,24 @@ def _miss_kind(*, is_ghost: bool, error_kinds: set) -> str:
 def _reject_block(
     conn: sqlite3.Connection, theta: float, anchor: str,
 ) -> dict[str, Any]:
-    """The v2 "fill tax": recent rejected FAK attempts (scored against their
-    would-be outcome), the per-RESOLUTION missed-trades rollup, and aggregate
-    reject/fill stats — all bounded to the record window. ``anchor`` is the
-    shared ``_record_anchor_ts()`` value computed ONCE by the caller
-    (_v2_block) so every window on the Subminute tab — bets, rejects, fill tax,
-    cash peak — anchors identically. Every query is bounded by a LIMIT with an
-    early-stopping plan or the indexed ``created_at``; empty tables degrade to
-    zeros/None.
+    """The "fill tax": recent rejected FAK orders (priced against what they
+    would have won), a per-resolution missed-trades rollup, and aggregate
+    reject/fill stats, all limited to the record window. ``anchor`` is
+    ``_record_anchor_ts()`` computed once by _v2_block, so every window on
+    the Subminute tab uses the same start. Every query has a LIMIT or uses
+    the ``created_at`` index; empty tables give zeros/None.
 
-    Missed-trade accounting:
-      * ONE missed trade per RESOLUTION (coin, interval, window_start_ts,
-        direction) — N FAK retries are ONE miss, and a
-        resolution that eventually FILLED is ZERO misses (its rejects are
-        retries of a bet that completed; before this fix their would-be PnL
-        leaked into the missed total on top of the realized ledger PnL).
-      * The representative attempt is the one carrying the full intended size
-        (max requested_usd), so the counterfactual is priced at the limit we
-        actually meant to buy. It is priced AT OUR LIMIT for every miss —
-        uniformly, with no cause-conditional pricing.
-      * CAUSE comes from the chain verdict (`chain_verdict` per row,
-        `chain_counts` / `chain_pnl` in the stats) and nowhere else. The
-        per-row `miss_kind` is not a rival cause — see the block above."""
+    Missed trades:
+
+      * One per resolution (coin, interval, window_start_ts, direction): several
+        FAK retries are one miss, and a resolution that eventually filled is not
+        a miss at all.
+      * The representative attempt is the one with the largest requested size,
+        and every miss is priced at our limit.
+      * The cause is the chain verdict (``chain_verdict`` per row,
+        ``chain_counts`` / ``chain_pnl`` in the stats). ``miss_kind`` is a fact
+        about our order, not a cause (see above).
+    """
     raw_rows: list = []
     try:
         # Newest-N by id (early-stops after LIMIT rows), then drop pre-anchor
@@ -3713,10 +3522,9 @@ def _reject_block(
     except sqlite3.OperationalError:
         raw_rows = []
 
-    # ON-CHAIN verdicts (off-path miss_forensics job). Read once and indexed
-    # two ways: per ATTEMPT for the drill-down chip, per RESOLUTION for the
-    # grouped row. Empty on a legacy DB / before the job's first fire, in which
-    # case every lookup misses and the payload is byte-identical to before.
+    # On-chain verdicts, read once and indexed per attempt (drill-down chip)
+    # and per resolution (grouped row). Empty before the job's first run, in
+    # which case every lookup misses.
     chain_rows, chain_by_attempt, chain_by_resolution = (
         _chain_forensics_cached(conn, anchor) if raw_rows else ([], {}, {})
     )
@@ -3777,17 +3585,12 @@ def _reject_block(
     except sqlite3.OperationalError:
         pass
 
-    # ── missed-trades rollup: ONE row per resolution ─────────────────────
-    # step1last places ONE bet per market window: the retries logged as
-    # separate reject rows are fill-completion attempts of the SAME intended
-    # position, not independent stakes. Collapse to one counterfactual per
-    # RESOLUTION — keyed on the interval bucket derived from the sleeve, NOT
-    # the sleeve label itself, so every attempt on the same resolution (retries,
-    # T3 top-ups, any second same-interval sleeve) folds into ONE window.
-    # (Before this fix a resolution that no-filled twice was double-counted,
-    # e.g. XRP 15m DOWN showed −$2.63 twice.) Rows without a
-    # window_start_ts can't be identified to a window → keyed on id so they
-    # stay their own group (never over-collapsed).
+    # ── missed trades: one row per resolution ──────────────────────────────
+    # Retries are attempts at the same position, not separate stakes, so
+    # collapse to one counterfactual per resolution. The key uses the interval
+    # from the sleeve rather than the sleeve label, so every attempt on the
+    # same resolution folds together. Rows without a window_start_ts are keyed
+    # on id so they stay separate.
     filled_keys, ghost_keys, err_kinds = (
         _reject_context_maps(conn, anchor) if raw_rows else (set(), set(), {})
     )
@@ -3945,19 +3748,16 @@ def _reject_block(
 
 
 def _v2_fill_rate_24h(conn: sqlite3.Connection) -> dict[str, Any]:
-    """ROLLING 24h fill rate — the top-right Subminute KPI (operator
-    2026-08-05).
+    """Rolling 24h fill rate (the Subminute tab's top-right KPI).
 
-    Definition is the breaker's, verbatim (fill_rate_breaker.evaluate_breaker):
-    Σ filled_usd / Σ requested_usd over ``subminute_fills`` rows whose outcome
-    is not 'error'. The ONLY difference is the window — orders CREATED in the
-    last 24h rather than the newest ``SUBMINUTE_BREAKER_WINDOW`` orders — so
-    the two figures on the page are the same measurement over two spans and can
-    never mean different things.
+    Same definition as the breaker (fill_rate_breaker.evaluate_breaker):
+    filled_usd / requested_usd summed over ``subminute_fills`` rows whose
+    outcome is not 'error'. Only the window differs: orders created in the last
+    24h instead of the newest ``SUBMINUTE_BREAKER_WINDOW`` orders.
 
-    Null-safe: no orders in 24h (or Σ requested == 0) → ``fill_rate_24h`` None
-    and the client renders '—'. Observability must never raise, so a missing
-    table / column degrades to None rather than breaking the SSE payload.
+    No orders in 24h (or zero requested) gives ``fill_rate_24h`` None and the
+    client shows '—'. A missing table or column also gives None rather than
+    breaking the payload.
     """
     try:
         row = conn.execute(
@@ -3987,18 +3787,17 @@ def _v2_block(
     *,
     book_mark_get: Optional[Callable[..., Any]] = None,
 ) -> Optional[dict[str, Any]]:
-    """v2 "step1last" operator console block.
+    """Sub-minute console block.
 
-    Carries the frozen decision spec (header), the equity-fraction sizing
-    state (base fracs, DD-brake multiplier `max(floor, 1 − dd/scale)` — INERT
-    since the 2026-07-31 throttle removal pinned the floor at 1.0 — and the
-    0.30 hard halt), the fill-rate breaker re-anchored to v2 realizability, and
-    recent per-bet rows (pred_edge / stake) from the sub-minute ledger. None
-    when the v2 executor is disabled (the page renders its disabled hint).
+    Carries the decision spec, the sizing state (base fractions, the drawdown
+    brake ``max(floor, 1 - dd/scale)`` (1.0 at the default floor) and the hard
+    halt), the fill-rate breaker, and recent per-bet rows (pred_edge, stake)
+    from the sub-minute ledger. None when sub-minute trading is disabled (the
+    page shows a hint).
 
-    Note: `equity_at_decision` is not persisted per bet in the current ledger
-    schema, so the per-row field is None and the *current* sizing anchor
-    (equity / peak) is surfaced in the sizing state instead.
+    ``equity_at_decision`` is not stored per bet, so the per-row field is None
+    and the current sizing anchor (equity, peak) is in the sizing state
+    instead.
     """
     if not config.SUBMINUTE_ENABLED:
         return None
@@ -4017,21 +3816,18 @@ def _v2_block(
     scale = consts["brake_scale"] or DEFAULT_BRAKE_SCALE
     floor = consts["brake_floor"]
     brake = max(floor, 1.0 - dd_frac / scale)
-    # Plain-language throttle descriptors for the dashboard: the brake holds
-    # full size at 0% DD and reaches its floor (floor× stake) once dd hits
-    # scale*(1-floor) — e.g. floor 0.50 / scale 0.60 → half size at ≥30% DD.
-    # At the 2026-07-31 defaults (floor 1.0) this is 0.0 and `brake` is always
-    # 1.0: the throttle is REMOVED. `brake_at_floor` is then trivially True, so
-    # the dashboard treats floor >= 1.0 as "throttle off", not as a warning.
+    # Plain-language brake description: full size at 0% drawdown, reaching the
+    # floor at dd = scale * (1 - floor), e.g. floor 0.50 / scale 0.60 is half
+    # size from 30% drawdown. At floor 1.0 this is 0.0 and the brake is always
+    # 1.0, so the dashboard treats floor >= 1.0 as "throttle off", not a
+    # warning.
     dd_at_floor = scale * (1.0 - floor)
-    # EQUITY SOURCE (operator 2026-07-11): the v2 tab shows the SAME per-tick
-    # live CLOB balance the hero + live sizing use (kpis.account_capital_live),
-    # so Subminute and Overview can NEVER diverge (the retired reconciliation-table
-    # read this replaced lagged ~10 min). Peak is the max of that balance and
-    # the historical wallet peak. Falls back to the ledger series only when no
-    # live cash basis exists yet (DRY / unreconciled) so the panel never
-    # renders blank. equity_basis stays honest:
-    # balance_cache | readiness_report | reconciliation_sample | ledger_fallback.
+    # Equity: the same per-tick live CLOB balance the Overview headline and
+    # live sizing use (kpis.account_capital_live), so the two tabs always
+    # agree. Peak is the higher of that balance and the historical wallet peak.
+    # Falls back to the ledger series only when there is no live cash basis yet
+    # (DRY, unreconciled). equity_basis says which: balance_cache |
+    # readiness_report | reconciliation_sample | ledger_fallback.
     live_cap = kd.get("account_capital_live")
     live_cap_source = kd.get("account_capital_live_source")
     if live_cap is not None:
@@ -4075,8 +3871,8 @@ def _v2_block(
         # How much of that equity is operator-deposited funding rather than
         # P&L — the equity tile's sub-line. Same value as kpis.net_deposits.
         "net_deposits": kd.get("net_deposits"),
-        # Ledger paper series kept EXPLICITLY separate + labelled so no two
-        # unlabelled equities coexist on the tab (operator 2026-07-09).
+        # The ledger paper series, kept separate and labelled so the tab never
+        # shows two unlabelled equity figures.
         "ledger_paper_equity": kd.get("realized_capital"),
         "ledger_paper_peak": kd.get("peak_capital"),
         "trading_halted": bool(kd.get("trading_halted")),
@@ -4092,14 +3888,11 @@ def _v2_block(
             out["fill_rate"] = {
                 "fill_rate": br.fill_rate,
                 "n_orders": br.n_orders,
-                # ROLLING 24h twin of `fill_rate` (operator 2026-08-05): the
-                # console shows fill rate twice — top-right is this 24h figure,
-                # bottom-right the full record-window one (reject_stats
-                # .fill_rate_usd). SAME definition as the breaker's arm —
-                # Σ filled_usd / Σ requested_usd over non-'error' subminute
-                # order rows — only the window differs (created_at within the
-                # last 24h instead of the newest N orders). Null when no orders
-                # landed in 24h, or when every one of them requested $0.
+                # Rolling 24h fill rate, alongside the record-window figure
+                # (reject_stats.fill_rate_usd). Same definition as the breaker:
+                # filled_usd / requested_usd over non-'error' sub-minute
+                # orders, over the last 24h. Null when there were no orders in
+                # 24h or all requested $0.
                 **_v2_fill_rate_24h(conn),
                 "tripped": br.tripped,
                 "reason": br.reason,
@@ -4112,14 +3905,12 @@ def _v2_block(
         except Exception:  # noqa: BLE001 — observability must never break SSE
             logger.warning("v2 fill-rate build failed", exc_info=True)
         try:
-            # Record-window anchored (operator reset re-anchors the console —
-            # see _record_anchor_ts): pre-cutover bets never resurface here.
-            # Newest-N by id then post-filter, NOT a bet_ts predicate in SQL —
-            # the anchor only trims the old prefix of history, and keeping the
-            # bare id-DESC LIMIT preserves the early-stopping plan on the hot
-            # ledger table (a SQL filter would reverse-scan the whole table
-            # whenever fewer than N post-anchor bets exist, i.e. right after
-            # a reset).
+            # Limited to the record window, so bets from before a reset never
+            # appear. Newest N by id and then filtered, rather than a bet_ts
+            # condition in SQL: an id-DESC LIMIT stops early on the large
+            # ledger table, while a filter would scan the whole table whenever
+            # fewer than N bets are newer than the anchor (right after a
+            # reset).
             rows = conn.execute(
                 "SELECT bet_ts, coin, sleeve, interval_min, offset_sec, "
                 "       window_start_ts, side, poly_token_id, is_topup, "
@@ -4142,10 +3933,9 @@ def _v2_block(
                     fee = fee_per_share(float(ask), theta=theta)
                     pred_edge = model_p - ask - fee
                 ghost = str(r["outcome"] or "").upper() == "GHOST_FILL"
-                # M1 partial fills (2026-07-21): filled_usd is the REALIZED
-                # live fill value (size × price) when the reconciler has landed
-                # one; the intended bet_size is only the DRY/legacy fallback.
-                # Before this a $5 intent that half-filled read filled_usd=$5.
+                # filled_usd is the realized fill value (size x price) once the
+                # reconciler has it; the intended bet_size is only the fallback
+                # for DRY or older rows.
                 _lf_size = _float_or_none(r["live_filled_size"])
                 _lf_price = _float_or_none(r["live_filled_price"])
                 if ghost:
@@ -4165,12 +3955,10 @@ def _v2_block(
                     "offset_sec": r["offset_sec"],
                     "window_start_ts": r["window_start_ts"],
                     "side": r["side"],
-                    # T3 top-up flag (2026-08-05). window_start_ts already
-                    # names the position; this LABELS the fills inside one, so
-                    # the Subminute tab can fold a base bet and its top-ups
-                    # into a single row (the shared client `groupTrades` key,
-                    # payload.contracts.trade_group) and still show them apart
-                    # in the drill-down. NOT part of the group key.
+                    # Top-up flag. window_start_ts identifies the position;
+                    # this labels the fills within it, so the Subminute tab can
+                    # show one row per position and still separate the fills in
+                    # the drill-down. Not part of the group key.
                     "is_topup": bool(r["is_topup"]),
                     "ask": _round_prob(ask),
                     # Same intended execution price as Trade Journal's exec
@@ -4248,16 +4036,13 @@ def build_payload(
     live_balance_get: Optional[Callable[[], Optional[float]]] = None,
     book_mark_get: Optional[Callable[..., Any]] = None,
 ) -> tuple[dict[str, Any], int]:
-    """Compose the full SSE payload; return (payload, new_max_ledger_id).
+    """Build the full SSE payload; return (payload, new_max_ledger_id).
 
-    ``live_balance_get`` is the in-memory BalanceCache reader live sizing uses
-    (``balance_cache.get``); it drives the per-tick cash headline
-    (kpis.account_capital_live). ``book_mark_get`` is the off-tick book source
-    (``book_prefetch.get``) used to mark OPEN positions to the current book —
-    both read-only, no trading/sizing/gate change.
-
-    (The ``tick_result`` param was dropped with the per-sleeve markets
-    decision subtree — nothing in the payload reads the tick anymore.)
+    ``live_balance_get`` is the BalanceCache reader live sizing uses
+    (``balance_cache.get``) and drives the per-tick cash headline
+    (kpis.account_capital_live). ``book_mark_get`` is the background book
+    source (``book_prefetch.get``) used to mark open positions. Both are
+    read-only.
     """
     now_ts = int(time.time())
 
@@ -4286,13 +4071,12 @@ def build_payload(
     # cash by the win-redemption bridge. Cheap single hourly GROUP-BY, computed
     # inline (not in the 5s history cache). net = final − base = cash-basis era P&L.
     cash_equity = _cash_equity_series(conn, record_anchor=_record_anchor_ts())
-    # Align the CASH net on the reset era too (operator 2026-07-24): the paper
-    # rollup/win-rate/kpis are already era-scoped via _ledger_where's
-    # `bet_ts >= WALLET_START_AT`, but account_pnl_total is cash minus the AUDITED
-    # lifetime basis (~$104.8) — a different window. cash_equity.net = cash_now −
-    # cash_at_reset is the era-anchored cash P&L, so surfacing it lets the
-    # dashboard's cash net match the era paper's window (audited account_pnl_total
-    # stays untouched for reconciliation).
+    # Put the cash net on the same period as the paper figures. The paper
+    # rollup and KPIs are already limited to ``bet_ts >= WALLET_START_AT``, but
+    # account_pnl_total is cash minus the lifetime audited basis.
+    # ``cash_equity.net`` (cash now - cash at reset) is the cash P&L for the
+    # same period, so the dashboard can show matching figures;
+    # account_pnl_total is left as is for reconciliation.
     if isinstance(kpis, dict) and cash_equity is not None:
         kpis["account_pnl_era_cash"] = cash_equity.get("net")
 
@@ -4338,10 +4122,9 @@ def build_payload(
         # n/wins/losses count TRADE GROUPS (top-ups folded into their base bet),
         # pnl is the unchanged per-row Σ.
         "ledger_daily": ledger_daily,
-        # H5 per-venue variants of the two rollups above — identical
-        # definitions, GROUP BY venue ('polymarket'/'predictfun'). The client
-        # prefers these for venue-scoped views instead of re-aggregating the
-        # bounded streamed window.
+        # Per-venue versions of the two rollups above, same definitions grouped
+        # by venue. The client prefers these over re-aggregating the streamed
+        # rows.
         "ledger_rollup_by_venue": ledger_rollup_by_venue,
         "ledger_daily_by_venue": ledger_daily_by_venue,
         # FULL-ledger analytics for the historical panels (headline summary ·
@@ -4361,9 +4144,7 @@ def build_payload(
             "win_rate": _WIN_RATE_CONTRACT,
             "trade_group": _TRADE_GROUP_CONTRACT,
         },
-        # Item 31: env-pinned execution-quality knobs (T3 / fresh gate /
-        # late-window skip / ask-band skip / tier-A) for the
-        # Config tab's data-driven strategy panel.
+        # Execution settings shown on the Config tab.
         "strategy_flags": _strategy_flags_block(),
         "live_wallet": _live_wallet_block(conn),
         # Account-level cash events (deposits / withdrawals / rebates) behind
